@@ -2,7 +2,7 @@ import anacal
 import numpy as np
 
 def anacal_pix_r(img, psf, center=None, 
-                 sigma_arcsec=0.7/2.355, 
+                 sigma_arcsec=0.85/2.355, 
                  scale_arcsec_per_pix=0.2,
                  freq_lim=10.0,
                  noise_map = None):
