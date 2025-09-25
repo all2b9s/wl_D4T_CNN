@@ -25,11 +25,16 @@ def anacal_pix_r(img, psf, center=None,
     klim = freq_lim / scale_arcsec_per_pix
     nx = img.shape[0]
     ny = img.shape[1]
+
     if center is None:
         xcen = nx // 2
         ycen = ny // 2
     else:
         xcen, ycen = center
+    dx = xcen - int(xcen)
+    dy = ycen - int(ycen)
+    xcen = int(xcen)
+    ycen = int(ycen)
 
     iq = anacal.image.ImageQ(nx, ny, scale_arcsec_per_pix, sigma_arcsec, klim, True)
 
@@ -38,5 +43,7 @@ def anacal_pix_r(img, psf, center=None,
         q_img_np = iq.prepare_qnumber_image(img, psf, xcen, ycen)
     else:
         q_img_np = iq.prepare_qnumber_image(img, psf, xcen, ycen, noise_map)
+    q_img_np[1] = q_img_np[1] - (dx * q_img_np[3] - dy * q_img_np[4])*scale_arcsec_per_pix
+    q_img_np[2] = q_img_np[2] - (dy * q_img_np[3] + dx * q_img_np[4])*scale_arcsec_per_pix
     return q_img_np
 

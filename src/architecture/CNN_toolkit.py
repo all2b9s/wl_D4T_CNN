@@ -158,14 +158,13 @@ def shape_pixel_gradients(
     """
     device = device or ("cuda" if torch.cuda.is_available() else "cpu")
     model = model.to(device).eval()
-
     # ---- Prepare input tensor on device ----
     if isinstance(img_np, torch.Tensor):
         x = img_np
         # ensure float32 on device
         x = x.to(device=device, dtype=torch.float32)
     else:
-        x = torch.from_numpy(np.asarray(img_np, dtype=np.float32)).to(device)
+        x = torch.from_numpy(img_np.astype(np.float32)).to(device)
 
     # Accept [H,W], [B,H,W], or [B,1,H,W]
     if x.ndim == 2:
@@ -293,6 +292,7 @@ def predictor(model, img, normalize = "none"):
         pass
     device = next(model.parameters()).device
     model.eval()
+    print(img)
     if img.ndim == 2:
         img_t = torch.tensor(img).unsqueeze(0).unsqueeze(0).to(device)  # [1,1,H,W]
     elif img.ndim == 3:

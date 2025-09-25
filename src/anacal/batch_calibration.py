@@ -1,68 +1,85 @@
 from typing import Any
 import numpy as np
 import torch
-from pixel_response import anacal_pix_r
+from src.anacal.pixel_response import anacal_pix_r
 from src.architecture.CNN_toolkit import shape_pixel_gradients, predictor, plot_shape_bidirectional, D4_eq_weight
 from concurrent.futures import ProcessPoolExecutor
+from functools import partial
+from tqdm import tqdm
 
-class calibrator():
-    def __init__(self, model, device="cuda", workers=32, bs_para = [100,100]):
+class Calibrator():
+    def __init__(self, model, device="cuda", workers=32, shear_value=0.02):
         self.model = model.to(device)
         self.model.eval()
         self.device = device
-        self.workers = 32
-        self.bs_size = bs_para[0]
-        self.bs_times = bs_para[1]
+        self.workers = workers
+        self.shear_value = shear_value
 
-    def __call__(self, q_imgs_m, 
-                 q_imgs_1p, 
-                 q_imgs_1n,
-                 q_imgs_2p,
-                 q_imgs_2n):
+
+    def shape_measure(self, q_imgs, batch_size=32):
         """
-        q_imgs_m,1p,1n,2p,2n: list of q_img dict for no-shear,1p,1n,2p,2n imgs each of shape (N, H, W)
-
+        q_imgs: array/list-like of length N with shape (N, 5, H, W) or list-of-lists,
+                ordering along axis=1: [m, 1p, 1n, 2p, 2n].
+                Each per-gal entry should be acceptable by get_resmoothed_shape.
 
         Returns:
-        shapes_m: (N, 4) numpy array
-        shapes_p: (N, 4) numpy array
-        shapes_n: (N, 4) numpy array
-        R_anacal: (N, 2, 2) numpy array
-        R_delta: (N, 2, 2) numpy array
+        shapes:         (N, 4, 2) float32
+        R_anacal_list:  (N, 4, 2, 2) float32
+        R_delta_list:   (N, 4, 2, 2) float32
         """
-        N = len(q_imgs_m)
-        assert N == len(q_imgs_1p) and N == len(q_imgs_1n)
+        # Basic checks
+        N = len(q_imgs)
+        assert hasattr(q_imgs, "shape") and q_imgs.shape[1] == 5, \
+            "q_imgs must be shape (N, 5, H, W) with ordering [m, 1p, 1n, 2p, 2n]"
 
-        # Get resmoothed shapes and gradients
-        shapes_m, grads_e1_m, grads_e2_m = self.get_resmoothed_shape(q_imgs_m, with_grad=True)
-        shapes_1p = self.get_resmoothed_shape(q_imgs_1p)
-        shapes_1n = self.get_resmoothed_shape(q_imgs_1n)
-        shapes_2p = self.get_resmoothed_shape(q_imgs_2p)
-        shapes_2n = self.get_resmoothed_shape(q_imgs_2n)
 
-        # Compute responses
-        R_anacal_list = []
-        R_delta_list = []
-        for i in range(N):
-            R_anacal, R_delta = _single_gal_response(q_imgs_m[i], grads_e1_m[i], grads_e2_m[i])
-            R_anacal_list.append(R_anacal)
-            R_delta_list.append(R_delta)
+        # Allocate outputs
+        R_anacal_list = np.zeros((N, 2, 2), dtype=np.float32)
 
-        R_anacal = np.array(R_anacal_list, dtype=np.float32)
-        shear_1p = self.shear_measurement(shapes_1p)
-        shear_1n = self.shear_measurement(shapes_1n)
-        shear_2p = self.shear_measurement(shapes_2p)
-        shear_2n = self.shear_measurement(shapes_2n)
+        # Batch compute resmoothed shapes & gradients for this shear slice
+        # Expect: shape_j -> (N, 2), grad_e1_j -> (N, H, W), grad_e2_j -> (N, H, W)
+        shapes, grad_e1, grad_e2 = self.get_resmoothed_shape(q_imgs, batch_size=batch_size, with_grad=True)
 
-        m1 = (shear_1p[0][0]-shear_1n[0][0])/R_anacal[:,0,0].mean()/2.0
-        m2 = (shear_2p[0][1]-shear_2n[0][1])/R_anacal[:,1,1].mean()/2.0
-        c1 = (shear_1p[0][0]+shear_1n[0][0])/2.0
-        c2 = (shear_2p[0][1]+shear_2n[0][1])/2.0
-        m1_err = (shear_1p[1][0]**2+shear_1n[1][0]**2)**0.5/R_anacal[:,0,0].mean()/2.0
-        m2_err = (shear_2p[1][1]**2+shear_2n[1][1]**2)**0.5/R_anacal[:,1,1].mean()/2.0
-        c1_err = (shear_1p[1][0]**2+shear_1n[1][0]**2)**0.5/2.0
-        c2_err = (shear_2p[1][1]**2+shear_2n[1][1]**2)**0.5/2.0
-        print(f"m1: {m1:.6f} +/- {m1_err:.6f}, m2: {m2:.6f} +/- {m2_err:.6f}, c1: {c1:.6f} +/- {c1_err:.6f}, c2: {c2:.6f} +/- {c2_err:.6f}")       
+        # Compute responses per galaxy for this shear (compact list-comprehension)
+        # _single_gal_response expects a single galaxy's q_img + its grads
+        res = [
+            _single_gal_response(q_imgs[i], grad_e1[i], grad_e2[i])
+            for i in range(N)
+        ]
+        # Unzip into separate arrays and stack
+        R_anacal_list = np.stack([r for r in res], axis = 0)
+
+        return shapes, R_anacal_list
+
+    def get_biases(self, shapes, Rs, 
+                   bs_size=100, 
+                   bs_times=100,
+                   n_factor=1):
+        """
+        shapes: (N, 4, 2) numpy array 
+        R_anacal: (N, 4, 2, 2) numpy array
+        R_delta: (N, 4, 2, 2) numpy array
+
+        all in sequence of 1p,1n,2p,2n
+
+        Returns:
+        cal_shapes: (N, 4) numpy array
+        """
+        N = shapes.shape[0]
+        m_list = np.zeros((bs_times, 2), dtype=np.float32)
+        c_list = np.zeros((bs_times, 2), dtype=np.float32)
+        bs_inds = [_bootstrap(N, bs_size) for _ in range(bs_times)]
+        for (idx,bs_ind) in enumerate(bs_inds):
+            assert np.all(bs_ind < N)
+            temp= _calibration(shapes[bs_ind], Rs[bs_ind])
+            m = temp[0]
+            c = temp[1]
+            m_list[idx] = m/self.shear_value-1
+            c_list[idx] = c
+        m_mean,c_mean = _calibration(shapes, Rs)
+        m_std = m_list.std(axis=0)*n_factor
+        c_std = c_list.std(axis=0)*n_factor
+        return m_mean/self.shear_value-1, c_mean, m_std, c_std
 
     def get_resmoothed_shape(self, q_imgs, batch_size=32, with_grad=False):
         """
@@ -80,7 +97,7 @@ class calibrator():
         """
 
         def process_q_imgs(q_imgs_batch):
-            resmoothed_batch = np.array([q_img[0].astype(np.float32)] for q_img in q_imgs_batch)  # shape (B, 1, H, W)
+            resmoothed_batch = np.array([q_img[0].astype(np.float32) for q_img in q_imgs_batch])  # shape (B, 1, H, W)
             if not with_grad:
                 shapes = predictor(self.model, resmoothed_batch)
                 grads_e1 = [None] * len(shapes)
@@ -91,7 +108,7 @@ class calibrator():
 
         results = []
         for i in range(0, len(q_imgs), batch_size):
-            q_imgs_batch = q_imgs[i:i + batch_size]
+            q_imgs_batch = q_imgs[i:min(i + batch_size, len(q_imgs))]
             results.append(process_q_imgs(q_imgs_batch))
 
         all_shape, all_grad_e1, all_grad_e2 = zip(*results)  # Unzip results
@@ -103,64 +120,128 @@ class calibrator():
             all_grad_e2 = np.array([grad for batch in all_grad_e2 for grad in batch], dtype=np.float32)
             return all_shape, all_grad_e1, all_grad_e2  
 
-    def prepare_q_images(self, images, psfs, noises, pixel_scale=0.2, sigma_arcsec=0.7/2.355, flim=10.0):
-        """
-        images: (N, H, W) numpy array
-        psfs: (N, H, W) numpy array
-        """
-        N = images.shape[0]
-        q_imgs = []
+def _process_image(
+    i: int,
+    images: np.ndarray,
+    psfs: np.ndarray,
+    centers: np.ndarray,
+    noises: np.ndarray,
+    pixel_scale: float,
+    sigma_arcsec: float,
+    flim: float,
+):
+    # your existing per-index logic:
+    return anacal_pix_r(
+        images[i],
+        psfs[i],
+        center=centers[i],
+        scale_arcsec_per_pix=pixel_scale,
+        sigma_arcsec=sigma_arcsec,
+        freq_lim=flim,
+        noise_map=(noises[i] if noises is not None else None),
+    )
 
-        def process_image(i):
-            return anacal_pix_r(
-                images[i,0],
-                psfs[i,0],
-                center=None,
-                sigma_arcsec=sigma_arcsec,
-                scale_arcsec_per_pix=pixel_scale,
-                freq_lim=flim,
-                noise_map=noises[i,0] if noises is not None else None
+from concurrent.futures import ProcessPoolExecutor
+from tqdm import tqdm
+
+# --- globals inside workers ---
+_G = {}
+def _init_worker(images, psfs, centers, noises, pixel_scale, sigma_arcsec, flim):
+    # mark read-only to avoid copy-on-write if using fork
+    for arr in (images, psfs, centers, noises):
+        try:
+            arr.setflags(write=False)
+        except Exception:
+            pass
+    _G['images'] = images
+    _G['psfs'] = psfs
+    _G['centers'] = centers
+    _G['noises'] = noises
+    _G['pixel_scale'] = pixel_scale
+    _G['sigma_arcsec'] = sigma_arcsec
+    _G['flim'] = flim
+
+def _process_idx(i):
+    # call your existing function with globals
+    return _process_image(
+        i,
+        images=_G['images'],
+        psfs=_G['psfs'],
+        centers=_G['centers'],
+        noises=_G['noises'],
+        pixel_scale=_G['pixel_scale'],
+        sigma_arcsec=_G['sigma_arcsec'],
+        flim=_G['flim'],
+    )
+
+def prepare_q_images(images, psfs, noises,
+                     cat=None, pixel_scale=0.2,
+                     sigma_arcsec=0.85/2.355, flim=10.0, workers=32):
+
+    N = images.shape[0]
+    centers = np.ones((N, 2), dtype=np.float32) * (images.shape[1] // 2)
+    if cat is not None:
+        centers[:, 0] += (cat['image_x'] % 1).to_numpy(np.float32)
+        centers[:, 1] += (cat['image_y'] % 1).to_numpy(np.float32)
+
+    with ProcessPoolExecutor(
+        max_workers=workers,
+        initializer=_init_worker,
+        initargs=(images, psfs, centers, noises, pixel_scale, sigma_arcsec, flim),
+    ) as ex:
+        # key changes: use ex.map on indices ONLY + chunksize + tqdm
+        q_imgs = list(
+            tqdm(
+                ex.map(_process_idx, range(N), chunksize=16),
+                total=N,
+                desc="prepare_q_images",
             )
+        )
+    return np.array(q_imgs)
 
-        with ProcessPoolExecutor(self.workers) as executor:
-            q_imgs = list(executor.map(process_image, range(N)))
 
-        return q_imgs
+def _calibration(shapes, Rs):
+    """
+    shapes: (N, 4, 2) numpy array 
+    R: (N, 4, 2, 2) numpy array
 
-    def shear_measurement(self, shapes):
-        with ProcessPoolExecutor(self.workers) as executor:
-            shape_futures = [executor.submit(_bootstrap, shapes, self.bs_size) for _ in range(self.bs_times)]
-        shear_list = [future.result().mean(axis = 0) for future in shape_futures]
-        shears = np.array(shear_list)
-        return shears.mean(axis=0), shears.std(axis=0)
+    all in sequence of 1p,1n,2p,2n
+
+    Returns:
+    cal_shapes: (N, 4) numpy array
+    """
+    shears = shapes.mean(axis=0) # (4,2)
+    responses = Rs.mean(axis=0) # (4, 2, 2)
+
+    m1 = (shears[0,0]-shears[1,0])/(responses[0,0,0]+responses[1,0,0])
+    m2 = (shears[2,1]-shears[3,1])/(responses[2,1,1]+responses[3,1,1])
+    c1 = (shears[0,0]+shears[1,0])/(responses[0,0,0]+responses[1,0,0])
+    c2 = (shears[2,1]+shears[3,1])/(responses[2,1,1]+responses[3,1,1])
+
+    return np.array([m1, m2]), np.array([c1, c2])
         
-def _bootstrap(inputs, size):
-    np.random.seed()
-    rand_ints = np.random.choice(len(inputs), size=size, replace=True)
-    return np.vstack([inputs[rand_index] for rand_index in rand_ints])
+def _bootstrap(lense, size, seed = None):
+    if seed is not None:
+        np.random.seed(seed)
+    else:
+        np.random.seed()
+    rand_ints = np.random.choice(lense, size=size, replace=True)
+    return rand_ints
 
 def _single_gal_response(q_img, grad_e1, grad_e2):
     """
     q_img: list of 5 q_img dict for 0,1p,1m,2p,2m each of shape (5, H, W)
     grad_e1, grad_e2: (H, W) numpy array
     """
-    q_0, q_1p, q_1m, q_2p, q_2m = q_img # [v, g1, g2, j1, j2]
-    delta_img1 = (q_1p[0].astype(np.float32) - q_1m[0].astype(np.float32)) / 2.0
-    delta_img2 = (q_2p[0].astype(np.float32) - q_2m[0].astype(np.float32)) / 2.0
 
     anacal_R = np.zeros((2,2), dtype=np.float32)
-    anacal_R[0,0] = np.sum(grad_e1 * q_0[1])
-    anacal_R[0,1] = np.sum(grad_e1 * q_0[2])
-    anacal_R[1,0] = np.sum(grad_e2 * q_0[1])
-    anacal_R[1,1] = np.sum(grad_e2 * q_0[2])
+    anacal_R[0,0] = np.sum(grad_e1 * q_img[1])
+    anacal_R[0,1] = np.sum(grad_e1 * q_img[2])
+    anacal_R[1,0] = np.sum(grad_e2 * q_img[1])
+    anacal_R[1,1] = np.sum(grad_e2 * q_img[2])
 
-    del_R = np.zeros((2,2), dtype=np.float32)
-    del_R[0,0] = np.sum(grad_e1 * delta_img1)
-    del_R[0,1] = np.sum(grad_e1 * delta_img2)
-    del_R[1,0] = np.sum(grad_e2 * delta_img1)
-    del_R[1,1] = np.sum(grad_e2 * delta_img2)
 
-    return anacal_R, del_R
+    return np.array([anacal_R])
 
 
 
