@@ -110,43 +110,37 @@ def plot_shape_bidirectional(
 
 def D4_eq_weight(img):
     """
-    Computes second-order Q/U with baked smoothing (no extra pass).
-    Input : img [B, C, H, W]
-    Output: w0 = Ixx - Iyy, w1 = 2 Ixy
-    Notes : valid conv (no padding), 5-tap separable kernels
+    Computes the second-order gradients of an image using Sobel operators.
+
+    Args:
+            img (torch.Tensor): Input image tensor of shape [B, C, H, W], 
+                                                    where B is the batch size, C is the number of channels,
+                                                    H is the height, and W is the width.
+
+    Returns:
+            tuple: A tuple containing two tensors:
+                    - weight_0 (torch.Tensor): Ixx-Iyy, for shape0
+                    - weight_1 (torch.Tensor): sIxy, for shape1
     """
-    B, C, H, W = img.shape
+    B,C,H,W = img.shape
+    # Sobel 
+    Kx = torch.tensor([[-1.,0.,1.],
+                       [-2.,0.,2.],
+                       [-1.,0.,1.]],
+                    device=img.device, dtype=img.dtype).view(1,1,3,3)
+    Ky = Kx.transpose(-1,-2).contiguous()
+    Kx, Ky = Kx.repeat(C,1,1,1), Ky.repeat(C,1,1,1)
 
-    # 1D kernels (float, device/dtype follow img)
-    # s5: smoothing; d5s: 1st-derivative (Scharr-like 5 tap); dd5: 2nd-derivative (5 tap)
-    s5  = torch.tensor([1, 4, 6, 4, 1], device=img.device, dtype=img.dtype) / 16.0
-    d5s = torch.tensor([1, -8, 0, 8, -1], device=img.device, dtype=img.dtype) / 12.0
-    dd5 = torch.tensor([-1, 16, -30, 16, -1], device=img.device, dtype=img.dtype) / 12.0
+    # valid 卷积（不 pad）
+    ix  = F.conv2d(img, Kx, groups=C, padding=0)
+    iy  = F.conv2d(img, Ky, groups=C, padding=0)
+    ixx = F.conv2d(ix, Kx, groups=C, padding=0)
+    iyy = F.conv2d(iy, Ky, groups=C, padding=0)
+    ixy = F.conv2d(ix, Ky, groups=C, padding=0)
 
-    # reshape to conv2d friendly 2D separable kernels
-    # x方向核: [1,1,KW,1]; y方向核: [1,1,1,KH]
-    kx_s5  = s5.view(1, 1, -1, 1).repeat(C, 1, 1, 1)
-    ky_s5  = s5.view(1, 1,  1, -1).repeat(C, 1, 1, 1)
-    kx_d5s = d5s.view(1, 1, -1, 1).repeat(C, 1, 1, 1)
-    ky_d5s = d5s.view(1, 1,  1, -1).repeat(C, 1, 1, 1)
-    kx_dd5 = dd5.view(1, 1, -1, 1).repeat(C, 1, 1, 1)
-    ky_dd5 = dd5.view(1, 1,  1, -1).repeat(C, 1, 1, 1)
+    w0 = ixx - iyy  
+    w1 = 2.0 * ixy  
 
-    # helper: separable valid conv (x then y), groups=C
-    def sep_conv(x, kx, ky):
-        x = F.conv2d(x, kx, groups=C, padding=0)  # along x (width)
-        x = F.conv2d(x, ky, groups=C, padding=0)  # along y (height)
-        return x
-
-    # I_xx: dd5 along x, s5 along y
-    ixx = sep_conv(img, kx_dd5, ky_s5)
-    # I_yy: s5 along x, dd5 along y
-    iyy = sep_conv(img, kx_s5, ky_dd5)
-    # I_xy: d5s along x, d5s along y
-    ixy = sep_conv(img, kx_d5s, ky_d5s)
-
-    w0 = ixx - iyy
-    w1 = 2.0 * ixy
     return w0, w1
 
 def shape_pixel_gradients(

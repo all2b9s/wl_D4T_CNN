@@ -124,7 +124,7 @@ class D4T_CNN_GeLU(nn.Module):
                 num_layers=5):
         super().__init__()
         C = base_channels
-        padding_size = int((kernel_size-1)/2*num_layers+8)
+        padding_size = int((kernel_size-1)/2*num_layers+4)
         self.inpad = nn.ConstantPad2d(padding_size, 0.0)
         self.blocks = nn.ModuleList([D4Inv_Conv2d(in_dim if i == 0 else C, C, k = kernel_size) for i in range(num_layers)])
 
@@ -144,9 +144,9 @@ class D4T_CNN_GeLU(nn.Module):
             y = block(y)
         # Crop out the center [H, W]
         #win = hann_window(H+4, W+4, margin=6, device=w0.device, dtype=w0.dtype)
-        self.y = center_crop_to(y, (H+8, W+8))  # [B, C, H, W]
-        self.w0 = center_crop_to(w0, (H+8, W+8))
-        self.w1 = center_crop_to(w1, (H+8, W+8))
+        self.y = center_crop_to(y, (H+4, W+4))  # [B, C, H, W]
+        self.w0 = center_crop_to(w0, (H+4, W+4))
+        self.w1 = center_crop_to(w1, (H+4, W+4))
 
         norm_0 = torch.sqrt((self.w0**2+1e-6).sum(dim=(-1,-2)))
         norm_1 = torch.sqrt((self.w1**2+1e-6).sum(dim=(-1,-2))) 

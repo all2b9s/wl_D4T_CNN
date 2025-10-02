@@ -8,7 +8,6 @@ import torch
 from torch import nn
 from torch.utils.data import Dataset, DataLoader
 from torchvision.models import resnet18, ResNet18_Weights
-from torchvision.transforms import GaussianBlur
 
 # ----------------------------
 # Dataset (memmap + CSV)
@@ -62,36 +61,6 @@ def rotate_image_90(img: torch.Tensor, k: int) -> torch.Tensor:
     if img.ndim == 2:
         return torch.rot90(img, k, dims=(0,1))
     return torch.rot90(img, k, dims=(-2,-1))
-
-def add_resmoothed_noise(img, psf_fwhm=0.85, crop_size=2, rng=None, device=None):
-    """
-    Add Gaussian noise then re-smooth to target PSF FWHM.
-    img: [B,C,H,W] float32
-    psf_fwhm: float, arcsec
-    crop_size: int
-    rng: torch.Generator
-    device: torch.device
-    """
-    if device is None:
-        device = img.device
-    if rng is None:
-        rng = torch.Generator(device="cpu")
-
-    center = (img.shape[-2] // 2, img.shape[-1] // 2)
-    img_crop = img[..., 
-                   center[0] - crop_size:center[0] + crop_size + 1,
-                   center[1] - crop_size:center[1] + crop_size + 1]
-    img_signal = img_crop.sum(dim=(-2, -1), keepdim=True)  # (B,C,1,1)
-
-    if psf_fwhm > 0:
-        sigma = psf_fwhm / (2.0 * math.sqrt(2.0 * math.log(2.0)))  # arcsec
-        norm = torch.rand(img.shape[:2], generator=rng, device=device) * 0.05  # (B,C)
-        norm = norm.unsqueeze(-1).unsqueeze(-1)  # (B,C,1,1)
-        noise = torch.randn(img.shape, generator=rng, device=device) * img_signal * norm  # (B,C,H,W)
-        img = img + noise
-
-    return img
-    
 
 class SingleGalaxyDataset(Dataset):
     """
@@ -175,8 +144,6 @@ class SingleGalaxyDataset(Dataset):
             if do_flip_x:
                 img = flip_image_x(img)
                 y = flip_spin2(y)
-
-            #img = add_resmoothed_noise(img, psf_fwhm=0.85, crop_size=5)
 
         return img, y
 

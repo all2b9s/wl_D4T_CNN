@@ -1,7 +1,7 @@
 import anacal
 import numpy as np
 import matplotlib.pylab as plt
-
+import numbers
 from numpy.lib import recfunctions as rfn
 from astropy.visualization import simple_norm
 import os
@@ -25,12 +25,19 @@ def load_img(shear_comp,
     cat = pd.read_csv(dir + 'gt_cat.csv')
     psfs = np.tile(psfs, (len(cutouts), 1, 1))
     seed = np.random.default_rng(ori_seed+index).integers(0,100000)
+    if noise_level == 'adaptive':
+        noise_list = np.zeros(len(cutouts))
+    else:
+        noise_list = np.full(len(cutouts), noise_level)
     for (idx, cutout) in enumerate(cutouts):
         rng = np.random.default_rng(seed+idx)
-        noise = rng.standard_normal(cutout.shape)*noise_level
+        if noise_level == 'adaptive':
+            center = (cutout.shape[-2]//2, cutout.shape[-1]//2)
+            cutout_crop = cutout[center[0]-2:(center[0]+3), center[1]-2:(center[1]+3)]
+            noise_list[idx] = rng.uniform(1/40, 1/15)*(cutout_crop.mean())
+        noise = rng.standard_normal(cutout.shape)*noise_list[idx]
         cutouts[idx] += noise
-
-    return cutouts, psfs, cat
+    return cutouts, psfs, cat, noise_list
 
 
 
@@ -58,7 +65,7 @@ def build_dataset(
     use_threads=True,
 ):
     # 1) Probe shapes once
-    cutouts0, psfs0, cat0 = load_img(
+    cutouts0, psfs0, cat0, _ = load_img(
         shear_comp=shear_comp,
         shear_mode=shear_mode,
         abs_shear_value=abs_shear_value,
@@ -73,41 +80,39 @@ def build_dataset(
     # 2) Preallocate
     all_cutouts = np.empty((N, H, W), dtype=cutouts0.dtype)
     all_psfs    = np.empty((N, H, W), dtype=psfs0.dtype)
+    all_noise = np.empty((N,), dtype=np.float32)
     cat_chunks  = [None] * N_BATCH
 
-    # 3) Place first batch
-    all_cutouts[0:B] = cutouts0
-    all_psfs[0:B]    = psfs0
-    cat_chunks[0]    = cat0
 
     # 4) Parallel read remaining batches with a progress bar
     Exec = ThreadPoolExecutor if use_threads else ProcessPoolExecutor
     max_w = min(workers, max(1, N_BATCH - 1))
 
-    loader = partial(
-        load_one,
-        shear_comp=shear_comp,
-        shear_mode=shear_mode,
-        abs_shear_value=abs_shear_value,
-        noise_level=noise_level,
-        directory=directory,
-    )
+    
+
+    loader = partial(load_one, 
+                     shear_comp=shear_comp, 
+                     shear_mode=shear_mode, 
+                     abs_shear_value=abs_shear_value, 
+                     noise_level=noise_level, 
+                     directory=directory)
 
     map_kwargs = {}
     if not use_threads:
         map_kwargs["chunksize"] = 4  # tune 2–16 for processes
 
     with Exec(max_workers=max_w) as ex:
-        it = ex.map(loader, range(index_range[0]+1, index_range[1]), **map_kwargs)
-        for i, (cutouts, psfs, cat) in enumerate(
-            tqdm(it, total=N_BATCH - 1, desc="Reading batches", unit="batch"),
-            start=1,
+        it = ex.map(loader, range(index_range[0], index_range[1]), **map_kwargs)
+        for i, (cutouts, psfs, cat, noise_level) in enumerate(
+            tqdm(it, total=N_BATCH, desc="Reading batches", unit="batch"),
+            start=0,
         ):
             s = i * B
             e = s + B
             all_cutouts[s:e] = cutouts
             all_psfs[s:e]    = psfs
+            all_noise[s:e] = noise_level
             cat_chunks[i]    = cat
 
     all_cats = pd.concat(cat_chunks, ignore_index=True)
-    return all_cutouts, all_psfs, all_cats
+    return all_cutouts, all_psfs, all_cats, all_noise

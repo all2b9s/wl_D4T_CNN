@@ -1,14 +1,44 @@
 import anacal
 import numpy as np
 import matplotlib.pylab as plt
-
 import lsst.geom as geom
 from lsst.afw.geom import makeSkyWcs
-
-from xlens.simulator.multiband import (
-    MultibandSimShearTaskConfig,
-    MultibandSimShearTask,
+import fitsio
+import os
+# LSST task to define DC2-like skymap 
+from lsst.skymap.discreteSkyMap import (
+    DiscreteSkyMapConfig, DiscreteSkyMap,
 )
+from lsst.pipe.tasks.coaddBase import makeSkyInfo
+
+from xlens.simulator.catalog import (
+    CatalogShearTask,
+    CatalogShearTaskConfig,
+)
+from xlens.simulator.sim import (
+    MultibandSimConfig, MultibandSimTask
+)
+
+# Detection Task: Detect, shape measurement
+from xlens.process_pipe.anacal_detect import (
+    AnacalDetectPipeConfig, 
+    AnacalDetectPipe,
+)
+
+# Force color measurement Task: 
+# flux measurement on the other bands
+from xlens.process_pipe.anacal_force import (
+    AnacalForcePipe,
+    AnacalForcePipeConfig,
+)
+
+# Match Task: match to input catalog
+from xlens.process_pipe.match import (
+    matchPipe,
+    matchPipeConfig,
+)
+
+from astropy.visualization import ZScaleInterval
 
 from numpy.lib import recfunctions as rfn
 from astropy.visualization import simple_norm
@@ -16,6 +46,11 @@ import os
 import pandas as pd
 from tqdm import tqdm
 from multiprocessing import Pool, cpu_count
+from dataset_toolkit import get_weighted_e
+
+cat_ref,h = fitsio.read(
+    os.path.join('/projects/bdsp/wenyinli/codes/data/catsim-v4/', "OneDegSq.fits"),header=True
+)
 
 # put this at module level, not inside __call__
 def _worker_wrapper(args):
@@ -25,7 +60,7 @@ def _worker_wrapper(args):
 def cutout_xlens_image(full_image, truth_catalog, seed, noise_level=0.354):
     cutouts = np.zeros((len(truth_catalog),64,64))
     for idx, gal in truth_catalog.iterrows():
-        x, y = int(gal['image_x']), int(gal['image_y'])
+        x, y = round(gal['image_x']), int(gal['image_y'])
         cutout = full_image[y-32:y+32, x-32:x+32]
         rng = np.random.default_rng(seed//2+idx)
         if noise_level>0:
@@ -44,57 +79,79 @@ def xlens_gal_sim(
         kappa_value = 0.0,
         seed = 20020103,
         band = 'i',
-        dim = 500,
+        dim = 800,
         sep = 11.0, # arcsec
         pixel_scale = 0.2,
     ):
+    tract_id = 0
+    patch_id = 0
+    skymap_config = DiscreteSkyMapConfig()
+    skymap_config.projection = "TAN"
 
-    bbox = geom.Box2I(
-        minimum=geom.Point2I(x=0, y=0),
-        maximum=geom.Point2I(x=dim - 1, y=dim - 1),
-    )
-    cd_matrix = np.array([[-1.0, -0.0], [0.0, 1.0]]) * (pixel_scale / 3600.0)
+    # Define tract center explicitly 
+    skymap_config.raList = [0]         # degrees
+    skymap_config.decList = [0]        # degrees
+    skymap_config.radiusList = [0.2*dim/5/3600]     # radius in degrees
 
-    crval = geom.SpherePoint(
-        np.pi / 2.0,  # radians
-        0.0,  # radians
-        geom.radians,
-    )
+    skymap_config.rotation = 0.0         # tract rotation in degrees
 
-    stack_crpix = geom.Point2D(
-        (dim - 1) / 2.0,
-        (dim - 1) / 2.0,
-    )
+    # Patch and tract configuration
+    skymap_config.patchInnerDimensions = [int(dim),int(dim)]  # inner size of patch in pixels
+    skymap_config.patchBorder = 50                    # border size in pixels
+    skymap_config.pixelScale = pixel_scale             # arcsec/pixel
+    skymap_config.tractOverlap = 0.0                   # no overlap
+    
+    # Create the skymap
+    skymap = DiscreteSkyMap(skymap_config)
 
-    wcs_stack = makeSkyWcs(
-        crpix=stack_crpix,
-        crval=crval,
-        cdMatrix=cd_matrix,
-    )
+    # configuration
+    task_config = CatalogShearTaskConfig()
+    task_config.kappa_value = kappa_value  # e.g., 0.0
+    task_config.layout="grid"
+    task_config.z_bounds = [-0.01, 20.0]
+    task_config.test_target = shear_comp  # 'g1' or 'g2'
+    task_config.test_value = shear_value  # e.g., 0.02
+    task_config.mode = shear_mode # g1: (-0.02, 0.0), 
+    #config.sep= sep  # arcsec
+    # we can change to mode = 5 for shear g1: (0.02, 0)
+    task_config.extend_ratio = 0.9
+    task_config.select_observable = ['i_ab', 'a_d']
+    task_config.select_lower_limit = [0,0.3]
+    task_config.select_upper_limit = [21,3.0]
+    task_config.sep_arcsec = sep # arcsec
 
-    config = MultibandSimShearTaskConfig()
+    cattask = CatalogShearTask(config=task_config)
+    truthCatalog = cattask.run(
+        tract_info=skymap[tract_id],
+        seed=seed,
+    ).truthCatalog
+    for item in truthCatalog:
+        item[2] *= np.pi/180  # fix all galaxies' angle to 180 degree
+    #print(len(truthCatalog))
+    config = MultibandSimConfig()
     config.survey_name = (
         "lsst"  # The scale parameter needs to be consistent with scale
     )
-    config.layout="grid"
-    config.sep= sep  # arcsec
-    config.mode = shear_mode # 0: - ; 1: + ; 2: no shear
-    config.test_target = shear_comp  # 'g1' or 'g2'
-    config.test_value = shear_value  # e.g., 0.02
-    config.kappa_value = kappa_value  # e.g., 0 
-    config.kappa_value = kappa_value
+    config.draw_image_noise = False
+    config.truncate_stamp_size = 65
 
-    sim_task = MultibandSimShearTask(config=config)
-    outcome = sim_task.run(band=band, seed=seed, boundaryBox=bbox, wcs=wcs_stack)
+    sim_task = MultibandSimTask(config=config)
+    outcome = sim_task.run(
+                tract_info=skymap[tract_id],
+                patch_id=patch_id,
+                band=band,
+                seed=seed,
+                truthCatalog=truthCatalog,
+            )
 
     # Galaxy image
     gal_array = np.asarray(
-        outcome.outputExposure.getMaskedImage().getImage().array,
+        outcome.simExposure.image.array,
         np.float64,
     )
 
     # PSF image
-    lsst_psf = outcome.outputExposure.getPsf()
+    lsst_psf = outcome.simExposure.getPsf()
     xc = int(dim // 2)  # we need PSF model without subpixel offset
     yc = int(dim // 2)
     psf_array = np.asarray(
@@ -105,8 +162,27 @@ def xlens_gal_sim(
     )
 
     # Truth Catalog
-    gal_cat = pd.DataFrame(outcome.outputTruthCatalog)
+    cat_dtype = [
+    ("indices", "i8"),
+    ("redshift", "f8"),
+    ("angles", "f8"),
+    ("gamma1", "f8"), ("gamma2", "f8"), ("kappa", "f8"),
+    ("dx", "f8"), ("dy", "f8"),
+    ("ra", "f8"), ("dec", "f8"),       # post-lensed ra, dec
+    ("image_x", "f8"), ("image_y", "f8"),
+    ("prelensed_image_x", "f8"), ("prelensed_image_y", "f8"),
+    ("has_finite_shear", "bool"),('hlr', '<f8')
+]
+    gal_cat = np.array(truthCatalog, dtype=cat_dtype)
+    gal_cat = pd.DataFrame(gal_cat)
 
+
+    gal_ref = cat_ref[gal_cat['indices']]
+    e = get_weighted_e(gal_ref['a_b'], gal_ref['b_b'], gal_ref['pa_bulge'], gal_ref['fluxnorm_bulge']*1e21,
+                          gal_ref['a_d'], gal_ref['b_d'], gal_ref['pa_disk'], gal_ref['fluxnorm_disk']*1e21,
+                            gal_cat['angles'])
+    gal_cat['e1'] = e[0]
+    gal_cat['e2'] = e[1]
     # Cutout Images
     cutouts = cutout_xlens_image(gal_array, gal_cat, seed, noise_level=0)
 
@@ -115,12 +191,13 @@ def xlens_gal_sim(
     full_img_path = os.path.join(output_dir, "full_image.npy")
 
     # Check if file exists before deleting
-    if os.path.exists(full_img_path):
+    '''if os.path.exists(full_img_path):
         os.remove(full_img_path)
         print(f"Deleted: {full_img_path}")
     else:
-        print(f"File not found: {full_img_path}")
+        print(f"File not found: {full_img_path}")'''
     np.save(os.path.join(output_dir, "psf_image.npy"), psf_array)
+    #np.save(full_img_path, gal_array)
     np.save(os.path.join(output_dir, "cutouts.npy"), cutouts)
     gal_cat.to_csv(os.path.join(output_dir, "gt_cat.csv"), index=False)
 
@@ -128,9 +205,9 @@ class xlen_simulator():
     def __init__(self, output_dir, 
                  abs_shear = 0.02, 
                  ori_seed = 666,
-                 image_size = 800,
+                 image_size = 1000,
                  pixel_scale = 0.2,
-                 separation = 20.0,
+                 separation = 18.0,
                  num_workers=8):
         self.seed = ori_seed
         self.output_dir = output_dir
@@ -143,7 +220,7 @@ class xlen_simulator():
     def __call__(self, num_sims: int):
         shear_tasks = [
             (2, "g1"),
-            (2, "g2"),
+            #(2, "g2"),
             (0, "g1"),
             (1, "g1"),
             (0, "g2"),
@@ -161,6 +238,21 @@ class xlen_simulator():
                     desc=f"Mode {shear_mode}, Comp {shear_comp}"
                 ))
                 results.extend(res)
+        '''for shear_mode, shear_comp in shear_tasks:
+            for index in tqdm(range(num_sims), desc=f"Mode {shear_mode}, Comp {shear_comp}"):
+                seed = seeds[index]
+                output_dir = f'{self.output_dir}/{shear_comp}_{shear_mode}_val_{self.abs_shear:.3f}/img_{int(index)}/'
+                temp = xlens_gal_sim(
+                    output_dir = output_dir,
+                    shear_mode = shear_mode,
+                    shear_comp = shear_comp,
+                    shear_value = self.abs_shear,
+                    seed = seed,
+                    dim = self.image_size,
+                    pixel_scale = self.pixel_scale,
+                    sep = self.separation,
+                )
+                results.append(temp)'''
 
         return results
 
@@ -178,5 +270,6 @@ class xlen_simulator():
         )
 
 
-simulator = xlen_simulator('/work/hdd/bdsp/wenyinli/datasets/xlens_gal/', num_workers=64)
-simulator(100000)
+simulator = xlen_simulator('/work/hdd/bdsp/wenyinli/datasets/xlens_train/', num_workers=64)
+#simulator = xlen_simulator('/projects/bdsp/wenyinli/codes/single_galaxies', num_workers=4)
+simulator(666)
