@@ -7,67 +7,139 @@ from typing import Literal, Tuple
 import torch
 from torch import nn
 import torch.nn.functional as F
+import torchvision.transforms as T
 from torchvision.models.resnet import resnet18, ResNet18_Weights
 
 from src.architecture.CNN_toolkit import D4_eq_weight, center_crop_to
-from src.architecture.CNN_module import R180Inv_Conv2d, D4Inv_Conv2d, ConvGELU, BiasFreeMLP
+from src.architecture.CNN_module import R180Inv_Conv2d, D4Inv_Conv2d, ConvGELU, BiasFreeMLP, ResConvBNGELU
 #######################################################################################################
 # CNN models:
 #######################################################################################################
 
+
 class SmoothCNN_GeLU(nn.Module):
     """
-      input:  [B, in_dim, H, W]  ('in_dim' bands)
-      output:  [B, 2]        (e1, e2)
+      input:  [B, in_dim, H, W]
+      output: [B, 2]  (e1, e2), D4 协变
     """
-
-
-    def __init__(self, in_dim = 1,  base_channels=64, head_hidden=256, out_dim=2):
+    def __init__(self, 
+                 in_dim=1, 
+                 base_channels=32, 
+                 head_hidden=128, 
+                 out_dim=2, 
+                 num_layers: int = 5,):
         super().__init__()
+        assert out_dim == 2, "This D4-equivariant head assumes two shape components."
         C = base_channels
         self.inpad = nn.ConstantPad2d(10, 0.0)
-        self.block1 = ConvGELU(in_dim,   C)
-        self.block2 = ConvGELU(C,   C)
-        self.block3 = ConvGELU(C,   C)
-        self.block4 = ConvGELU(C,   C)
-        self.block5 = ConvGELU(C,   C)
 
+
+        # ---------- NEW: depthwise Gaussian smoothing layer ----------
+        self.smooth = T.GaussianBlur(kernel_size=5, sigma=0.7)
+
+        # CNN backbone
+        layers = [ConvGELU(in_dim, C)]
+        layers += [ConvGELU(C, C) for _ in range(max(0, num_layers - 1))]
+        self.blocks = nn.ModuleList(layers)
 
         self.gap = nn.AdaptiveAvgPool2d(1)  # -> [B, C, 1, 1]
 
-        # MLP head
-        self.head = nn.Sequential(
-            nn.Flatten(),
-            nn.Linear(C, head_hidden),
-            nn.GELU(),
-            nn.Linear(head_hidden, out_dim),
-        )
+        self.head_e1 = BiasFreeMLP(C, hidden=head_hidden)
+        self.head_e2 = BiasFreeMLP(C, hidden=head_hidden)
 
-        # 线性层初始化
-        for m in self.head:
-            if isinstance(m, nn.Linear):
-                nn.init.kaiming_normal_(m.weight, nonlinearity='relu')
-                if m.bias is not None:
-                    nn.init.zeros_(m.bias)
+        # 8 elements from _d4_augment r0, r90, r180, r270, r0·sx, r90·sx, r180·sx, r270·sx
+        self.register_buffer('signs_e1', torch.tensor([+1, -1, +1, -1, +1, -1, +1, -1], dtype=torch.float32))
+        self.register_buffer('signs_e2', torch.tensor([+1, -1, +1, -1, -1, +1, -1, +1], dtype=torch.float32))
 
-    def forward(self, x):
-        # x: [B,in_dim,H,W]
-        H = x.size(-2)-6
-        W = x.size(-1)-6
-        x = self.inpad(x)                       # [B,in_dim,H+20,W+20]
-        x = self.block1(x)
-        x = self.block2(x)
-        x = self.block3(x)
-        x = self.block4(x)
-        x = self.block5(x) 
-        
-        # Crop out the center [H, W]
+    # ----------------- D4 空间作用 -----------------
+    @staticmethod
+    def _rot90_k(x, k: int):
+        return torch.rot90(x, k % 4, dims=(-2, -1))
+
+    @staticmethod
+    def _reflect_x(x):
+        return torch.flip(x, dims=[-2]) 
+
+    def _d4_augment(self, x):
+        xs = []
+        for k in range(4):
+            xs.append(self._rot90_k(x, k))
+        for k in range(4):
+            xs.append(self._reflect_x(self._rot90_k(x, k)))
+        return xs  # list of 8 tensors [B,C,H,W]
+
+    def _d4_inverse(self, x, idx: int):
+        if idx < 4:      # r^k
+            return self._rot90_k(x, -idx)
+        else:            # r^k * sx
+            k = idx - 4
+            return self._rot90_k(self._reflect_x(x), -k)
+
+    # ----------------- trunk：提取 feature map -----------------
+    def _trunk_feature(self, x):
+        H = x.size(-2) - 6
+        W = x.size(-1) - 6
+        x = self.inpad(x)
+        for blk in self.blocks:
+            x = blk(x)
         h_, w_ = x.size(-2), x.size(-1)
-        x = x[:, :, (h_ // 2 - H // 2):(h_ // 2 + H // 2), (w_ // 2 - W // 2):(w_ // 2 + W // 2)] # [B,C,H,W]
-        x = self.gap(x).squeeze(-1).squeeze(-2)  # [B, C]
-        
-        y = self.head(x)                         # [B, 2]
-        return y
+        x = x[:, :,
+              (h_ // 2 - H // 2):(h_ // 2 + H // 2),
+              (w_ // 2 - W // 2):(w_ // 2 + W // 2)]  # [B,C,H,W]
+        return x
+
+    # ----------------- forward -----------------
+    def forward(self, x):
+        self.m   = x.sum(dim=(1, 2, 3), keepdim=True)         # [B,1,1,1]
+        self.eps = x.std(dim=(1, 2, 3), keepdim=True)
+        x = x / (self.m + self.eps.clamp(min=1e-6))          
+        self.x = self.smooth(x)                                    # [B,in_dim,H,W]
+        norm = torch.sqrt(self.x.pow(2).sum(dim=(-1, -2), keepdim=True) + 1e-6)  # [B,in_dim,1,1]
+        w = self.x / norm                                                          # [B,in_dim,H,W]
+
+        # If in_dim>1, compress to a single weight map; if in_dim==1 this is a no-op
+        w = w.mean(dim=1, keepdim=True)                                            # [B,1,H,W]
+
+        # 1) D4 Orbit with features as you already have...
+        xs = self._d4_augment(x)
+        feats = []
+        for idx, xi in enumerate(xs):
+            f = self._trunk_feature(xi)      # [B,C,H,W]
+            f_inv = self._d4_inverse(f, idx) # [B,C,H,W]
+            feats.append(f_inv)
+        feats = torch.stack(feats, dim=0)     # [8,B,C,H,W]
+
+        s1 = self.signs_e1.view(8, 1, 1, 1, 1).to(feats.dtype).to(feats.device)
+        s2 = self.signs_e2.view(8, 1, 1, 1, 1).to(feats.dtype).to(feats.device)
+
+        self.f_mean_e1 = (feats * s1).mean(dim=0)  # [B,C,H,W]
+        self.f_mean_e2 = (feats * s2).mean(dim=0)  # [B,C,H,W]
+
+
+        Hf, Wf = self.f_mean_e1.shape[-2], self.f_mean_e1.shape[-1]
+        Hw, Ww = w.shape[-2], w.shape[-1]
+        if (Hw != Hf) or (Ww != Wf):
+            dh = (Hw - Hf) // 2
+            dw = (Ww - Wf) // 2
+            w = w[:, :, dh:dh + Hf, dw:dw + Wf]   # center crop
+
+        # 2) Weighted GAP helper
+        def weighted_gap(feat, w):
+            # feat: [B,C,H,W], w: [B,1,H,W]
+            ws = w.sum(dim=(-2, -1), keepdim=True).clamp_min(1e-6)  # [B,1,1,1]
+            v = (feat * w).sum(dim=(-2, -1), keepdim=True) / ws     # [B,C,1,1]
+            return v.squeeze(-1).squeeze(-2)                        # [B,C]
+
+        # 3) Compute weighted pooled vectors
+        v1 = weighted_gap(self.f_mean_e1, w)  # [B,C]
+        v2 = weighted_gap(self.f_mean_e2, w)  # [B,C]
+
+        # 4) Heads
+        e1 = self.head_e1(v1)
+        e2 = self.head_e2(v2)  # [B,1]
+        e  = torch.cat([e1, e2], dim=-1)
+        return e
+
 
 class R180Inv_CNN_GeLU(nn.Module):
     """
@@ -134,33 +206,36 @@ class D4T_CNN_GeLU(nn.Module):
 
     def forward(self, x):
         B, C, H, W = x.shape
+
+        # --- 保留你的归一化 ---
         self.m = x.sum(dim=(1,2,3), keepdim=True)   # [B,1,1,1]
         self.eps = x.std(dim=(1,2,3), keepdim=True)
-        x = x / (self.m + self.eps)
-        
+        x = x / (self.m + self.eps.clamp(min=1e-6))
+
+        # --- inpad 后走特征提取 ---
         y = self.inpad(x)  # [B, C, H+12, W+12]
-        w0, w1 = D4_eq_weight(y)
         for block in self.blocks:
-            y = block(y)
-        # Crop out the center [H, W]
-        #win = hann_window(H+4, W+4, margin=6, device=w0.device, dtype=w0.dtype)
-        self.y = center_crop_to(y, (H+8, W+8))  # [B, C, H, W]
-        self.w0 = center_crop_to(w0, (H+8, W+8))
-        self.w1 = center_crop_to(w1, (H+8, W+8))
+            y = block(y)   # 期望保持空间尺寸不变：仍约 [B, C, H+12, W+12]
 
-        norm_0 = torch.sqrt((self.w0**2+1e-6).sum(dim=(-1,-2)))
-        norm_1 = torch.sqrt((self.w1**2+1e-6).sum(dim=(-1,-2))) 
+        w0, w1 = D4_eq_weight(y)
 
-        self.y0 = self.y*self.w0
-        self.y1 = self.y*self.w1
+        self.y  = center_crop_to(y,  (H, W))  # [B, C, H+8, W+8]
+        self.w0 = center_crop_to(w0, (H, W))  # [B, C, H+8, W+8]
+        self.w1 = center_crop_to(w1, (H, W))  # [B, C, H+8, W+8]
 
-        z0 = self.y0.sum(dim = (-1,-2))/norm_0 # [B,C]
-        z1 = self.y1.sum(dim = (-1,-2))/norm_1 # [B,C]
+        norm_0 = torch.sqrt((self.w0.pow(2).sum(dim=(-1, -2)) + 1e-6))  # [B, C]
+        norm_1 = torch.sqrt((self.w1.pow(2).sum(dim=(-1, -2)) + 1e-6))  # [B, C]
+
+        self.y0 = self.y * self.w0
+        self.y1 = self.y * self.w1
+
+        z0 = self.y0.sum(dim=(-1, -2)) / norm_0  # [B, C]
+        z1 = self.y1.sum(dim=(-1, -2)) / norm_1  # [B, C]
 
         shape0 = self.head0(z0)  # [B, 1]
         shape1 = self.head1(z1)  # [B, 1]
 
-        out = torch.cat([shape0, shape1], dim=-1)  # [B,2], order: [shape_0, shape_1]
+        out = torch.cat([shape0, shape1], dim=-1)  # [B, 2]
         return out
 
 class ShpaeResNet_GeLU(nn.Module):

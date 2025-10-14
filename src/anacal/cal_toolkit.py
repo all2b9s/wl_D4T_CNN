@@ -34,14 +34,10 @@ def load_img(shear_comp,
         if noise_level == 'adaptive':
             center = (cutout.shape[-2]//2, cutout.shape[-1]//2)
             cutout_crop = cutout[center[0]-2:(center[0]+3), center[1]-2:(center[1]+3)]
-            noise_list[idx] = rng.uniform(1/40, 1/15)*(cutout_crop.mean())
+            noise_list[idx] = (cutout_crop.mean())/rng.uniform(1,40)
         noise = rng.standard_normal(cutout.shape)*noise_list[idx]
         cutouts[idx] += noise
     return cutouts, psfs, cat, noise_list
-
-
-
-
 
 
 def load_one(i, *, shear_comp, shear_mode, abs_shear_value, noise_level, directory):
@@ -60,8 +56,9 @@ def build_dataset(
     abs_shear_value=0.02,
     noise_level=0.1,
     index_range=[0,100],
-    directory=dir,
+    directory='dir',
     workers=8,
+    return_imgs = True,
     use_threads=True,
 ):
     # 1) Probe shapes once
@@ -78,8 +75,9 @@ def build_dataset(
     N = N_BATCH * B
 
     # 2) Preallocate
-    all_cutouts = np.empty((N, H, W), dtype=cutouts0.dtype)
-    all_psfs    = np.empty((N, H, W), dtype=psfs0.dtype)
+    if return_imgs:
+        all_cutouts = np.empty((N, H, W), dtype=cutouts0.dtype)
+        all_psfs    = np.empty((N, H, W), dtype=psfs0.dtype)
     all_noise = np.empty((N,), dtype=np.float32)
     cat_chunks  = [None] * N_BATCH
 
@@ -109,10 +107,14 @@ def build_dataset(
         ):
             s = i * B
             e = s + B
-            all_cutouts[s:e] = cutouts
-            all_psfs[s:e]    = psfs
+            if return_imgs:
+                all_cutouts[s:e] = cutouts
+                all_psfs[s:e]    = psfs
             all_noise[s:e] = noise_level
             cat_chunks[i]    = cat
 
     all_cats = pd.concat(cat_chunks, ignore_index=True)
-    return all_cutouts, all_psfs, all_cats, all_noise
+    if return_imgs:
+        return all_cutouts, all_psfs, all_cats, all_noise
+    else:
+        return [], [], all_cats, all_noise

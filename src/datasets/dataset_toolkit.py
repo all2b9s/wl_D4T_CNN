@@ -28,29 +28,19 @@ def galsim_e(bulge_params, disk_params, angle,shift=[0,0],
                 n_bulge=4.0, n_disk=1.0,
                 pixel_scale=0.2, stamp_size=64):
     """
-    输入 bulge 和 disk 的参数，输出 galaxy 图像和整体椭率。
-
     Parameters
     ----------
     bulge_params : (a, b, pa, flux)
-        bulge 的长轴, 短轴, 位置角(度), 总光度
     disk_params : (a, b, pa, flux)
-        disk 的长轴, 短轴, 位置角(度), 总光度
     n_bulge : float
-        Sérsic 指数 (默认 bulge=4)
     n_disk : float
-        Sérsic 指数 (默认 disk=1)
     pixel_scale : float
-        像素大小 (arcsec/pixel)
     stamp_size : int
-        图像大小 (像素)
 
     Returns
     -------
     img_total : galsim.Image
-        合成星系图像
-    ellip : dict
-        测量的椭率 {e1, e2, e}
+    ellip : dict {e1, e2}
     """
 
     def make_comp(a, b, pa, flux, n):
@@ -71,8 +61,6 @@ def galsim_e(bulge_params, disk_params, angle,shift=[0,0],
                              method="no_pixel",
                              )
 
-
-    # 用 HSM 自适应矩测椭率
     try:
         res = galsim.hsm.FindAdaptiveMom(img_total)
         e1, e2 = res.observed_shape.e1, res.observed_shape.e2

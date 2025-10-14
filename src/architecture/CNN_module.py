@@ -134,9 +134,12 @@ class D4Inv_Conv2d(nn.Module):
 
 class ConvGELU(nn.Module):
     """ReflectionPad2d + Conv2d(3x3, stride=1) + GeLU"""
-    def __init__(self, in_ch, out_ch):
+    def __init__(self, in_ch, out_ch,
+                bn_eps: float = 1e-5,
+                bn_momentum: float = 0.1,):
         super().__init__()
         self.conv = nn.Conv2d(in_ch, out_ch, kernel_size=3, stride=1, padding=0, bias=True)
+        self.bn = nn.BatchNorm2d(out_ch, eps=bn_eps, momentum=bn_momentum)
         self.act  = nn.GELU()
 
         # Kaiming init
@@ -146,8 +149,48 @@ class ConvGELU(nn.Module):
 
     def forward(self, x):
         x = self.conv(x)
+        x = self.bn(x)
         x = self.act(x)
         return x
+    
+class ConvGELU_Res(nn.Module):
+    """
+    ReflectionPad2d + Conv2d(3×3) + LayerNorm(GroupNorm) + GeLU
+    + 0.1 * residual connection
+
+    Residual path helps preserve input information and stabilize training,
+    while LayerNorm (implemented via GroupNorm(1, C)) prevents batch
+    statistic coupling between low- and high-S/N samples.
+    """
+
+    def __init__(self, in_ch, out_ch, residual_scale: float = 0.1):
+        super().__init__()
+        self.residual_scale = residual_scale
+        self.pad = nn.ReflectionPad2d(1)
+        self.conv = nn.Conv2d(in_ch, out_ch, kernel_size=3, stride=1, padding=0, bias=True)
+        #self.norm = nn.GroupNorm(1, out_ch, affine=True)  # LayerNorm-like behavior
+        self.act = nn.GELU()
+
+        # Optional 1×1 conv for channel alignment (if in_ch != out_ch)
+        self.skip = None
+        if in_ch != out_ch:
+            self.skip = nn.Conv2d(in_ch, out_ch, kernel_size=1, stride=1, bias=False)
+
+        # Kaiming initialization
+        nn.init.kaiming_normal_(self.conv.weight, nonlinearity="relu")
+        if self.conv.bias is not None:
+            nn.init.zeros_(self.conv.bias)
+        if self.skip is not None:
+            nn.init.kaiming_normal_(self.skip.weight, nonlinearity="linear")
+
+    def forward(self, x):
+        residual = self.skip(x) if self.skip is not None else x
+        y = self.pad(x)
+        y = self.conv(y)
+        #y = self.norm(y)
+        y = self.act(y)
+
+        return y + self.residual_scale * residual
 
 class BiasFreeMLP(nn.Module):
     def __init__(self, in_dim: int, hidden: int = 128):
@@ -156,11 +199,101 @@ class BiasFreeMLP(nn.Module):
             nn.Flatten(),
             nn.Linear(in_dim, hidden, bias=False),
             nn.Tanh(),
+            nn.Linear(hidden, hidden, bias=False),
+            nn.Tanh(),
+            nn.Linear(hidden, hidden, bias=False),
+            nn.Tanh(),
             nn.Linear(hidden, 1, bias=False)
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.net(x)
+
+class ResConvBNGELU(nn.Module):
+    """
+    Residual Conv block: Conv-BN-GELU -> Conv-BN, with skip connection.
+    - Preserves H×W when stride=1 (same-padding).
+    - Uses 1×1 projection if in/out channels or stride differ.
+    - BatchNorm is fine for batch sizes ~1e2.
+
+    Args:
+        in_c (int): input channels
+        out_c (int): output channels
+        k (int): kernel size (odd recommended)
+        stride (int): conv stride for both convs (projection uses same stride)
+        dilation (int): dilation for both convs
+        groups (int): conv groups (keep 1 for standard conv)
+        bn_eps (float): BatchNorm eps
+        bn_momentum (float): BatchNorm momentum
+        dropout_p (float): optional Dropout2d after the second BN (default 0.0 = off)
+    """
+    def __init__(
+        self,
+        in_c: int,
+        out_c: int,
+        k: int = 3,
+        stride: int = 1,
+        dilation: int = 1,
+        groups: int = 1,
+        bn_eps: float = 1e-5,
+        bn_momentum: float = 0.1,
+        dropout_p: float = 0.0,
+    ):
+        super().__init__()
+        assert k >= 1 and isinstance(k, int), "kernel size must be int >= 1"
+        assert stride >= 1 and dilation >= 1
+        p = (k // 2) * dilation  # 'same' padding for odd k
+
+        self.conv1 = nn.Conv2d(
+            in_c, out_c, kernel_size=k, stride=stride, padding=p,
+            dilation=dilation, groups=groups, bias=False
+        )
+        self.bn1 = nn.BatchNorm2d(out_c, eps=bn_eps, momentum=bn_momentum)
+        self.act = nn.GELU()
+        self.conv2 = nn.Conv2d(
+            out_c, out_c, kernel_size=k, stride=1, padding=p,
+            dilation=dilation, groups=groups, bias=False
+        )
+        self.bn2 = nn.BatchNorm2d(out_c, eps=bn_eps, momentum=bn_momentum)
+
+        # Optional dropout after BN2 (kept off by default)
+        self.drop = nn.Dropout2d(dropout_p) if dropout_p and dropout_p > 0.0 else nn.Identity()
+
+        # Projection for skip path if shape changes
+        needs_proj = (in_c != out_c) or (stride != 1)
+        self.proj = (
+            nn.Sequential(
+                nn.Conv2d(in_c, out_c, kernel_size=1, stride=stride, bias=False),
+                nn.BatchNorm2d(out_c, eps=bn_eps, momentum=bn_momentum),
+            )
+            if needs_proj else nn.Identity()
+        )
+
+        #self._init_weights()
+
+    def _init_weights(self):
+        # Kaiming for GELU; BN to sensible defaults
+        for m in self.modules():
+            if isinstance(m, nn.Conv2d):
+                nn.init.kaiming_normal_(m.weight, mode="fan_out", nonlinearity="gelu")
+            elif isinstance(m, nn.BatchNorm2d):
+                nn.init.ones_(m.weight)
+                nn.init.zeros_(m.bias)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        identity = x
+
+        out = self.conv1(x)
+        out = self.bn1(out)
+        out = self.act(out)
+
+        out = self.conv2(out)
+        out = self.bn2(out)
+        out = self.drop(out)
+
+        out = out + self.proj(identity)
+        out = self.act(out)
+        return out
 
 def hann_window(H, W, margin, device, dtype):
     if margin <= 0:
@@ -178,3 +311,37 @@ def hann_window(H, W, margin, device, dtype):
     wx = ramp(W); wy = ramp(H)
     win = wy.view(H,1) * wx.view(1,W)
     return win.view(1,1,H,W)
+
+def asinh_norm_torch(data: torch.Tensor, vmin=0, vmax=1, a: float = 0.1):
+    """
+    Apply asinh normalization similar to Astropy's AsinhStretch.
+
+    Args:
+        data:  torch.Tensor [H, W] or [B, C, H, W]
+        vmin, vmax: optional bounds; if None, use 1–99 percentile
+        a:     softening parameter for asinh stretch (default=0.1)
+    Returns:
+        normed: same shape tensor normalized to [0, 1]
+    """
+
+    # 1. remove NaN/Inf
+    finite_mask = torch.isfinite(data)
+    if not finite_mask.any():
+        return torch.zeros_like(data)
+
+    finite_data = data[finite_mask]
+
+    # 2. compute percentiles if not given
+    if vmin is None or vmax is None:
+        vmin_p, vmax_p = torch.quantile(finite_data, torch.tensor([0.01, 0.99], device=data.device))
+        vmin = float(vmin_p) if vmin is None else vmin
+        vmax = float(vmax_p) if vmax is None else vmax
+
+    # 3. scale to [0, 1]
+    scaled = (data - vmin) / (vmax - vmin + 1e-12)
+    #scaled = scaled.clamp(0, 1)
+
+    # 4. apply asinh stretch
+    stretched = torch.asinh(scaled / a) / torch.asinh(torch.tensor(1.0 / a, device=data.device))
+
+    return stretched

@@ -60,7 +60,7 @@ def _worker_wrapper(args):
 def cutout_xlens_image(full_image, truth_catalog, seed, noise_level=0.354):
     cutouts = np.zeros((len(truth_catalog),64,64))
     for idx, gal in truth_catalog.iterrows():
-        x, y = round(gal['image_x']), int(gal['image_y'])
+        x, y = round(gal['image_x']), round(gal['image_y'])
         cutout = full_image[y-32:y+32, x-32:x+32]
         rng = np.random.default_rng(seed//2+idx)
         if noise_level>0:
@@ -115,9 +115,10 @@ def xlens_gal_sim(
     #config.sep= sep  # arcsec
     # we can change to mode = 5 for shear g1: (0.02, 0)
     task_config.extend_ratio = 0.9
-    task_config.select_observable = ['i_ab', 'a_d']
-    task_config.select_lower_limit = [0,0.3]
-    task_config.select_upper_limit = [21,3.0]
+    task_config.force_pixel_center = True
+    task_config.select_observable = ['i_ab']
+    task_config.select_lower_limit = [0]
+    task_config.select_upper_limit = [25.3]
     task_config.sep_arcsec = sep # arcsec
 
     cattask = CatalogShearTask(config=task_config)
@@ -125,8 +126,8 @@ def xlens_gal_sim(
         tract_info=skymap[tract_id],
         seed=seed,
     ).truthCatalog
-    for item in truthCatalog:
-        item[2] *= np.pi/180  # fix all galaxies' angle to 180 degree
+    #for item in truthCatalog:
+    #    item[2] *= np.pi/180  # fix all galaxies' angle to 180 degree
     #print(len(truthCatalog))
     config = MultibandSimConfig()
     config.survey_name = (
@@ -270,6 +271,6 @@ class xlen_simulator():
         )
 
 
-simulator = xlen_simulator('/work/hdd/bdsp/wenyinli/datasets/xlens_train/', num_workers=64)
-#simulator = xlen_simulator('/projects/bdsp/wenyinli/codes/single_galaxies', num_workers=4)
-simulator(666)
+simulator = xlen_simulator('/work/hdd/bfmo/wenyinli/datasets/xlens_gal/', num_workers=64)
+#simulator = xlen_simulator('/work/nvme/bfmo/wenyinli/datasets/xlens_train/', num_workers=64, ori_seed=20240411)
+simulator(10000)

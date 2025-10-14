@@ -8,39 +8,58 @@ import torch.nn.functional as F
 from torch import nn
 import pandas as pd
 
+# Testing plotting and data loading
 
 def load_test_item(
     images_path: str = "images.npy",
     csv_path: str = "gt_info.csv",
-    index: int = 0,
-    target: str = "e",   # "e" -> (e1,e2), "g" -> (g1,g2)
-    normalize: str = "none"  # or "none"
+    index_range: list = None,   # e.g. [0, 10]
+    target: str = "e",          # "e" -> (e1, e2), "g" -> (g1, g2)
+    normalize: str = "none"     # or "per_image"
 ):
+    if index_range is None or len(index_range) != 2:
+        raise ValueError("index_range must be a list like [start, end].")
 
+    # Load CSV and select test subset
     df = pd.read_csv(csv_path)
     df_test = df[df["split"] == "test"].sort_values("id").reset_index(drop=True)
-    assert 0 <= index < len(df_test), f"index out of range: 0..{len(df_test)-1}"
-    row = df_test.iloc[index]
-    img_id = int(row["id"])
 
-    # read image
+    idx_min, idx_max = index_range
+    if idx_min < 0 or idx_max > len(df_test):
+        raise IndexError("index_range is out of bounds for test dataset.")
+
+    # Load all images (mmap for memory efficiency)
     imgs = np.load(images_path, mmap_mode="r")
-    img = imgs[img_id].astype(np.float32, copy=True)  # [H, W]
 
-    # target
-    if target == "e":
-        y = np.array([row["e1"], row["e2"]], dtype=np.float32)
-    elif target == "g":
-        y = np.array([row["g1"], row["g2"]], dtype=np.float32)
-    else:
-        raise ValueError("target must be 'e' or 'g'")
+    img_list, y_list = [], []
 
-    # normalization
-    if normalize == "per_image":
-        m, s = img.mean(), img.std()
-        img = (img - m) / s if s > 0 else (img - m)
+    for index in range(idx_min, idx_max):
+        row = df_test.iloc[index]
+        img_id = int(row["id"])
 
-    return img, y
+        # read image
+        img = imgs[img_id].astype(np.float32, copy=True)
+
+        # normalization
+        if normalize == "per_image":
+            m, s = img.mean(), img.std()
+            img = (img - m) / s if s > 0 else (img - m)
+
+        # target
+        if target == "e":
+            y = np.array([row["e1"], row["e2"]], dtype=np.float32)
+        elif target == "g":
+            y = np.array([row["g1"], row["g2"]], dtype=np.float32)
+        else:
+            raise ValueError("target must be 'e' or 'g'")
+
+        img_list.append(img)
+        y_list.append(y)
+
+    imgs_out = np.stack(img_list)   # shape [N, H, W]
+    ys_out = np.stack(y_list)       # shape [N, 2]
+
+    return imgs_out, ys_out
 
 def plot_shape_bidirectional(
     img: np.ndarray,                 # [H, W]
@@ -125,7 +144,7 @@ def D4_eq_weight(img):
 
     # reshape to conv2d friendly 2D separable kernels
     # x方向核: [1,1,KW,1]; y方向核: [1,1,1,KH]
-    kx_s5  = s5.view(1, 1, -1, 1).repeat(C, 1, 1, 1)
+    kx_s5  = s5.view(1, 1, -1, 1).repeat(C, 1, 1, 1)    
     ky_s5  = s5.view(1, 1,  1, -1).repeat(C, 1, 1, 1)
     kx_d5s = d5s.view(1, 1, -1, 1).repeat(C, 1, 1, 1)
     ky_d5s = d5s.view(1, 1,  1, -1).repeat(C, 1, 1, 1)
@@ -206,7 +225,7 @@ def shape_pixel_gradients(
     # ---- One forward pass on duplicated batch ----
     # Make [2B,1,H,W]: first half used to backprop e1, second half for e2
     x2 = torch.cat([x, x], dim=0)                   # [2B,1,H,W]
-    pred2 = model(x2)                               # [2B, 2]
+    pred2 = model(x2)[:,:2]                               # [2B, 2]
     # Use the first B predictions as the output preds (inputs identical)
     pred = pred2[:B]
 
@@ -238,6 +257,29 @@ def shape_pixel_gradients(
     grad_e2_np = grad_e2.detach().cpu().numpy()         # [B,H,W]
 
     return pred_np, grad_e1_np, grad_e2_np 
+
+def draw_grad(model, img):
+    pred, grad_e1, grad_e2 = shape_pixel_gradients(model, img, normalize="none")
+
+    print("pred (e1,e2):", pred)
+    fig, axs = plt.subplots(1, 3, figsize=(10, 3))
+    im0 = axs[0].imshow(img, cmap="gray", origin="lower")
+    axs[0].set_title("input")
+    im1 = axs[1].imshow(grad_e1[0][0], cmap="bwr", origin="lower", vmax = np.abs(grad_e1).max(), vmin = -np.abs(grad_e1).max())
+    axs[1].set_title(r"$\partial e_1/\partial I$")
+    im2 = axs[2].imshow(grad_e2[0][0], cmap="bwr", origin="lower", vmax = np.abs(grad_e2).max(), vmin = -np.abs(grad_e2).max())
+    axs[2].set_title(r"$\partial e_2/\partial I$")
+
+    fig.colorbar(im0, ax=axs[0])
+    fig.colorbar(im1, ax=axs[1])
+    fig.colorbar(im2, ax=axs[2])
+
+    for ax in axs:
+        ax.set_xticks([])
+        ax.set_yticks([])
+    plt.tight_layout()
+    plt.show()
+    return pred, grad_e1, grad_e2
 
 # --------------------------
 # Utils: geometry & sizing
@@ -276,6 +318,33 @@ def gaussian_kernel2d(ks: int, sigma: float, device=None, dtype=None):
     g2d = torch.outer(g1d, g1d)
     g2d = g2d / g2d.sum()
     return g2d  # [ks, ks]
+
+def gaussian_weight_2d(size: int | tuple[int, int], std: float = 16, device=None, normalize=True):
+    """
+    Generate a 2D Gaussian weight image centered in the middle.
+
+    Args:
+        size: int or (H, W)
+        std: standard deviation (in pixels)
+        device: torch device (cpu / cuda)
+        normalize: if True, normalize so that sum = 1
+
+    Returns:
+        Tensor of shape [H, W] with dtype=float32
+    """
+    if isinstance(size, int):
+        H = W = size
+    else:
+        H, W = size
+
+    y = torch.arange(H, device=device, dtype=torch.float32) - (H) // 2
+    x = torch.arange(W, device=device, dtype=torch.float32) - (W) // 2
+    yy, xx = torch.meshgrid(y, x, indexing="ij")
+
+    g = torch.exp(-0.5 * (xx**2 + yy**2) / (std**2))/(2*np.pi*std**2)
+    #if normalize:
+    #    g /= g.sum()
+    return g
 
 def gaussian_blur(x: torch.Tensor, ks: int = 3, sigma: float = 1.0) -> torch.Tensor:
     """

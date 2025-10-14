@@ -5,6 +5,7 @@ import pandas as pd
 from typing import Literal, Tuple
 
 import torch
+from torch.utils.data import get_worker_info
 from torch import nn
 from torch.utils.data import Dataset, DataLoader
 from torchvision.models import resnet18, ResNet18_Weights
@@ -63,35 +64,46 @@ def rotate_image_90(img: torch.Tensor, k: int) -> torch.Tensor:
         return torch.rot90(img, k, dims=(0,1))
     return torch.rot90(img, k, dims=(-2,-1))
 
-def add_resmoothed_noise(img, psf_fwhm=0.85, crop_size=2, rng=None, device=None):
+def add_resmoothed_noise(img, max_sigma=0.05, rng=None):
     """
-    Add Gaussian noise then re-smooth to target PSF FWHM.
-    img: [B,C,H,W] float32
-    psf_fwhm: float, arcsec
-    crop_size: int
-    rng: torch.Generator
-    device: torch.device
+    Works with [H,W], [C,H,W], or [B,C,H,W]. CPU-safe inside Dataset/__getitem__.
     """
-    if device is None:
-        device = img.device
+    # Ensure CPU inside DataLoader workers
+    if img.device.type != "cpu":
+        img = img.cpu()
+
+    # Ensure float dtype
+    if not img.is_floating_point():
+        img = img.float()
+
+    # Worker-safe RNG
     if rng is None:
         rng = torch.Generator(device="cpu")
+        wi = get_worker_info()
+        rng.manual_seed(wi.seed if wi is not None else torch.initial_seed())
 
-    center = (img.shape[-2] // 2, img.shape[-1] // 2)
-    img_crop = img[..., 
-                   center[0] - crop_size:center[0] + crop_size + 1,
-                   center[1] - crop_size:center[1] + crop_size + 1]
-    img_signal = img_crop.sum(dim=(-2, -1), keepdim=True)  # (B,C,1,1)
+    # Leading dims before H,W
+    assert img.dim() >= 2, "img must have at least H,W"
+    lead = img.shape[:-2]
 
-    if psf_fwhm > 0:
-        sigma = psf_fwhm / (2.0 * math.sqrt(2.0 * math.log(2.0)))  # arcsec
-        norm = torch.rand(img.shape[:2], generator=rng, device=device) * 0.05  # (B,C)
-        norm = norm.unsqueeze(-1).unsqueeze(-1)  # (B,C,1,1)
-        noise = torch.randn(img.shape, generator=rng, device=device) * img_signal * norm  # (B,C,H,W)
-        img = img + noise
+    # Per-(leading dims) sigma
+    if len(lead) == 0:
+        sigma = torch.rand((), generator=rng, device="cpu", dtype=img.dtype) * max_sigma
+    else:
+        sigma = torch.rand(lead, generator=rng, device="cpu", dtype=img.dtype) * max_sigma
+        sigma = sigma.view(*lead, 1, 1)
 
-    return img
-    
+    # Noise (use randn because randn_like may not accept generator)
+    noise = torch.randn(
+        img.shape, generator=rng, device=img.device, dtype=img.dtype
+    )
+    return img + noise * sigma
+
+
+
+# ----------------------------
+# Dataset class
+# ----------------------------
 
 class SingleGalaxyDataset(Dataset):
     """
@@ -176,7 +188,9 @@ class SingleGalaxyDataset(Dataset):
                 img = flip_image_x(img)
                 y = flip_spin2(y)
 
-            #img = add_resmoothed_noise(img, psf_fwhm=0.85, crop_size=5)
+            add_noise = torch.rand(1).item() < 0.5
+            if add_noise: 
+                img = add_resmoothed_noise(img)  # max_sigma=0.05 with 50% prob
 
         return img, y
 
