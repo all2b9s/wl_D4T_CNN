@@ -190,7 +190,7 @@ class SingleGalaxyDataset(Dataset):
 
             add_noise = torch.rand(1).item() < 0.5
             if add_noise: 
-                img = add_resmoothed_noise(img)  # max_sigma=0.05 with 50% prob
+                img = add_resmoothed_noise(img, max_sigma=0.05)  # max_sigma=0.05 with 50% prob
 
         return img, y
 
@@ -213,9 +213,9 @@ def make_loaders(
 
     pin = torch.cuda.is_available()
     train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True,
-                              num_workers=num_workers, pin_memory=pin, drop_last=True)
+                              num_workers=num_workers, pin_memory=pin, drop_last=True, persistent_workers=True)
     val_loader   = DataLoader(val_ds,   batch_size=batch_size, shuffle=False,
-                              num_workers=num_workers, pin_memory=pin)
+                              num_workers=num_workers, pin_memory=pin,persistent_workers=True)
     test_loader  = DataLoader(test_ds,  batch_size=batch_size, shuffle=False,
-                              num_workers=num_workers, pin_memory=pin)
+                              num_workers=num_workers, pin_memory=pin,persistent_workers=True)
     return train_loader, val_loader, test_loader

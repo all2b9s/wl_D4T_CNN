@@ -9,6 +9,29 @@ from torch import nn
 import torch.nn.functional as F
 
 from src.datasets.single_gal_dataset import make_loaders, rotate_spin2, rotate_image_90, flip_image_y, flip_spin2
+# Basic Modules
+
+class ChannelLayerNorm2d(nn.Module):
+    def __init__(self, num_channels, eps=1e-5, affine=True):
+        super().__init__()
+        self.eps = eps
+        if affine:
+            self.weight = nn.Parameter(torch.ones(1, num_channels, 1, 1))
+            self.bias   = nn.Parameter(torch.zeros(1, num_channels, 1, 1))
+        else:
+            self.weight = self.bias = None
+
+    def forward(self, x):
+        # x: [N,C,H,W]
+        mean = x.mean(dim=1, keepdim=True)
+        var  = (x - mean).pow(2).mean(dim=1, keepdim=True)
+        y = (x - mean) * torch.rsqrt(var + self.eps)
+        if self.weight is not None:
+            y = y * self.weight + self.bias
+        return y
+
+
+
 # ----------------------------
 # Related modules:
 # ----------------------------
@@ -95,25 +118,31 @@ class R180Inv_Conv2d(nn.Module):
         x = F.conv2d(x, W_even, self.bias, stride=self.s, padding=self.p)
         return self.act(x)
     
+
 class D4Inv_Conv2d(nn.Module):
     """
-    Rot 180 degree invariant convolution
+    Rot 180° invariant convolution with channel-only normalization (via nn.LayerNorm).
     """
     def __init__(self, in_ch, out_ch, k=3, s=1, p=0, bias=True):
         super().__init__()
-        self.P = nn.Parameter(torch.randn(out_ch, in_ch, k, k) * (2.0/(in_ch*k*k))**0.5)
+        self.P = nn.Parameter(
+            torch.randn(out_ch, in_ch, k, k) * (2.0 / (in_ch * k * k)) ** 0.5
+        )
         self.bias = nn.Parameter(torch.zeros(out_ch)) if bias else None
         self.s, self.p = s, p
+
+        # LayerNorm applied across channels only (for each spatial location)
+        self.norm = nn.LayerNorm(out_ch, elementwise_affine=True)
         self.act = nn.GELU()
-    
+
     @staticmethod
     def _rot90(W):
-        return torch.rot90(W, 1, dims=(-2,-1))
-    
+        return torch.rot90(W, 1, dims=(-2, -1))
+
     @staticmethod
-    def _mirror(W) -> torch.Tensor:
+    def _mirror(W):
         return torch.flip(W, dims=(-1,))  # horizontal flip
-    
+
     def _D4_avg(self, W):
         Ws = [W]
         for _ in range(3):
@@ -124,13 +153,21 @@ class D4Inv_Conv2d(nn.Module):
         for _ in range(3):
             Wm = self._rot90(Wm)
             Ws.append(Wm)
-        W_avg = torch.stack(Ws, dim=0).mean(dim=0)
-        return W_avg
+        return torch.stack(Ws, dim=0).mean(dim=0)
 
     def forward(self, x):
         self.W_D4 = self._D4_avg(self.P)
         x = F.conv2d(x, self.W_D4, self.bias, stride=self.s, padding=self.p)
-        return self.act(x)
+
+        # LayerNorm normalizes over the channel dimension only
+        x = x.permute(0, 2, 3, 1)            # [B, H, W, C]
+        x = self.norm(x)                     # normalize per pixel across C
+        x = x.permute(0, 3, 1, 2).contiguous()  # back to [B, C, H, W]
+
+        x = self.act(x)
+        return x
+
+
 
 class ConvGELU(nn.Module):
     """ReflectionPad2d + Conv2d(3x3, stride=1) + GeLU"""
@@ -163,20 +200,18 @@ class ConvGELU_Res(nn.Module):
     statistic coupling between low- and high-S/N samples.
     """
 
-    def __init__(self, in_ch, out_ch, residual_scale: float = 0.1):
+    def __init__(self, in_ch, out_ch, residual_scale: float = 1, kernel_size: int =3):
         super().__init__()
         self.residual_scale = residual_scale
-        self.pad = nn.ReflectionPad2d(1)
-        self.conv = nn.Conv2d(in_ch, out_ch, kernel_size=3, stride=1, padding=0, bias=True)
-        #self.norm = nn.GroupNorm(1, out_ch, affine=True)  # LayerNorm-like behavior
+        #self.pad = nn.ReflectionPad2d(1)
+        self.conv = nn.Conv2d(in_ch, out_ch, kernel_size=kernel_size, stride=1, padding=kernel_size//2, bias=True)
+        self.norm = ChannelLayerNorm2d(out_ch, eps=1e-5, affine=True)
         self.act = nn.GELU()
 
-        # Optional 1×1 conv for channel alignment (if in_ch != out_ch)
-        self.skip = None
-        if in_ch != out_ch:
-            self.skip = nn.Conv2d(in_ch, out_ch, kernel_size=1, stride=1, bias=False)
+        # optional 1x1 skip if channel mismatch
+        self.skip = nn.Conv2d(in_ch, out_ch, kernel_size=1, stride=1, bias=False) if in_ch != out_ch else None
 
-        # Kaiming initialization
+        # initialization
         nn.init.kaiming_normal_(self.conv.weight, nonlinearity="relu")
         if self.conv.bias is not None:
             nn.init.zeros_(self.conv.bias)
@@ -185,12 +220,48 @@ class ConvGELU_Res(nn.Module):
 
     def forward(self, x):
         residual = self.skip(x) if self.skip is not None else x
-        y = self.pad(x)
-        y = self.conv(y)
-        #y = self.norm(y)
+        #y = self.pad(x)
+        y = self.conv(x)
+        y = self.norm(y)
         y = self.act(y)
-
         return y + self.residual_scale * residual
+
+class ConvGELU_layernorm(nn.Module):
+    """
+    ReflectionPad2d + Conv2d(3×3) + LayerNorm(GroupNorm) + GeLU
+    + 0.1 * residual connection
+
+    Residual path helps preserve input information and stabilize training,
+    while LayerNorm (implemented via GroupNorm(1, C)) prevents batch
+    statistic coupling between low- and high-S/N samples.
+    """
+
+    def __init__(self, in_ch, out_ch, residual_scale: float = 0.1):
+        super().__init__()
+        self.residual_scale = residual_scale
+        #self.pad = nn.ReflectionPad2d(1)
+        self.conv = nn.Conv2d(in_ch, out_ch, kernel_size=3, stride=1, padding=0, bias=True)
+        self.norm = nn.LayerNorm(out_ch, elementwise_affine=True)  # per-channel normalization
+        self.act = nn.GELU()
+
+
+        # initialization
+        nn.init.kaiming_normal_(self.conv.weight, nonlinearity="relu")
+        if self.conv.bias is not None:
+            nn.init.zeros_(self.conv.bias)
+
+    def forward(self, x):
+        y = self.conv(x)
+
+        # Apply normalization along channels only
+        # LayerNorm expects [N, H, W, C], so we permute
+        y = y.permute(0, 2, 3, 1)
+        y = self.norm(y)
+        y = y.permute(0, 3, 1, 2)
+
+        y = self.act(y)
+        return y 
+
 
 class BiasFreeMLP(nn.Module):
     def __init__(self, in_dim: int, hidden: int = 128):
@@ -208,6 +279,7 @@ class BiasFreeMLP(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.net(x)
+
 
 class ResConvBNGELU(nn.Module):
     """

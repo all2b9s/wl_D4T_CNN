@@ -6,6 +6,7 @@ from src.architecture.CNN_toolkit import shape_pixel_gradients, predictor, plot_
 from concurrent.futures import ProcessPoolExecutor
 from functools import partial
 from tqdm import tqdm
+import os
 
 class Calibrator():
     def __init__(self, model, device="cuda", workers=32, shear_value=0.02):
@@ -50,36 +51,6 @@ class Calibrator():
         R_anacal_list = np.stack([r for r in res], axis = 0)
 
         return shapes, R_anacal_list
-
-    def get_biases(self, shapes, Rs, 
-                   bs_size=100, 
-                   bs_times=100,
-                   n_factor=1):
-        """
-        shapes: (N, 4, 2) numpy array 
-        R_anacal: (N, 4, 2, 2) numpy array
-        R_delta: (N, 4, 2, 2) numpy array
-
-        all in sequence of 1p,1n,2p,2n
-
-        Returns:
-        cal_shapes: (N, 4) numpy array
-        """
-        N = shapes.shape[0]
-        m_list = np.zeros((bs_times, 2), dtype=np.float32)
-        c_list = np.zeros((bs_times, 2), dtype=np.float32)
-        bs_inds = [_bootstrap(N, bs_size) for _ in range(bs_times)]
-        for (idx,bs_ind) in enumerate(bs_inds):
-            assert np.all(bs_ind < N)
-            temp= _calibration(shapes[bs_ind], Rs[bs_ind])
-            m = temp[0]
-            c = temp[1]
-            m_list[idx] = m/self.shear_value-1
-            c_list[idx] = c
-        m_mean,c_mean = _calibration(shapes, Rs)
-        m_std = m_list.std(axis=0)*n_factor
-        c_std = c_list.std(axis=0)*n_factor
-        return m_mean/self.shear_value-1, c_mean, m_std, c_std
 
     def get_resmoothed_shape(self, q_imgs, batch_size=32, with_grad=False):
         """
@@ -141,8 +112,65 @@ def _process_image(
         noise_map=(noises[i] if noises is not None else None),
     )
 
-from concurrent.futures import ProcessPoolExecutor
-from tqdm import tqdm
+
+# ---- Bootstraping ----
+_BS_GLOBALS = {"shapes": None, "Rs": None, "shear": None}
+
+def _bs_init_pool(shapes, Rs, shear_value):
+    # Set read-only globals inside each worker process
+    _BS_GLOBALS["shapes"] = shapes
+    _BS_GLOBALS["Rs"]     = Rs
+    _BS_GLOBALS["shear"]  = shear_value
+
+def _bs_worker(bs_ind):
+    # bs_ind: 1D numpy index array
+    shapes = _BS_GLOBALS["shapes"][bs_ind]
+    Rs     = _BS_GLOBALS["Rs"][bs_ind]
+    m, c   = _calibration(shapes, Rs)   # expects to return (m, c) shaped (2,), (2,)
+    shear  = _BS_GLOBALS["shear"]
+    return (m / shear - 1.0, c)         # normalize m here to reduce post work
+
+def get_biases(shapes, Rs,
+                shear_value=0.02,
+               bs_size=100, 
+               bs_times=100,
+               n_factor=1.0,
+               n_jobs=4):
+    """
+    shapes: (N, 4, 2) numpy array 
+    Rs:     (N, 4, 2, 2) numpy array   # combined R inputs you use in _calibration
+    Returns:
+        m_mean (2,), c_mean (2,), m_std (2,), c_std (2,)
+        where m_mean is already (m/shear - 1)
+    """
+    N = shapes.shape[0]
+    # Pre-generate bootstrap indices
+    bs_inds = [_bootstrap(N, bs_size) for _ in range(bs_times)]
+
+    # Parallel map over bootstrap resamples
+    if n_jobs is None:
+        n_jobs = os.cpu_count() or 1
+
+    # Initialize worker pool with shared read-only arrays and shear value
+    with ProcessPoolExecutor(max_workers=n_jobs,
+                             initializer=_bs_init_pool,
+                             initargs=(shapes, Rs, shear_value)) as ex:
+        results = list(ex.map(_bs_worker, bs_inds))
+
+    # Unpack results
+    m_list = np.array([r[0] for r in results], dtype=np.float32)  # (bs_times, 2)
+    c_list = np.array([r[1] for r in results], dtype=np.float32)  # (bs_times, 2)
+
+    # Full-sample estimate (single call, no bootstrap)
+    m_mean, c_mean = _calibration(shapes, Rs)
+    m_mean = m_mean / shear_value - 1.0
+
+    # Bootstrap standard deviations
+    m_std = m_list.std(axis=0, ddof=1) * n_factor
+    c_std = c_list.std(axis=0, ddof=1) * n_factor
+
+    return m_mean, c_mean, m_std, c_std
+
 
 # --- globals inside workers ---
 _G = {}
@@ -181,6 +209,9 @@ def prepare_q_images(images, psfs, noises,
     N = images.shape[0]
     centers = np.ones((N, 2), dtype=np.float32) * (images.shape[1] // 2)
     if cat is not None:
+        if len(cat) > N:
+            cat = cat[:N]  # ensure cat length matches N
+            print(f"Warning: cat length greater than images. Truncating cat to length {N}.")
         centers[:, 0] += (cat['image_x']-round(cat['image_x'])).to_numpy(np.float32)
         centers[:, 1] += (cat['image_y']-round(cat['image_y'])).to_numpy(np.float32)
 

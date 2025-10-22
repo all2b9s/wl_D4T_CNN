@@ -15,7 +15,8 @@ def load_img(shear_comp,
             shear_mode,
             index,
             abs_shear_value = 0.02,
-            noise_level = 0.1,
+            noise_level = 0.594,
+            noise_mode = 'fixed',
             ori_seed = 777,
             directory='./temp/',
             ):
@@ -25,28 +26,30 @@ def load_img(shear_comp,
     cat = pd.read_csv(dir + 'gt_cat.csv')
     psfs = np.tile(psfs, (len(cutouts), 1, 1))
     seed = np.random.default_rng(ori_seed+index).integers(0,100000)
-    if noise_level == 'adaptive':
+    if noise_mode == 'adaptive':
         noise_list = np.zeros(len(cutouts))
-    else:
+    elif noise_mode == 'fixed':
         noise_list = np.full(len(cutouts), noise_level)
     for (idx, cutout) in enumerate(cutouts):
         rng = np.random.default_rng(seed+idx)
-        if noise_level == 'adaptive':
+        if noise_mode == 'adaptive':
             center = (cutout.shape[-2]//2, cutout.shape[-1]//2)
             cutout_crop = cutout[center[0]-2:(center[0]+3), center[1]-2:(center[1]+3)]
-            noise_list[idx] = (cutout_crop.mean())/rng.uniform(1,40)
+            noise_list[idx] = min((cutout_crop.mean())*(rng.uniform(0,0.25))**2,noise_level)
+            
         noise = rng.standard_normal(cutout.shape)*noise_list[idx]
         cutouts[idx] += noise
     return cutouts, psfs, cat, noise_list
 
 
-def load_one(i, *, shear_comp, shear_mode, abs_shear_value, noise_level, directory):
+def load_one(i, *, shear_comp, shear_mode, abs_shear_value, noise_level,noise_mode, directory):
     return load_img(
         shear_comp=shear_comp,
         shear_mode=shear_mode,
         abs_shear_value=abs_shear_value,
         index=i,
         noise_level=noise_level,
+        noise_mode=noise_mode,
         directory=directory,
     )
 
@@ -55,6 +58,7 @@ def build_dataset(
     shear_mode,
     abs_shear_value=0.02,
     noise_level=0.1,
+    noise_mode='fixed',
     index_range=[0,100],
     directory='dir',
     workers=8,
@@ -68,6 +72,7 @@ def build_dataset(
         abs_shear_value=abs_shear_value,
         index=index_range[0],
         noise_level=noise_level,
+        noise_mode=noise_mode,
         directory=directory,
     )
     B, H, W = cutouts0.shape
@@ -92,7 +97,8 @@ def build_dataset(
                      shear_comp=shear_comp, 
                      shear_mode=shear_mode, 
                      abs_shear_value=abs_shear_value, 
-                     noise_level=noise_level, 
+                     noise_level=noise_level,
+                     noise_mode=noise_mode, 
                      directory=directory)
 
     map_kwargs = {}
@@ -118,3 +124,9 @@ def build_dataset(
         return all_cutouts, all_psfs, all_cats, all_noise
     else:
         return [], [], all_cats, all_noise
+    
+
+def format_number(x: float) -> str:
+    s = f"{x:.3f}".rstrip('0').rstrip('.')  # keep up to 3 decimal places, trim trailing zeros
+    s = s.replace('.', '')                  # remove the decimal point
+    return f"n{s}"

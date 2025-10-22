@@ -168,11 +168,20 @@ def D4_eq_weight(img):
     w1 = 2.0 * ixy
     return w0, w1
 
+@torch.no_grad()
+def _to_device_f32(x, device):
+    # 仅在此 helper 中关闭 grad，加速搬运；主函数会在需要的位置重新开启
+    if isinstance(x, torch.Tensor):
+        return x.to(device=device, dtype=torch.float32, non_blocking=True)
+    return torch.from_numpy(np.asarray(x, dtype=np.float32)).to(device, non_blocking=True)
+
 def shape_pixel_gradients(
     model: torch.nn.Module,
     img_np,                       # [H,W] or [B,H,W] or [B,1,H,W]
     device=None,
-    normalize: str = "none", # "per_image" or "none"
+    normalize: str = "none",      # "per_image" or "none"
+    mode: str = "memory",         # "memory" or "speed"
+    eps: float = 1e-6,
 ):
     """
     Returns:
@@ -180,83 +189,99 @@ def shape_pixel_gradients(
       grad_e1:  np.ndarray, [B,1,H,W]
       grad_e2:  np.ndarray, [B,1,H,W]
     """
+    assert mode in ("memory", "speed")
     device = device or ("cuda" if torch.cuda.is_available() else "cpu")
-    model = model.to(device).eval()
-    # ---- Prepare input tensor on device ----
-    if isinstance(img_np, torch.Tensor):
-        x = img_np
-        # ensure float32 on device
-        x = x.to(device=device, dtype=torch.float32)
-    else:
-        x = torch.from_numpy(img_np.astype(np.float32)).to(device)
 
-    # Accept [H,W], [B,H,W], or [B,1,H,W]
+    # ---- 1) 准备输入到 device（此处不追踪梯度以减少开销）----
+    x = _to_device_f32(img_np, device)
+
+    # 统一到 [B, H, W]
     if x.ndim == 2:
-        x = x.unsqueeze(0)          # [1,H,W]
-        single = True
-    elif x.ndim == 3:
-        single = False
+        x = x.unsqueeze(0)              # [1,H,W]
     elif x.ndim == 4 and x.shape[1] == 1:
-        # already [B,1,H,W] -> squeeze channel for normalization, will re-add
-        single = (x.shape[0] == 1)
-        x = x.squeeze(1)            # [B,H,W]
-    else:
+        x = x.squeeze(1)                # [B,H,W]
+    elif x.ndim != 3:
         raise ValueError("img_np must be [H,W], [B,H,W], or [B,1,H,W]")
 
     B, H, W = x.shape
 
-    # ---- Normalization (per-image if requested) ----
+    # ---- 2) 归一化（在 requires_grad 之前，就地操作）----
     if normalize == "per_image":
         m = x.mean(dim=(-1, -2), keepdim=True)
-        s = x.std(dim=(-1, -2), keepdim=True)
-        x = torch.where(s > 0, (x - m) / s, x - m)
+        s = x.std(dim=(-1, -2), keepdim=True).clamp_min(eps)
+        x = (x - m) / s
     elif normalize != "none":
         raise ValueError("normalize must be 'per_image' or 'none'")
 
-    # Add channel dim -> [B,1,H,W]
-    x = x.unsqueeze(1).contiguous()
-    x.requires_grad_(True)
+    # 加回通道 -> [B,1,H,W]
+    x = x.unsqueeze(1)
 
-    # ---- Disable param grads: we only need ∂y/∂x ----
+    # ---- 3) 模型设置：关闭参数梯度，eval 模式 ----
+    model = model.to(device).eval()
     prev_flags = [p.requires_grad for p in model.parameters()]
     for p in model.parameters():
         p.requires_grad_(False)
 
-    # ---- One forward pass on duplicated batch ----
-    # Make [2B,1,H,W]: first half used to backprop e1, second half for e2
-    x2 = torch.cat([x, x], dim=0)                   # [2B,1,H,W]
-    pred2 = model(x2)[:,:2]                               # [2B, 2]
-    # Use the first B predictions as the output preds (inputs identical)
-    pred = pred2[:B]
+    try:
+        if mode == "memory":
+            # ---- 4A) 单次前向，两次反传（省显存）----
+            x.requires_grad_(True)
+            pred = model(x)[:, :2]          # [B,2]
 
-    # ---- One backward to get both grads at once ----
-    # grad_outputs shape must match pred2: [2B, 2]
-    go = torch.zeros_like(pred2)
-    go[:B, 0] = 1.0   # select e1 for first copy
-    go[B:, 1] = 1.0   # select e2 for second copy
+            # e1 梯度
+            go1 = torch.zeros_like(pred)
+            go1[:, 0] = 1.0
+            (gx1,) = torch.autograd.grad(
+                outputs=pred, inputs=x, grad_outputs=go1,
+                retain_graph=True, create_graph=False, allow_unused=False
+            )
 
-    (gx2,) = torch.autograd.grad(
-        outputs=pred2,
-        inputs=x2,
-        grad_outputs=go,
-        retain_graph=False,
-        create_graph=False,
-        allow_unused=False,
-    )
-    # Split back into e1/e2 grads for the original batch
-    grad_e1 = gx2[:B]   # [B,1,H,W]
-    grad_e2 = gx2[B:]   # [B,1,H,W]
+            # e2 梯度
+            go2 = torch.zeros_like(pred)
+            go2[:, 1] = 1.0
+            (gx2,) = torch.autograd.grad(
+                outputs=pred, inputs=x, grad_outputs=go2,
+                retain_graph=False, create_graph=False, allow_unused=False
+            )
 
-    # ---- Restore model flags ----
-    for p, f in zip(model.parameters(), prev_flags):
-        p.requires_grad_(f)
+            grad_e1 = gx1      # [B,1,H,W]
+            grad_e2 = gx2      # [B,1,H,W]
 
-    # ---- To numpy with shape conventions ----
-    pred_np = pred.detach().cpu().numpy()               # [B,2]
-    grad_e1_np = grad_e1.detach().cpu().numpy()         # [B,H,W]
-    grad_e2_np = grad_e2.detach().cpu().numpy()         # [B,H,W]
+        else:
+            x = x.detach()              
+            x.requires_grad_(True)
+            x2 = torch.cat([x, x], dim=0)   # [2B,1,H,W]
 
-    return pred_np, grad_e1_np, grad_e2_np 
+            pred2 = model(x2)[:, :2]    # [2B,2]
+            pred = pred2[:B]
+
+            go = torch.zeros_like(pred2)
+            go[:B, 0] = 1.0
+            go[B:, 1] = 1.0
+            (gx2,) = torch.autograd.grad(
+                outputs=pred2, inputs=x2, grad_outputs=go,
+                retain_graph=False, create_graph=False, allow_unused=False
+            )
+            grad_e1 = gx2[:B]
+            grad_e2 = gx2[B:]
+
+        # ---- 5) 转 numpy（保持 [B,1,H,W]）----
+        pred_np = pred.detach().float().cpu().numpy()
+        grad_e1_np = grad_e1.detach().float().cpu().numpy()
+        grad_e2_np = grad_e2.detach().float().cpu().numpy()
+
+    finally:
+        for p, f in zip(model.parameters(), prev_flags):
+            p.requires_grad_(f)
+
+        if 'go1' in locals():
+            del go1  
+        if 'go2' in locals():
+            del go2 
+        if 'go' in locals():
+            del go 
+
+    return pred_np, grad_e1_np, grad_e2_np
 
 def draw_grad(model, img):
     pred, grad_e1, grad_e2 = shape_pixel_gradients(model, img, normalize="none")
@@ -345,6 +370,54 @@ def gaussian_weight_2d(size: int | tuple[int, int], std: float = 16, device=None
     #if normalize:
     #    g /= g.sum()
     return g
+
+import torch, numpy as np
+
+def quad_gaussian_2d(
+    size: int | tuple[int, int],
+    std: float = 16,
+    mode: str = "x2-y2",   # options: "x2-y2" or "2xy"
+    device=None,
+    normalize=True,
+):
+    """
+    Generate (x^2 - y^2)*Gaussian or 2xy*Gaussian weight maps.
+
+    Args:
+        size: int or (H, W)
+        std: Gaussian sigma in pixels
+        mode: "x2-y2" or "2xy" or "Gaussian"
+        device: torch device
+        normalize: if True, normalize to unit RMS amplitude (not sum)
+
+    Returns:
+        Tensor [H, W] of dtype float32
+    """
+    if isinstance(size, int):
+        H = W = size
+    else:
+        H, W = size
+
+    y = torch.arange(H, device=device, dtype=torch.float32) - H // 2
+    x = torch.arange(W, device=device, dtype=torch.float32) - W // 2
+    yy, xx = torch.meshgrid(y, x, indexing="ij")
+
+    g = torch.exp(-0.5 * (xx**2 + yy**2) / (std**2)) / (2 * np.pi * std**2)
+
+    if mode == "x2-y2":
+        out = (xx**2 - yy**2) * g
+    elif mode == "2xy":
+        out = (2 * xx * yy) * g
+    elif mode == "Gaussian":
+        out = g
+    else:
+        raise ValueError("mode must be 'x2-y2' or '2xy'")
+
+    if normalize:
+        out = out / torch.sqrt((out**2).sum())  # unit RMS
+
+    return out
+
 
 def gaussian_blur(x: torch.Tensor, ks: int = 3, sigma: float = 1.0) -> torch.Tensor:
     """

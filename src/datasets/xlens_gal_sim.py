@@ -42,16 +42,16 @@ from astropy.visualization import ZScaleInterval
 
 from numpy.lib import recfunctions as rfn
 from astropy.visualization import simple_norm
-import os
+import sys
 import pandas as pd
 from tqdm import tqdm
 from multiprocessing import Pool, cpu_count
 from dataset_toolkit import get_weighted_e
 
 cat_ref,h = fitsio.read(
-    os.path.join('/projects/bdsp/wenyinli/codes/data/catsim-v4/', "OneDegSq.fits"),header=True
+    os.path.join(os.environ.get('CATSIM_DIR'), "OneDegSq.fits"),header=True
 )
-
+print(os.path.join(os.environ.get('CATSIM_DIR'), "OneDegSq.fits"))
 # put this at module level, not inside __call__
 def _worker_wrapper(args):
     obj, func = args[0], args[1]   # unpack object and function
@@ -82,6 +82,7 @@ def xlens_gal_sim(
         dim = 800,
         sep = 11.0, # arcsec
         pixel_scale = 0.2,
+        has_shift = True,
     ):
     tract_id = 0
     patch_id = 0
@@ -115,7 +116,12 @@ def xlens_gal_sim(
     #config.sep= sep  # arcsec
     # we can change to mode = 5 for shear g1: (0.02, 0)
     task_config.extend_ratio = 0.9
-    task_config.force_pixel_center = True
+    if has_shift:
+        task_config.force_pixel_center = False
+        task_config.apply_lensing_position_shifts = True
+    else:
+        task_config.force_pixel_center = True
+        task_config.apply_lensing_position_shifts = False
     task_config.select_observable = ['i_ab']
     task_config.select_lower_limit = [0]
     task_config.select_upper_limit = [25.3]
@@ -209,7 +215,9 @@ class xlen_simulator():
                  image_size = 1000,
                  pixel_scale = 0.2,
                  separation = 18.0,
-                 num_workers=8):
+                 num_workers=8,
+                 has_shift = True,
+                 mode = 'calibration'):
         self.seed = ori_seed
         self.output_dir = output_dir
         self.abs_shear = abs_shear
@@ -217,16 +225,23 @@ class xlen_simulator():
         self.pixel_scale = pixel_scale
         self.separation = separation
         self.num_workers = num_workers
+        self.has_shift = has_shift
+        self.mode = mode
 
     def __call__(self, num_sims: int):
-        shear_tasks = [
-            (2, "g1"),
-            #(2, "g2"),
-            (0, "g1"),
-            (1, "g1"),
-            (0, "g2"),
-            (1, "g2"),
-        ]
+        if self.mode == 'calibration':
+            shear_tasks = [
+                (2, "g1"),
+                #(2, "g2"),
+                (0, "g1"),
+                (1, "g1"),
+                (0, "g2"),
+                (1, "g2"),
+            ]
+        elif self.mode == 'training':
+            shear_tasks = [
+                (2, "g1"),
+            ]
         seeds = np.random.default_rng(self.seed).integers(0, 1e8, size=num_sims)
         results = []
 
@@ -268,9 +283,13 @@ class xlen_simulator():
             dim = self.image_size,
             pixel_scale = self.pixel_scale,
             sep = self.separation,
+            has_shift=self.has_shift,
         )
 
 
-simulator = xlen_simulator('/work/hdd/bfmo/wenyinli/datasets/xlens_gal/', num_workers=64)
-#simulator = xlen_simulator('/work/nvme/bfmo/wenyinli/datasets/xlens_train/', num_workers=64, ori_seed=20240411)
+simulator = xlen_simulator('/work/nvme/bfmo/wenyinli/datasets/xlens_sims/', 
+                            num_workers=64, mode='calibration',has_shift=False, ori_seed=667)
+#simulator = xlen_simulator('/work/nvme/bfmo/wenyinli/datasets/xlens_train/', 
+#                           num_workers=64, ori_seed=20240411,
+#                           mode='training')
 simulator(10000)

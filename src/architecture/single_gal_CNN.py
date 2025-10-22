@@ -10,7 +10,7 @@ import torch.nn.functional as F
 import torchvision.transforms as T
 from torchvision.models.resnet import resnet18, ResNet18_Weights
 
-from src.architecture.CNN_toolkit import D4_eq_weight, center_crop_to
+from src.architecture.CNN_toolkit import D4_eq_weight, center_crop_to, quad_gaussian_2d, gaussian_weight_2d
 from src.architecture.CNN_module import R180Inv_Conv2d, D4Inv_Conv2d, ConvGELU, BiasFreeMLP, ResConvBNGELU
 #######################################################################################################
 # CNN models:
@@ -191,12 +191,13 @@ class R180Inv_CNN_GeLU(nn.Module):
 class D4T_CNN_GeLU(nn.Module):
     def __init__(self, in_dim=1,
                 kernel_size=3, 
-                base_channels=32, 
-                head_hidden=256, 
+                base_channels=64, 
+                head_hidden=128, 
                 num_layers=5):
         super().__init__()
         C = base_channels
-        padding_size = int((kernel_size-1)/2*num_layers+8)
+        padding_size = int((kernel_size-1)/2*num_layers+4)
+        self._w_cache = {}
         self.inpad = nn.ConstantPad2d(padding_size, 0.0)
         self.blocks = nn.ModuleList([D4Inv_Conv2d(in_dim if i == 0 else C, C, k = kernel_size) for i in range(num_layers)])
 
@@ -204,33 +205,38 @@ class D4T_CNN_GeLU(nn.Module):
         self.head0 = BiasFreeMLP(C, head_hidden)
         self.head1 = BiasFreeMLP(C, head_hidden)
 
+    def _get_cached_weight(self, hw, sigma, device, dtype, mode):
+        key = (hw[0], hw[1], sigma, device.type, str(dtype), str(mode))
+        w = self._w_cache.get(key)
+        if w is None:
+            w = quad_gaussian_2d(hw, sigma, device=device, mode = mode).to(dtype=dtype)  # [H,W]
+            w = w.unsqueeze(0).unsqueeze(0)  # [1,1,H,W] for cheap broadcast
+            self._w_cache[key] = w
+        return self._w_cache[key]
+
     def forward(self, x):
         B, C, H, W = x.shape
 
-        # --- 保留你的归一化 ---
-        self.m = x.sum(dim=(1,2,3), keepdim=True)   # [B,1,1,1]
-        self.eps = x.std(dim=(1,2,3), keepdim=True)
-        x = x / (self.m + self.eps.clamp(min=1e-6))
+        # Gaussian Normalization
+        w = self._get_cached_weight(x.shape[-2:], sigma=16, device=x.device, dtype=x.dtype, mode="Gaussian")
+        m = (x*w).sum(dim=(1, 2, 3), keepdim=True)*100 # mean brightness
+        norm = 1 + F.softplus(m - 1, beta=10.0, threshold=20)
+        x = x / norm
 
         # --- inpad 后走特征提取 ---
         y = self.inpad(x)  # [B, C, H+12, W+12]
         for block in self.blocks:
             y = block(y)   # 期望保持空间尺寸不变：仍约 [B, C, H+12, W+12]
 
-        w0, w1 = D4_eq_weight(y)
-
         self.y  = center_crop_to(y,  (H, W))  # [B, C, H+8, W+8]
-        self.w0 = center_crop_to(w0, (H, W))  # [B, C, H+8, W+8]
-        self.w1 = center_crop_to(w1, (H, W))  # [B, C, H+8, W+8]
-
-        norm_0 = torch.sqrt((self.w0.pow(2).sum(dim=(-1, -2)) + 1e-6))  # [B, C]
-        norm_1 = torch.sqrt((self.w1.pow(2).sum(dim=(-1, -2)) + 1e-6))  # [B, C]
+        self.w0 = self._get_cached_weight([H,W], sigma=4, device=x.device, dtype=x.dtype, mode="x2-y2")
+        self.w1 = self._get_cached_weight([H,W], sigma=4, device=x.device, dtype=x.dtype, mode="2xy")
 
         self.y0 = self.y * self.w0
         self.y1 = self.y * self.w1
 
-        z0 = self.y0.sum(dim=(-1, -2)) / norm_0  # [B, C]
-        z1 = self.y1.sum(dim=(-1, -2)) / norm_1  # [B, C]
+        z0 = self.y0.sum(dim=(-1, -2))  # [B, C]
+        z1 = self.y1.sum(dim=(-1, -2))  # [B, C]
 
         shape0 = self.head0(z0)  # [B, 1]
         shape1 = self.head1(z1)  # [B, 1]
