@@ -10,6 +10,21 @@ from tqdm import tqdm
 from multiprocessing import Pool, cpu_count
 from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor
 from functools import partial
+import time
+
+def robust_load_npy(path, retries=5, delay=0.05):
+    for i in range(retries):
+        try:
+            with open(path, "rb") as f:
+                return np.load(f, allow_pickle=False)
+        except Exception as e:
+            msg = str(e)
+            # only retry on short-read-like errors
+            if "Failed to read all data for array" in msg or "file seems not fully written" in msg:
+                if i < retries - 1:
+                    time.sleep(delay * (2**i))
+                    continue
+            raise
 
 def load_img(shear_comp,
             shear_mode,
@@ -21,14 +36,17 @@ def load_img(shear_comp,
             directory='./temp/',
             ):
     dir = f'{directory}/{shear_comp}_{shear_mode}_val_{abs_shear_value:.3f}/img_{int(index)}/'
-    cutouts = np.load(dir + 'cutouts.npy')
-    psfs = np.load(dir + 'psf_image.npy')
-    cat = pd.read_csv(dir + 'gt_cat.csv')
+    try:
+        cutouts = robust_load_npy(dir + 'cutouts.npy')
+        psfs = robust_load_npy(dir + 'psf_image.npy')
+        cat = pd.read_csv(dir + 'gt_cat.csv')
+    except Exception as e:
+        raise RuntimeError(f"Failed to load data from {dir}: {e}")
     psfs = np.tile(psfs, (len(cutouts), 1, 1))
-    seed = np.random.default_rng(ori_seed+index).integers(0,100000)
-    if noise_mode == 'adaptive':
+    seed = np.random.default_rng(ori_seed+index).integers(0,10000000)
+    if (noise_mode == 'adaptive') or (noise_mode == 'uniform'):
         noise_list = np.zeros(len(cutouts))
-    elif noise_mode == 'fixed':
+    if noise_mode == 'fixed':
         noise_list = np.full(len(cutouts), noise_level)
     for (idx, cutout) in enumerate(cutouts):
         rng = np.random.default_rng(seed+idx)
@@ -36,6 +54,10 @@ def load_img(shear_comp,
             center = (cutout.shape[-2]//2, cutout.shape[-1]//2)
             cutout_crop = cutout[center[0]-2:(center[0]+3), center[1]-2:(center[1]+3)]
             noise_list[idx] = min((cutout_crop.mean())*(rng.uniform(0,0.25))**2,noise_level)
+        if noise_mode == 'uniform':
+            center = (cutout.shape[-2]//2, cutout.shape[-1]//2)
+            cutout_crop = cutout[center[0]-2:(center[0]+3), center[1]-2:(center[1]+3)]
+            noise_list[idx] = min((cutout_crop.mean())/(rng.uniform(5,40)),noise_level)
             
         noise = rng.standard_normal(cutout.shape)*noise_list[idx]
         cutouts[idx] += noise
@@ -57,7 +79,7 @@ def build_dataset(
     shear_comp,
     shear_mode,
     abs_shear_value=0.02,
-    noise_level=0.1,
+    noise_level=0.594,
     noise_mode='fixed',
     index_range=[0,100],
     directory='dir',

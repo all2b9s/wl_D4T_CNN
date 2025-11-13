@@ -60,7 +60,7 @@ def _worker_wrapper(args):
 def cutout_xlens_image(full_image, truth_catalog, seed, noise_level=0.354):
     cutouts = np.zeros((len(truth_catalog),64,64))
     for idx, gal in truth_catalog.iterrows():
-        x, y = round(gal['image_x']), round(gal['image_y'])
+        x, y = int(0.5+gal['image_x']), int(0.5+gal['image_y'])
         cutout = full_image[y-32:y+32, x-32:x+32]
         rng = np.random.default_rng(seed//2+idx)
         if noise_level>0:
@@ -68,8 +68,6 @@ def cutout_xlens_image(full_image, truth_catalog, seed, noise_level=0.354):
             cutout+=noise
         cutouts[idx] = cutout
     return cutouts
-    
-
 
 def xlens_gal_sim(
         output_dir = "./temp/",
@@ -77,6 +75,8 @@ def xlens_gal_sim(
         shear_comp = 'g1',
         shear_value = 0.02,
         kappa_value = 0.0,
+        rotId = 0,
+        psf_e = 0.0,
         seed = 20020103,
         band = 'i',
         dim = 800,
@@ -132,15 +132,18 @@ def xlens_gal_sim(
         tract_info=skymap[tract_id],
         seed=seed,
     ).truthCatalog
-    #for item in truthCatalog:
-    #    item[2] *= np.pi/180  # fix all galaxies' angle to 180 degree
-    #print(len(truthCatalog))
+    for item in truthCatalog:
+        item[2] += rotId * np.pi / 2 # fix all galaxies' angle to 180 degree
+    
     config = MultibandSimConfig()
     config.survey_name = (
         "lsst"  # The scale parameter needs to be consistent with scale
     )
     config.draw_image_noise = False
     config.truncate_stamp_size = 65
+    #config.rotId = rotId
+    config.psf_e1 = psf_e
+    config.psf_e2 = -psf_e
 
     sim_task = MultibandSimTask(config=config)
     outcome = sim_task.run(
@@ -217,6 +220,9 @@ class xlen_simulator():
                  separation = 18.0,
                  num_workers=8,
                  has_shift = True,
+                 init_id=0,
+                 psf_e = 0.0,
+                 rotId=0,
                  mode = 'calibration'):
         self.seed = ori_seed
         self.output_dir = output_dir
@@ -226,12 +232,16 @@ class xlen_simulator():
         self.separation = separation
         self.num_workers = num_workers
         self.has_shift = has_shift
+        self.init_id = init_id
+        self.rotId = rotId
+        self.psf_e = psf_e
         self.mode = mode
 
     def __call__(self, num_sims: int):
+        print(f"Starting xlens simulations: mode={self.mode}, num_sims={num_sims}, has_shift={self.has_shift}, rotId={self.rotId}")
         if self.mode == 'calibration':
             shear_tasks = [
-                (2, "g1"),
+                #(2, "g1"),
                 #(2, "g2"),
                 (0, "g1"),
                 (1, "g1"),
@@ -246,7 +256,7 @@ class xlen_simulator():
         results = []
 
         for shear_mode, shear_comp in shear_tasks:
-            args = [(self, self._worker, i, seeds[i], shear_mode, shear_comp) for i in range(num_sims)]
+            args = [(self, self._worker, i+self.init_id, seeds[i], shear_mode, shear_comp) for i in range(num_sims)]
             with Pool(processes=self.num_workers) as pool:
                 res = list(tqdm(
                     pool.imap_unordered(_worker_wrapper, args,chunksize=4),
@@ -279,17 +289,30 @@ class xlen_simulator():
             shear_mode = shear_mode,
             shear_comp = shear_comp,
             shear_value = self.abs_shear,
+            rotId= self.rotId,
             seed = seed,
             dim = self.image_size,
             pixel_scale = self.pixel_scale,
             sep = self.separation,
+            psf_e=self.psf_e,
             has_shift=self.has_shift,
         )
 
-
-simulator = xlen_simulator('/work/nvme/bfmo/wenyinli/datasets/xlens_sims/', 
-                            num_workers=64, mode='calibration',has_shift=False, ori_seed=667)
+psf_e = 0
+print(f'psf_e: {psf_e}')
+#simulator = xlen_simulator('/work/hdd/bdsp/wenyinli/datasets/xlens_fixed/', 
+#                            num_workers=128, mode='calibration', 
+#                            rotId=0,
+#                            psf_e=psf_e,
+#                            has_shift=False, ori_seed=666)
+#simulator(100000)
+simulator = xlen_simulator('/work/hdd/bdsp/wenyinli/datasets/xlens_fixed/', 
+                            num_workers=128, mode='calibration',
+                            rotId=1, init_id=100000,
+                            psf_e=psf_e,
+                            has_shift=False, ori_seed=666)
+simulator(100000)
 #simulator = xlen_simulator('/work/nvme/bfmo/wenyinli/datasets/xlens_train/', 
 #                           num_workers=64, ori_seed=20240411,
 #                           mode='training')
-simulator(10000)
+

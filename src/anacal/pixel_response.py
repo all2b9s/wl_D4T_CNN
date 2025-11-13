@@ -31,10 +31,10 @@ def anacal_pix_r(img, psf, center=None,
         ycen = ny // 2
     else:
         xcen, ycen = center
-    dx = 0.5 #xcen - round(xcen)
-    dy = 0.5 #ycen - round(ycen)
-    xcen = round(xcen)
-    ycen = round(ycen)
+    dx = -0.5
+    dy = -0.5
+    xcen = int(xcen+0.5)
+    ycen = int(ycen+0.5)
 
     iq = anacal.image.ImageQ(nx, ny, scale_arcsec_per_pix, sigma_arcsec, klim, True)
 

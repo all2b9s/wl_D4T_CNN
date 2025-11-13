@@ -135,6 +135,7 @@ def get_biases(shapes, Rs,
                bs_size=100, 
                bs_times=100,
                n_factor=1.0,
+               is_twin = False,
                n_jobs=4):
     """
     shapes: (N, 4, 2) numpy array 
@@ -145,7 +146,11 @@ def get_biases(shapes, Rs,
     """
     N = shapes.shape[0]
     # Pre-generate bootstrap indices
+    if is_twin:
+        N = N // 2
     bs_inds = [_bootstrap(N, bs_size) for _ in range(bs_times)]
+    if is_twin:
+        bs_inds = [np.concatenate([inds, inds + N]) for inds in bs_inds]
 
     # Parallel map over bootstrap resamples
     if n_jobs is None:
@@ -212,8 +217,8 @@ def prepare_q_images(images, psfs, noises,
         if len(cat) > N:
             cat = cat[:N]  # ensure cat length matches N
             print(f"Warning: cat length greater than images. Truncating cat to length {N}.")
-        centers[:, 0] += (cat['image_x']-round(cat['image_x'])).to_numpy(np.float32)
-        centers[:, 1] += (cat['image_y']-round(cat['image_y'])).to_numpy(np.float32)
+        centers[:, 0] += (cat['image_x']-(cat['image_x']+0.5)//1).to_numpy(np.float32)
+        centers[:, 1] += (cat['image_y']-(cat['image_y']+0.5)//1).to_numpy(np.float32)
 
     with ProcessPoolExecutor(
         max_workers=workers,

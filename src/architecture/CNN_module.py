@@ -279,6 +279,19 @@ class BiasFreeMLP(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.net(x)
+    
+class BiasFreeMLP_2l(nn.Module):
+    def __init__(self, in_dim: int, hidden: int = 128):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Flatten(),
+            nn.Linear(in_dim, hidden, bias=False),
+            nn.Tanh(),
+            nn.Linear(hidden, 1, bias=False)
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.net(x)
 
 
 class ResConvBNGELU(nn.Module):
@@ -367,10 +380,84 @@ class ResConvBNGELU(nn.Module):
         out = self.act(out)
         return out
 
+# ----------------------------
+# Attention Modules
+# ----------------------------
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+class OddMultiheadAttnPool(nn.Module):
+    """
+    Multihead Attention Pooling with optional external-even Key source.
+    """
+    def __init__(self, C, num_heads=4, eps: float = 1e-6):
+        super().__init__()
+        self.num_heads = num_heads
+        self.C = C
+        self.eps = eps
+        self.q = nn.Parameter(torch.randn(1, 1, C))
+        self.mha = nn.MultiheadAttention(C, num_heads, batch_first=True)
+
+    def forward( 
+        self,
+        x: torch.Tensor,                        # [B,C,H,W] —— 用于 Value（奇）
+        mask: torch.Tensor | None = None,       # [B,1,H,W] 或 [B,H,W]，可选
+        K_even_src: torch.Tensor | None = None, # [B,C,H,W]，外部偶特征（比如8旋平均）
+    ) -> torch.Tensor:
+        B, C, H, W = x.shape
+        N = H * W
+
+        # --- tokens & query ---
+        V_odd  = x.view(B, C, N).permute(0, 2, 1).contiguous()   # [B,N,C]（奇）
+        Q      = self.q.expand(B, 1, C)                          # [B,1,C]
+
+        # --- Key 的“偶部分”来源 ---
+        if K_even_src is None:
+            K_even_map = x**2                                    # 传统方案：保证对符号偶
+        else:
+            K_even_map = K_even_src                              # 你的 8 旋平均特征
+        K_even = K_even_map.view(B, C, N).permute(0, 2, 1).contiguous()  # [B,N,C]
+
+        # --- 连续 mask 的 log-bias（可选） ---
+        attn_mask = None
+        if mask is not None:
+            if mask.ndim == 3:
+                mask = mask.unsqueeze(1)                         # [B,1,H,W]
+            mask_bias = torch.log(mask.view(B, 1, N) + self.eps) # [B,1,N]
+            attn_mask = mask_bias.repeat_interleave(self.num_heads, dim=0)  # [B*heads,1,N]
+
+        # --- MHA（Q,K_even,V_odd） ---
+        out, _ = self.mha(Q, K_even, V_odd, attn_mask=attn_mask, need_weights=False)  # [B,1,C]
+        return out.squeeze(1)  # [B,C]
+
+class SingleQueryAttn_NoEmbed(nn.Module):
+    def __init__(self, C, num_heads=4, mask_zeros=True):
+        super().__init__()
+        self.mha = nn.MultiheadAttention(embed_dim=C, num_heads=num_heads, batch_first=True)
+        self.q = nn.Parameter(torch.randn(1, 1, C))
+        self.mask_zeros = mask_zeros
+
+    def forward(self, x):
+        # x: [B', C, H, W]
+        Bp, C, H, W = x.shape
+        N = H * W
+        tokens = x.view(Bp, C, N).permute(0, 2, 1).contiguous()  # [B', N, C]
+        Q = self.q.expand(Bp, -1, -1)                            # [B', 1, C]
+
+        key_padding_mask = None
+        if self.mask_zeros:
+            with torch.no_grad():
+                key_padding_mask = (x.abs().sum(dim=1) == 0).view(Bp, -1)  # [B', N]
+
+        out, _ = self.mha(Q, tokens, tokens, key_padding_mask=key_padding_mask, need_weights=False)
+        return out.squeeze(1)  # [B', C]
+
 def hann_window(H, W, margin, device, dtype):
     if margin <= 0:
         return torch.ones(1, 1, H, W, device=device, dtype=dtype)
-    # 1D Hann 余弦缓入
+
     def ramp(n):
         v = torch.ones(n, device=device, dtype=dtype)
         m = int(margin)
