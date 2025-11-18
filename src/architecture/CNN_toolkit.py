@@ -38,7 +38,7 @@ def load_test_item(
         img_id = int(row["id"])
 
         # read image
-        img = imgs[img_id].astype(np.float32, copy=True)
+        img = imgs[img_id].astype(np.float64, copy=True)
 
         # normalization
         if normalize == "per_image":
@@ -47,9 +47,9 @@ def load_test_item(
 
         # target
         if target == "e":
-            y = np.array([row["e1"], row["e2"]], dtype=np.float32)
+            y = np.array([row["e1"], row["e2"]], dtype=np.float64)
         elif target == "g":
-            y = np.array([row["g1"], row["g2"]], dtype=np.float32)
+            y = np.array([row["g1"], row["g2"]], dtype=np.float64)
         else:
             raise ValueError("target must be 'e' or 'g'")
 
@@ -169,11 +169,11 @@ def D4_eq_weight(img):
     return w0, w1
 
 @torch.no_grad()
-def _to_device_f32(x, device):
+def _to_device(x, device):
     # 仅在此 helper 中关闭 grad，加速搬运；主函数会在需要的位置重新开启
     if isinstance(x, torch.Tensor):
-        return x.to(device=device, dtype=torch.float32, non_blocking=True)
-    return torch.from_numpy(np.asarray(x, dtype=np.float32)).to(device, non_blocking=True)
+        return x.to(device=device, dtype=x.dtype, non_blocking=True)
+    return torch.from_numpy(np.asarray(x, dtype=x.dtype)).to(device, non_blocking=True)
 
 def shape_pixel_gradients(
     model: torch.nn.Module,
@@ -182,6 +182,7 @@ def shape_pixel_gradients(
     normalize: str = "none",      # "per_image" or "none"
     mode: str = "memory",         # "memory" or "speed"
     eps: float = 1e-6,
+    dtype = np.float32,
 ):
     """
     Returns:
@@ -193,7 +194,7 @@ def shape_pixel_gradients(
     device = device or ("cuda" if torch.cuda.is_available() else "cpu")
 
     # ---- 1) 准备输入到 device（此处不追踪梯度以减少开销）----
-    x = _to_device_f32(img_np, device)
+    x = _to_device(img_np, device)
 
     # 统一到 [B, H, W]
     if x.ndim == 2:
@@ -344,7 +345,7 @@ def gaussian_kernel2d(ks: int, sigma: float, device=None, dtype=None):
     g2d = g2d / g2d.sum()
     return g2d  # [ks, ks]
 
-def gaussian_weight_2d(size: int | tuple[int, int], std: float = 16, device=None, normalize=True):
+def gaussian_weight_2d(size: int | tuple[int, int], std: float = 16, device=None, normalize=True, dtype=torch.float32):
     """
     Generate a 2D Gaussian weight image centered in the middle.
 
@@ -362,8 +363,8 @@ def gaussian_weight_2d(size: int | tuple[int, int], std: float = 16, device=None
     else:
         H, W = size
 
-    y = torch.arange(H, device=device, dtype=torch.float32) - (H-1)/2
-    x = torch.arange(W, device=device, dtype=torch.float32) - (W-1)/2
+    y = torch.arange(H, device=device, dtype=dtype) - (H-1)/2
+    x = torch.arange(W, device=device, dtype=dtype) - (W-1)/2
     yy, xx = torch.meshgrid(y, x, indexing="ij")
 
     g = torch.exp(-0.5 * (xx**2 + yy**2) / (std**2))/(2*np.pi*std**2)

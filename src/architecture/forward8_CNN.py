@@ -167,7 +167,7 @@ class Forward8_fixW_CNN(Forward8_base):
         key = (hw[0], hw[1], sigma, device.type, str(dtype))
         w = self._w_cache.get(key)
         if w is None:
-            w = gaussian_weight_2d(hw, sigma).to(device=device, dtype=dtype)  # [H,W]
+            w = gaussian_weight_2d(hw, sigma, dtype=dtype).to(device=device)  # [H,W]
             w = w.unsqueeze(0).unsqueeze(0)  # [1,1,H,W] for cheap broadcast
             self._w_cache[key] = w
         return self._w_cache[key]
@@ -206,6 +206,111 @@ class Forward8_fixW_CNN(Forward8_base):
         # --- Align weight map to feature map size (center crop) ---
         Hf, Wf = self.f_mean_e1.shape[-2:]
         w_f = self._get_cached_weight((Hf, Wf), sigma=self.gw_sigma, device=self.f_mean_e1.device, dtype=self.f_mean_e1.dtype) # [Hf,Wf]
+
+        # --- Weighted pooling ---
+        v1 = self._weighted_gap(self.f_mean_e1, w_f)
+        v2 = self._weighted_gap(self.f_mean_e2, w_f)
+
+        # --- Heads ---
+        e1 = self.head_e1(v1)
+        e2 = self.head_e2(v2)
+        e = torch.cat([e1, e2], dim=-1)  # [B,2]
+        return e
+    
+class Forward8_simp_CNN(Forward8_base):
+    """
+    D4-equivariant CNN model with Gaussian smoothing and weighted pooling.
+    Input:  [B, in_dim, H, W]
+    Output: [B, 2]  (e1, e2)
+    """
+
+    def __init__(
+        self,
+        in_dim=1,
+        base_channels=16,
+        head_hidden=64,
+        out_dim=2,
+        num_layers=3,
+        res_factor=0,
+        nl_sigma=6,
+        gw_sigma=16,
+    ):
+        super().__init__()
+        assert out_dim == 2, "This D4-equivariant head assumes two shape components."
+        C = base_channels
+        self._w_cache = {}
+
+        # --- CNN trunk ---
+        self.blocks = nn.ModuleList(
+            [ConvGELU_Res(in_dim, C, res_factor)] + [ConvGELU_Res(C, C, res_factor) for _ in range(max(0, num_layers - 1))]
+        )
+        # --- Heads ---
+        self.gap = nn.AdaptiveAvgPool2d(1)
+        self.head_e1 = BiasFreeMLP_2l(C, hidden=head_hidden)
+        self.head_e2 = BiasFreeMLP_2l(C, hidden=head_hidden)
+
+        self.nl_sigma = nl_sigma
+        self.gw_sigma = gw_sigma
+
+    # ============================================================
+    # Weighted Global Average Pool
+    # ============================================================
+
+    @staticmethod
+    def _weighted_gap(feat: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
+        """
+        Weighted global average pooling.
+        feat: [B,C,H,W]
+        w:    [B,1,H,W]
+        """
+        ws = w.sum(dim=(-2, -1), keepdim=True)
+        v = (feat * w).sum(dim=(-2, -1), keepdim=True) / ws
+        return v.squeeze(-1).squeeze(-1)  # [B,C]
+
+    def _get_cached_weight(self, hw, sigma, device, dtype):
+        key = (hw[0], hw[1], sigma, device.type, str(dtype))
+        w = self._w_cache.get(key)
+        if w is None:
+            w = gaussian_weight_2d(hw, sigma).to(device=device, dtype=dtype)  # [H,W]
+            w = w.unsqueeze(0).unsqueeze(0)  # [1,1,H,W] for cheap broadcast
+            self._w_cache[key] = w
+        return self._w_cache[key]
+
+    # ============================================================
+    # Forward pass
+    # ============================================================
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # --- Normalization ---
+        w = self._get_cached_weight(x.shape[-2:], sigma=self.nl_sigma, device=x.device, dtype=x.dtype)
+        m = (x*w).sum(dim=(1, 2, 3), keepdim=True)*100 # mean brightness
+        norm = 1 + F.softplus(m - 1, beta=10.0, threshold=20)
+        x = x / norm
+        #x = asinh_norm_torch(x)
+
+        # --- D4 orbit and inverse aggregation ---
+        xs = self._d4_orbit_stack(x)              # [8,B,C,H,W]
+        B = x.size(0)
+        x8 = xs.view(-1, xs.size(2), xs.size(3), xs.size(4))  # [8B,C,H,W]
+
+        # 2) Single trunk pass
+        f8 = self._trunk_feature(x8)              # [8B,C,Hf,Wf]
+        f8 = f8.view(8, B, f8.size(1), f8.size(2), f8.size(3))  # [8,B,C,Hf,Wf]
+
+        # 3) Bulk inverse back to canonical frame
+        feats = self._d4_inverse_stack(f8)        # [8,B,C,Hf,Wf]
+
+        # --- Sign-weighted mean for e1/e2 --- 
+        s1 = self.signs_e1.view(8, 1, 1, 1, 1).to(feats) 
+        s2 = self.signs_e2.view(8, 1, 1, 1, 1).to(feats)
+        # --- Sign-weighted mean for e1/e2 ---
+        self.f_mean_e1 = (feats * s1).mean(dim=0)  # [B,C,Hf,Wf]
+        self.f_mean_e2 = (feats * s2).mean(dim=0)  # [B,C,Hf,Wf]
+
+        # --- Align weight map to feature map size (center crop) ---
+        Hf, Wf = self.f_mean_e1.shape[-2:]
+        #w_f = self._get_cached_weight((Hf, Wf), sigma=self.gw_sigma, device=self.f_mean_e1.device, dtype=self.f_mean_e1.dtype) # [Hf,Wf]
+        w_f = torch.ones((1,1,Hf,Wf), device=self.f_mean_e1.device, dtype=self.f_mean_e1.dtype)
 
         # --- Weighted pooling ---
         v1 = self._weighted_gap(self.f_mean_e1, w_f)

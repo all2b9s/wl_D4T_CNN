@@ -12,6 +12,13 @@ from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor
 from functools import partial
 import time
 
+def make_seed(ori_seed, index, idx):
+    # convert into uint64 to avoid overflow
+    x = np.uint64(ori_seed)
+    x ^= np.uint64(index) * np.uint64(0x9E3779B97F4A7C15)
+    x ^= np.uint64(idx)   * np.uint64(0xBF58476D1CE4E5B9)
+    return int(x)
+
 def robust_load_npy(path, retries=5, delay=0.05):
     for i in range(retries):
         try:
@@ -43,13 +50,14 @@ def load_img(shear_comp,
     except Exception as e:
         raise RuntimeError(f"Failed to load data from {dir}: {e}")
     psfs = np.tile(psfs, (len(cutouts), 1, 1))
-    seed = np.random.default_rng(ori_seed+index).integers(0,10000000)
     if (noise_mode == 'adaptive') or (noise_mode == 'uniform'):
         noise_list = np.zeros(len(cutouts))
     if noise_mode == 'fixed':
         noise_list = np.full(len(cutouts), noise_level)
+    
     for (idx, cutout) in enumerate(cutouts):
-        rng = np.random.default_rng(seed+idx)
+        seed = make_seed(ori_seed, index, idx)
+        rng = np.random.default_rng(seed)
         if noise_mode == 'adaptive':
             center = (cutout.shape[-2]//2, cutout.shape[-1]//2)
             cutout_crop = cutout[center[0]-2:(center[0]+3), center[1]-2:(center[1]+3)]

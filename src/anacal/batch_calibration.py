@@ -8,88 +8,95 @@ from functools import partial
 from tqdm import tqdm
 import os
 
-class Calibrator():
-    def __init__(self, model, device="cuda", workers=32, shear_value=0.02):
-        self.model = model.to(device)
+class Calibrator:
+    def __init__(self, model, device="cuda", workers=32,
+                 shear_value=0.02, dtype="float32"):
+        """
+        dtype: "float32" or "float64"
+        """
+        assert dtype in ("float32", "float64")
+        self.dtype = dtype
+        self.np_dtype = np.float64 if dtype == "float64" else np.float32
+        self.torch_dtype = torch.float64 if dtype == "float64" else torch.float32
+
+        self.model = model.to(device=device, dtype=self.torch_dtype)
         self.model.eval()
+
         self.device = device
         self.workers = workers
         self.shear_value = shear_value
 
 
+    # ---------------------------- shape_measure ----------------------------
     def shape_measure(self, q_imgs, batch_size=32):
-        """
-        q_imgs: array/list-like of length N with shape (N, 5, H, W) or list-of-lists,
-                ordering along axis=1: [m, 1p, 1n, 2p, 2n].
-                Each per-gal entry should be acceptable by get_resmoothed_shape.
-
-        Returns:
-        shapes:         (N, 4, 2) float32
-        R_anacal_list:  (N, 4, 2, 2) float32
-        R_delta_list:   (N, 4, 2, 2) float32
-        """
-        # Basic checks
         N = len(q_imgs)
         assert hasattr(q_imgs, "shape") and q_imgs.shape[1] == 5, \
-            "q_imgs must be shape (N, 5, H, W) with ordering [m, 1p, 1n, 2p, 2n]"
+            "q_imgs must be shape (N, 5, H, W)"
 
+        shapes, grad_e1, grad_e2 = \
+            self.get_resmoothed_shape(q_imgs, batch_size=batch_size, with_grad=True)
 
-        # Allocate outputs
-        R_anacal_list = np.zeros((N, 2, 2), dtype=np.float32)
-
-        # Batch compute resmoothed shapes & gradients for this shear slice
-        # Expect: shape_j -> (N, 2), grad_e1_j -> (N, H, W), grad_e2_j -> (N, H, W)
-        shapes, grad_e1, grad_e2 = self.get_resmoothed_shape(q_imgs, batch_size=batch_size, with_grad=True)
-
-        # Compute responses per galaxy for this shear (compact list-comprehension)
-        # _single_gal_response expects a single galaxy's q_img + its grads
+        # compute response per galaxy
         res = [
             _single_gal_response(q_imgs[i], grad_e1[i], grad_e2[i])
             for i in range(N)
         ]
-        # Unzip into separate arrays and stack
-        R_anacal_list = np.stack([r for r in res], axis = 0)
+
+        R_anacal_list = np.stack(res, axis=0).astype(self.np_dtype)
 
         return shapes, R_anacal_list
 
-    def get_resmoothed_shape(self, q_imgs, batch_size=32, with_grad=False):
-        """
-        q_imgs: list of q_img dict, each of shape (5, H, W)
-        batch_size: batch size for model inference
-        with_grad: whether to compute pixel gradients
 
-        Returns:
-        if not with_grad:
-            all_shape: (N, 2) numpy array
-        else:
-            all_shape: (N, 2) numpy array
-            all_grad_e1: (N, H, W) numpy array
-            all_grad_e2: (N, H, W) numpy array
-        """
+    # ---------------------------- get_resmoothed_shape ----------------------------
+    def get_resmoothed_shape(self, q_imgs, batch_size=32, with_grad=False):
 
         def process_q_imgs(q_imgs_batch):
-            resmoothed_batch = np.array([q_img[0].astype(np.float32) for q_img in q_imgs_batch])  # shape (B, 1, H, W)
-            if not with_grad:
-                shapes = predictor(self.model, resmoothed_batch)[:,:2]
-                grads_e1 = [None] * len(shapes)
-                grads_e2 = [None] * len(shapes)
-            else:
-                shapes, grads_e1, grads_e2 = shape_pixel_gradients(self.model, resmoothed_batch)
-            return shapes, grads_e1, grads_e2
+            # Extract the "m" image (index 0) and cast to target dtype
+            resmoothed_batch = np.array(
+                [q_img[0].astype(self.np_dtype) for q_img in q_imgs_batch]
+            )  # shape (B, H, W)
 
+            # ensure shape is (B, 1, H, W)
+            if resmoothed_batch.ndim == 3:
+                resmoothed_batch = resmoothed_batch[:, None, :, :]
+
+            # Move to torch
+            inp = torch.from_numpy(resmoothed_batch).to(
+                device=self.device, dtype=self.torch_dtype
+            )
+
+            if not with_grad:
+                out = predictor(self.model, inp)[:, :2]  # (B, 2)
+                shapes = out.detach().cpu().numpy().astype(self.np_dtype)
+                return shapes, [None]*len(shapes), [None]*len(shapes)
+
+            else:
+                shapes_t, g1_t, g2_t = shape_pixel_gradients(self.model, inp)
+
+                shapes = shapes_t.astype(self.np_dtype)
+                g1 = g1_t.astype(self.np_dtype)
+                g2 = g2_t.astype(self.np_dtype)
+                return shapes, g1, g2
+
+
+        # batching
         results = []
         for i in range(0, len(q_imgs), batch_size):
-            q_imgs_batch = q_imgs[i:min(i + batch_size, len(q_imgs))]
-            results.append(process_q_imgs(q_imgs_batch))
+            batch = q_imgs[i:i+batch_size]
+            results.append(process_q_imgs(batch))
 
-        all_shape, all_grad_e1, all_grad_e2 = zip(*results)  # Unzip results
-        all_shape = np.array([shape for batch in all_shape for shape in batch], dtype=np.float32)  # shape (N, 2)
+        # unpack
+        all_shape, all_grad_e1, all_grad_e2 = zip(*results)
+
+        all_shape = np.concatenate(all_shape, axis=0).astype(self.np_dtype)
+
         if not with_grad:
             return all_shape
-        else:
-            all_grad_e1 = np.array([grad for batch in all_grad_e1 for grad in batch], dtype=np.float32)
-            all_grad_e2 = np.array([grad for batch in all_grad_e2 for grad in batch], dtype=np.float32)
-            return all_shape, all_grad_e1, all_grad_e2  
+
+        all_grad_e1 = np.concatenate(all_grad_e1, axis=0).astype(self.np_dtype)
+        all_grad_e2 = np.concatenate(all_grad_e2, axis=0).astype(self.np_dtype)
+
+        return all_shape, all_grad_e1, all_grad_e2
 
 def _process_image(
     i: int,
@@ -163,8 +170,8 @@ def get_biases(shapes, Rs,
         results = list(ex.map(_bs_worker, bs_inds))
 
     # Unpack results
-    m_list = np.array([r[0] for r in results], dtype=np.float32)  # (bs_times, 2)
-    c_list = np.array([r[1] for r in results], dtype=np.float32)  # (bs_times, 2)
+    m_list = np.array([r[0] for r in results], dtype=np.float64)  # (bs_times, 2)
+    c_list = np.array([r[1] for r in results], dtype=np.float64)  # (bs_times, 2)
 
     # Full-sample estimate (single call, no bootstrap)
     m_mean, c_mean = _calibration(shapes, Rs)
@@ -212,13 +219,13 @@ def prepare_q_images(images, psfs, noises,
                      sigma_arcsec=0.85/2.355, flim=10.0, workers=32):
 
     N = images.shape[0]
-    centers = np.ones((N, 2), dtype=np.float32) * (images.shape[1] // 2)
+    centers = np.ones((N, 2), dtype=np.float64) * (images.shape[1] // 2)
     if cat is not None:
         if len(cat) > N:
             cat = cat[:N]  # ensure cat length matches N
             print(f"Warning: cat length greater than images. Truncating cat to length {N}.")
-        centers[:, 0] += (cat['image_x']-(cat['image_x']+0.5)//1).to_numpy(np.float32)
-        centers[:, 1] += (cat['image_y']-(cat['image_y']+0.5)//1).to_numpy(np.float32)
+        centers[:, 0] += (cat['image_x']-(cat['image_x']+0.5)//1).to_numpy(np.float64)
+        centers[:, 1] += (cat['image_y']-(cat['image_y']+0.5)//1).to_numpy(np.float64)
 
     with ProcessPoolExecutor(
         max_workers=workers,
@@ -270,7 +277,7 @@ def _single_gal_response(q_img, grad_e1, grad_e2):
     grad_e1, grad_e2: (H, W) numpy array
     """
 
-    anacal_R = np.zeros((2,2), dtype=np.float32)
+    anacal_R = np.zeros((2,2), dtype=q_img.dtype)
     anacal_R[0,0] = np.sum(grad_e1 * q_img[1])
     anacal_R[0,1] = np.sum(grad_e1 * q_img[2])
     anacal_R[1,0] = np.sum(grad_e2 * q_img[1])
