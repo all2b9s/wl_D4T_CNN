@@ -11,12 +11,16 @@ from multiprocessing import Pool, cpu_count
 from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor
 from functools import partial
 import time
+from numpy.random import SeedSequence, default_rng
 
 def make_seed(ori_seed, index, idx):
-    # convert into uint64 to avoid overflow
-    x = np.uint64(ori_seed)
-    x ^= np.uint64(index) * np.uint64(0x9E3779B97F4A7C15)
-    x ^= np.uint64(idx)   * np.uint64(0xBF58476D1CE4E5B9)
+    ori_seed = np.uint64(ori_seed)
+    index    = np.uint64(index)
+    idx      = np.uint64(idx)
+
+    x = ori_seed
+    x ^= index * np.uint64(0x9E3779B97F4A7C15)
+    x ^= idx   * np.uint64(0xBF58476D1CE4E5B9)
     return int(x)
 
 def robust_load_npy(path, retries=5, delay=0.05):
@@ -39,7 +43,7 @@ def load_img(shear_comp,
             abs_shear_value = 0.02,
             noise_level = 0.594,
             noise_mode = 'fixed',
-            ori_seed = 777,
+            ori_seed = 1115,
             directory='./temp/',
             ):
     dir = f'{directory}/{shear_comp}_{shear_mode}_val_{abs_shear_value:.3f}/img_{int(index)}/'
@@ -50,14 +54,15 @@ def load_img(shear_comp,
     except Exception as e:
         raise RuntimeError(f"Failed to load data from {dir}: {e}")
     psfs = np.tile(psfs, (len(cutouts), 1, 1))
+    if noise_level <= 0:
+        return cutouts, psfs, cat, np.zeros(len(cutouts))
     if (noise_mode == 'adaptive') or (noise_mode == 'uniform'):
         noise_list = np.zeros(len(cutouts))
     if noise_mode == 'fixed':
         noise_list = np.full(len(cutouts), noise_level)
-    
+    base_seq = SeedSequence([ori_seed, index])
+    rng = np.random.default_rng(base_seq)
     for (idx, cutout) in enumerate(cutouts):
-        seed = make_seed(ori_seed, index, idx)
-        rng = np.random.default_rng(seed)
         if noise_mode == 'adaptive':
             center = (cutout.shape[-2]//2, cutout.shape[-1]//2)
             cutout_crop = cutout[center[0]-2:(center[0]+3), center[1]-2:(center[1]+3)]

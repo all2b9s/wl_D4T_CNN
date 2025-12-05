@@ -124,7 +124,7 @@ def xlens_gal_sim(
         task_config.apply_lensing_position_shifts = False
     task_config.select_observable = ['i_ab']
     task_config.select_lower_limit = [0]
-    task_config.select_upper_limit = [25.3]
+    task_config.select_upper_limit = [24.5]
     task_config.sep_arcsec = sep # arcsec
 
     cattask = CatalogShearTask(config=task_config)
@@ -306,12 +306,12 @@ print(f'psf_e: {psf_e}')
 #                            psf_e=psf_e,
 #                            has_shift=False, ori_seed=666)
 #simulator(100000)
-simulator = xlen_simulator('/work/hdd/bdsp/wenyinli/datasets/xlens_fixed/', 
-                            num_workers=128, mode='calibration',
-                            rotId=1, init_id=100000,
+simulator = xlen_simulator('/work/hdd/bdsp/wenyinli/datasets/xlens_test/', 
+                            num_workers=128, mode='training',
+                            rotId=0, init_id=0,
                             psf_e=psf_e,
-                            has_shift=False, ori_seed=666)
-simulator(100000)
+                            has_shift=False, ori_seed=888)
+simulator(10000)
 #simulator = xlen_simulator('/work/nvme/bfmo/wenyinli/datasets/xlens_train/', 
 #                           num_workers=64, ori_seed=20240411,
 #                           mode='training')

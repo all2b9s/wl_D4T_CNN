@@ -29,6 +29,12 @@ class Calibrator:
 
     # ---------------------------- shape_measure ----------------------------
     def shape_measure(self, q_imgs, batch_size=32):
+        '''
+        q_imgs: (N, 5, H, W) numpy array
+        Returns:
+            shapes: (N, 2) numpy array
+            R_anacal_list: (N, 1, 2, 2) numpy array
+        '''
         N = len(q_imgs)
         assert hasattr(q_imgs, "shape") and q_imgs.shape[1] == 5, \
             "q_imgs must be shape (N, 5, H, W)"
@@ -131,58 +137,96 @@ def _bs_init_pool(shapes, Rs, shear_value):
 
 def _bs_worker(bs_ind):
     # bs_ind: 1D numpy index array
-    shapes = _BS_GLOBALS["shapes"][bs_ind]
-    Rs     = _BS_GLOBALS["Rs"][bs_ind]
+    g = _BS_GLOBALS
+    shapes = g["shapes"][bs_ind]
+    Rs     = g["Rs"][bs_ind]
     m, c   = _calibration(shapes, Rs)   # expects to return (m, c) shaped (2,), (2,)
-    shear  = _BS_GLOBALS["shear"]
+    shear  = g["shear"]
     return (m / shear - 1.0, c)         # normalize m here to reduce post work
 
-def get_biases(shapes, Rs,
-                shear_value=0.02,
-               bs_size=100, 
-               bs_times=100,
-               n_factor=1.0,
-               is_twin = False,
-               n_jobs=4):
+def _bootstrap(N, bs_size, rng=None, dtype=np.int32):
+    """单次 bootstrap 抽样，包装成函数方便重用。"""
+    if rng is None:
+        rng = np.random.default_rng()
+    return rng.integers(0, N, size=bs_size, dtype=dtype)
+
+
+def get_biases(
+    shapes,
+    Rs,
+    shear_value=0.02,
+    bs_size=100,
+    bs_times=100,
+    n_factor=1.0,
+    is_twin=False,
+    n_jobs=4,
+    chunk_bs=10,          # 每一批次做多少次 bootstrap，可调参
+    base_seed=12345,     # 如需可复现
+):
     """
     shapes: (N, 4, 2) numpy array 
     Rs:     (N, 4, 2, 2) numpy array   # combined R inputs you use in _calibration
+
     Returns:
         m_mean (2,), c_mean (2,), m_std (2,), c_std (2,)
         where m_mean is already (m/shear - 1)
     """
-    N = shapes.shape[0]
-    # Pre-generate bootstrap indices
-    if is_twin:
-        N = N // 2
-    bs_inds = [_bootstrap(N, bs_size) for _ in range(bs_times)]
-    if is_twin:
-        bs_inds = [np.concatenate([inds, inds + N]) for inds in bs_inds]
+    N_total = shapes.shape[0]
 
-    # Parallel map over bootstrap resamples
+    # twin 情况下，N_total = 2 * N_eff，只在抽样时用前半段
+    if is_twin:
+        N_eff = N_total // 2
+        bs_size = bs_size // 2
+    else:
+        N_eff = N_total
+
     if n_jobs is None:
         n_jobs = os.cpu_count() or 1
 
-    # Initialize worker pool with shared read-only arrays and shear value
-    with ProcessPoolExecutor(max_workers=n_jobs,
-                             initializer=_bs_init_pool,
-                             initargs=(shapes, Rs, shear_value)) as ex:
-        results = list(ex.map(_bs_worker, bs_inds))
-
-    # Unpack results
-    m_list = np.array([r[0] for r in results], dtype=np.float64)  # (bs_times, 2)
-    c_list = np.array([r[1] for r in results], dtype=np.float64)  # (bs_times, 2)
-
-    # Full-sample estimate (single call, no bootstrap)
+    # 全样本估计（不 bootstrap）
     m_mean, c_mean = _calibration(shapes, Rs)
     m_mean = m_mean / shear_value - 1.0
 
-    # Bootstrap standard deviations
+    # bootstrap 结果容器
+    m_list = []
+    c_list = []
+
+    rng = np.random.default_rng(base_seed)
+
+    # 以 chunk_bs 为单位分批做 bootstrap
+    with ProcessPoolExecutor(
+        max_workers=n_jobs,
+        initializer=_bs_init_pool,
+        initargs=(shapes, Rs, shear_value),
+    ) as ex:
+        done = 0
+        while done < bs_times:
+            cur = min(chunk_bs, bs_times - done)
+
+            # 这一批次只生成 cur 个索引数组，内存 ≈ cur * bs_size * sizeof(int)
+            bs_inds = []
+            for _ in range(cur):
+                inds = _bootstrap(N_eff, bs_size, rng=rng, dtype=np.int32)
+                if is_twin:
+                    inds = np.concatenate([inds, inds + N_eff])
+                bs_inds.append(inds)
+
+            # 并行跑这一小批次
+            results = list(ex.map(_bs_worker, bs_inds))
+
+            m_list.extend(r[0] for r in results)
+            c_list.extend(r[1] for r in results)
+
+            done += cur
+
+    m_list = np.asarray(m_list, dtype=np.float64)  # (bs_times, 2)
+    c_list = np.asarray(c_list, dtype=np.float64)  # (bs_times, 2)
+
+    # bootstrap 标准差
     m_std = m_list.std(axis=0, ddof=1) * n_factor
     c_std = c_list.std(axis=0, ddof=1) * n_factor
 
     return m_mean, c_mean, m_std, c_std
-
 
 # --- globals inside workers ---
 _G = {}
@@ -263,13 +307,6 @@ def _calibration(shapes, Rs):
 
     return np.array([m1, m2]), np.array([c1, c2])
         
-def _bootstrap(lense, size, seed = None):
-    if seed is not None:
-        np.random.seed(seed)
-    else:
-        np.random.seed()
-    rand_ints = np.random.choice(lense, size=size, replace=True)
-    return rand_ints
 
 def _single_gal_response(q_img, grad_e1, grad_e2):
     """
