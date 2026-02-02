@@ -129,19 +129,26 @@ class SingleGalaxyDataset(Dataset):
         df = df[df["split"] == split].copy().sort_values("id")
         self.ids = df["id"].to_numpy().astype(np.int64)
 
-        if target == "e":
-            self.targets = df[["e1","e2"]].to_numpy().astype(np.float32)
-        else:
-            raise ValueError("target must be 'e' or 'g'")
-
         # Keep fields if you want more complex losses later
         #self.extra = df[["flux","hlr_arcsec","sersic_n","psf_fwhm_arcsec","noise_std_ADU"]].to_numpy()
 
         # Open memmap (read-only, zero RAM)
-        self.images = np.load(images_path, mmap_mode="r").astype(np.float32)  # (N,H,W) float32
+        images = np.load(images_path, mmap_mode="r").astype(np.float32)  # (N,H,W) float32
+        if len(images.shape) == 3:
+            self.images = images  # keep memmap handle
+            self.shear_imgs = None
+        else:
+            print('Have shear images for augmentation')
+            self.images = images[:,0]
+            self.shear_imgs = images[:,1:3]
+            self.responses = df[["r1","r2"]].to_numpy().astype(np.float32)
         self.augment = augment and (split == "train")
         self.normalize = normalize
         self.channel_first = channel_first
+        if target == "e":
+            self.targets = df[["e1","e2"]].to_numpy().astype(np.float32)
+        else:
+            raise ValueError("target must be 'e' or 'g'")
 
         # Basic checks
         H, W = self.images.shape[1], self.images.shape[2]
@@ -149,6 +156,27 @@ class SingleGalaxyDataset(Dataset):
 
     def __len__(self):
         return len(self.ids)
+    
+    def augment_galaxy(self, img, y):
+        k = torch.randint(low=0, high=4, size=(1,), dtype=torch.int64).item()
+        img = rotate_image_90(img, k)
+        y = rotate_spin2(y, k)
+
+        do_flip_y = torch.rand(1).item() < 0.5
+        if do_flip_y:
+            img = flip_image_y(img)
+            y = flip_spin2(y)
+        
+        do_flip_x = torch.rand(1).item() < 0.5
+        if do_flip_x:
+            img = flip_image_x(img)
+            y = flip_spin2(y)
+
+        add_noise = torch.rand(1).item() < 0.5
+        if add_noise: 
+            img = add_resmoothed_noise(img, max_sigma=0.05)  # max_sigma=0.05 with 50% prob
+        return img, y
+
 
     def __getitem__(self, idx):
         i = self.ids[idx]
@@ -174,25 +202,71 @@ class SingleGalaxyDataset(Dataset):
 
         # data augmentation: random 0,90,180,270 rotation with proper spin-2 update
         if self.augment:
-            k = torch.randint(low=0, high=4, size=(1,), dtype=torch.int64).item()
-            img = rotate_image_90(img, k)
-            y = rotate_spin2(y, k)
+            do_shear = torch.rand(1).item() < 0.8
+            if do_shear and (self.shear_imgs is not None):
+                shear = torch.rand(2)*0.04 - 0.02  # [-0.02,0.02]
+                img = img + torch.tensor(self.shear_imgs[i,0]) * shear[0]+ torch.tensor(self.shear_imgs[i,1]) * shear[1]
+                y = y + shear*torch.tensor(self.responses[idx], dtype=torch.float32)
 
-            do_flip_y = torch.rand(1).item() < 0.5
-            if do_flip_y:
-                img = flip_image_y(img)
-                y = flip_spin2(y)
-            
-            do_flip_x = torch.rand(1).item() < 0.5
-            if do_flip_x:
-                img = flip_image_x(img)
-                y = flip_spin2(y)
-
-            add_noise = torch.rand(1).item() < 0.5
-            if add_noise: 
-                img = add_resmoothed_noise(img, max_sigma=0.05)  # max_sigma=0.05 with 50% prob
-
+            img, y = self.augment_galaxy(img, y)
         return img, y
+
+class PairedGalaxyDataset(SingleGalaxyDataset):
+    """
+    Loads paired images from a single .npy (via memmap) and labels from a CSV.
+    Supports spin-2–correct 90° rotations as augmentation.
+    """
+    def __init__(
+        self,
+        images_path: str,
+        csv_path: str,
+        split: Literal["train","val","test"] = "train",
+        target: Literal["e","g"] = "e",
+        augment: bool = True,
+        normalize: Literal["per_image","none"] = "per_image",
+        channel_first: bool = True,
+    ):
+        super().__init__(images_path, csv_path, split, target, augment, normalize, channel_first)
+
+    def __getitem__(self, idx):
+        i = self.ids[idx]
+        # load one image; copy to torch
+        img_np = self.images[i]  # (H,W) float32
+        img = torch.tensor(img_np)  # [H,W]
+
+        # per-image normalization (robust if mean varies with flux/noise)
+        if self.normalize == "per_image":
+            m = img.mean()
+            s = img.std()
+            if s > 0:
+                img = (img - m) / s
+            else:
+                img = img - m
+
+        # add channel
+        if self.channel_first:
+            img = img.unsqueeze(0)  # [1,H,W]
+
+        # target
+        y = torch.tensor(self.targets[idx], dtype=torch.float32)  # [2]
+
+        # data augmentation: random 0,90,180,270 rotation with proper spin-2 update
+        shear = torch.rand(2)*0.1 - 0.05  # [-0.02,0.02]
+        delta_e = shear*torch.tensor(self.responses[idx], dtype=torch.float32)
+        delta_img = torch.tensor(self.shear_imgs[i,0]) * shear[0]+ torch.tensor(self.shear_imgs[i,1]) * shear[1]
+        img_p = img + delta_img
+        img_n = img - delta_img
+        e_p = y + delta_e
+        e_n = y - delta_e
+
+        if self.augment:
+            img_p, e_p = self.augment_galaxy(img_p, e_p)
+            img_n, e_n = self.augment_galaxy(img_n, e_n)
+
+        imgs = torch.stack([img_p, img_n], dim=0)  # [2, C, H, W]
+        es   = torch.stack([e_p, e_n], dim=0)      # [2, 2]
+
+        return imgs, es
 
 
 # ----------------------------

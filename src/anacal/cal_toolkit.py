@@ -13,6 +13,29 @@ from functools import partial
 import time
 from numpy.random import SeedSequence, default_rng
 
+def bootstrap_e_std(e_fpfs, R_fpfs, n_boot=20, rng=None):
+    """
+    e_fpfs : (N,2) array
+    R_fpfs : (N,2) array
+    """
+
+    if rng is None:
+        rng = np.random.default_rng()
+
+    N = e_fpfs.shape[0]
+    boots = []
+
+    for _ in range(n_boot):
+        idx = rng.integers(0, N, N)       # bootstrap index
+        e_std = e_fpfs[idx].std(axis=0) / R_fpfs[idx].mean(axis=0)
+        boots.append(e_std)
+
+    boots = np.vstack(boots)             # (n_boot, 2)
+    mean = boots.mean(axis=0)
+    err  = boots.std(axis=0, ddof=1)     # error bar = std of bootstraps
+
+    return mean, err, boots
+
 def make_seed(ori_seed, index, idx):
     ori_seed = np.uint64(ori_seed)
     index    = np.uint64(index)
@@ -66,7 +89,7 @@ def load_img(shear_comp,
         if noise_mode == 'adaptive':
             center = (cutout.shape[-2]//2, cutout.shape[-1]//2)
             cutout_crop = cutout[center[0]-2:(center[0]+3), center[1]-2:(center[1]+3)]
-            noise_list[idx] = min((cutout_crop.mean())*(rng.uniform(0,0.25))**2,noise_level)
+            noise_list[idx] = min((cutout_crop.mean())*(rng.uniform(0,0.3))**2,noise_level)
         if noise_mode == 'uniform':
             center = (cutout.shape[-2]//2, cutout.shape[-1]//2)
             cutout_crop = cutout[center[0]-2:(center[0]+3), center[1]-2:(center[1]+3)]
@@ -160,6 +183,30 @@ def build_dataset(
     else:
         return [], [], all_cats, all_noise
     
+
+def selection_response(
+    flux,
+    R_flux,
+    shapes,
+    zero_point = 30,
+    mag_cut = 25.0,
+):
+    dg = 0.02
+    def flux_to_mag(flux):
+        return zero_point-2.5 * np.log10(flux)
+    mask_1p = flux_to_mag(flux+dg*R_flux[:,0])< mag_cut
+    mask_1m = flux_to_mag(flux-dg*R_flux[:,0])< mag_cut
+    mask_2p = flux_to_mag(flux+dg*R_flux[:,1])< mag_cut
+    mask_2m = flux_to_mag(flux-dg*R_flux[:,1])< mag_cut
+
+    e_1p = shapes[mask_1p,0].mean()
+    e_1m = shapes[mask_1m,0].mean()
+    e_2p = shapes[mask_2p,1].mean()
+    e_2m = shapes[mask_2m,1].mean()
+    R_s_1 = (e_1p - e_1m) / (2*dg)
+    R_s_2 = (e_2p - e_2m) / (2*dg)
+    R_s = np.array([R_s_1, R_s_2])
+    return R_s
 
 def format_number(x: float) -> str:
     s = f"{x:.3f}".rstrip('0').rstrip('.')  # keep up to 3 decimal places, trim trailing zeros

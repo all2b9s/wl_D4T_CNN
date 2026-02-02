@@ -127,20 +127,22 @@ def _process_image(
 
 
 # ---- Bootstraping ----
-_BS_GLOBALS = {"shapes": None, "Rs": None, "shear": None}
+_BS_GLOBALS = {"shapes": None, "Rs": None, "shear": None, "mask": None}
 
-def _bs_init_pool(shapes, Rs, shear_value):
+def _bs_init_pool(shapes, Rs, shear_value, mask=None):
     # Set read-only globals inside each worker process
     _BS_GLOBALS["shapes"] = shapes
     _BS_GLOBALS["Rs"]     = Rs
     _BS_GLOBALS["shear"]  = shear_value
+    _BS_GLOBALS["mask"]   = mask
 
 def _bs_worker(bs_ind):
     # bs_ind: 1D numpy index array
     g = _BS_GLOBALS
     shapes = g["shapes"][bs_ind]
     Rs     = g["Rs"][bs_ind]
-    m, c   = _calibration(shapes, Rs)   # expects to return (m, c) shaped (2,), (2,)
+    mask   = g["mask"][bs_ind] if g["mask"] is not None else None
+    m, c   = _calibration(shapes, Rs, mask=mask)   # expects to return (m, c) shaped (2,), (2,)
     shear  = g["shear"]
     return (m / shear - 1.0, c)         # normalize m here to reduce post work
 
@@ -154,6 +156,7 @@ def _bootstrap(N, bs_size, rng=None, dtype=np.int32):
 def get_biases(
     shapes,
     Rs,
+    mask=None,
     shear_value=0.02,
     bs_size=100,
     bs_times=100,
@@ -166,7 +169,9 @@ def get_biases(
     """
     shapes: (N, 4, 2) numpy array 
     Rs:     (N, 4, 2, 2) numpy array   # combined R inputs you use in _calibration
-
+    mask:   (N, 4) boolean numpy array, optional
+            if given, only use the selected galaxies for calibration
+    
     Returns:
         m_mean (2,), c_mean (2,), m_std (2,), c_std (2,)
         where m_mean is already (m/shear - 1)
@@ -184,7 +189,7 @@ def get_biases(
         n_jobs = os.cpu_count() or 1
 
     # 全样本估计（不 bootstrap）
-    m_mean, c_mean = _calibration(shapes, Rs)
+    m_mean, c_mean = _calibration(shapes, Rs, mask=mask)
     m_mean = m_mean / shear_value - 1.0
 
     # bootstrap 结果容器
@@ -197,27 +202,29 @@ def get_biases(
     with ProcessPoolExecutor(
         max_workers=n_jobs,
         initializer=_bs_init_pool,
-        initargs=(shapes, Rs, shear_value),
+        initargs=(shapes, Rs, shear_value, mask),
     ) as ex:
         done = 0
-        while done < bs_times:
-            cur = min(chunk_bs, bs_times - done)
+        with tqdm(total=bs_times, desc="Bootstrap") as pbar:
+            while done < bs_times:
+                cur = min(chunk_bs, bs_times - done)
 
-            # 这一批次只生成 cur 个索引数组，内存 ≈ cur * bs_size * sizeof(int)
-            bs_inds = []
-            for _ in range(cur):
-                inds = _bootstrap(N_eff, bs_size, rng=rng, dtype=np.int32)
-                if is_twin:
-                    inds = np.concatenate([inds, inds + N_eff])
-                bs_inds.append(inds)
+                # 这一批次只生成 cur 个索引数组，内存 ≈ cur * bs_size * sizeof(int)
+                bs_inds = []
+                for _ in range(cur):
+                    inds = _bootstrap(N_eff, bs_size, rng=rng, dtype=np.int32)
+                    if is_twin:
+                        inds = np.concatenate([inds, inds + N_eff])
+                    bs_inds.append(inds)
 
-            # 并行跑这一小批次
-            results = list(ex.map(_bs_worker, bs_inds))
+                # 并行跑这一小批次
+                results = list(ex.map(_bs_worker, bs_inds))
 
-            m_list.extend(r[0] for r in results)
-            c_list.extend(r[1] for r in results)
+                m_list.extend(r[0] for r in results)
+                c_list.extend(r[1] for r in results)
 
-            done += cur
+                done += cur
+                pbar.update(cur)
 
     m_list = np.asarray(m_list, dtype=np.float64)  # (bs_times, 2)
     c_list = np.asarray(c_list, dtype=np.float64)  # (bs_times, 2)
@@ -287,23 +294,51 @@ def prepare_q_images(images, psfs, noises,
     return np.array(q_imgs)
 
 
-def _calibration(shapes, Rs):
+def _calibration(shapes, Rs, mask=None):
     """
     shapes: (N, 4, 2) numpy array 
-    R: (N, 4, 2, 2) numpy array
+    Rs:     (N, 4, 2, 2) numpy array
+    mask:   (N, 4) boolean numpy array, optional
 
     all in sequence of 1p,1n,2p,2n
 
     Returns:
-    cal_shapes: (N, 4) numpy array
+    m: (2,), c: (2,) numpy arrays
     """
-    shears = shapes.mean(axis=0) # (4,2)
-    responses = Rs.mean(axis=0) # (4, 2, 2)
-
-    m1 = (shears[0,0]-shears[1,0])/(responses[0,0,0]+responses[1,0,0])
-    m2 = (shears[2,1]-shears[3,1])/(responses[2,1,1]+responses[3,1,1])
-    c1 = (shears[0,0]+shears[1,0])/(responses[0,0,0]+responses[1,0,0])
-    c2 = (shears[2,1]+shears[3,1])/(responses[2,1,1]+responses[3,1,1])
+    if mask is not None:
+        # mask out invalid entries: for each position, only keep rows where mask is True
+        # mask shape (N, 4), we need to apply it per galaxy
+        mask_1p = mask[:, 0]  # (N,)
+        mask_1m = mask[:, 1]
+        mask_2p = mask[:, 2]
+        mask_2m = mask[:, 3]
+        
+        # compute shears only with valid data
+        shear_1p = shapes[mask_1p, 0, 0].mean()
+        shear_1m = shapes[mask_1m, 1, 0].mean()
+        shear_2p = shapes[mask_2p, 2, 1].mean()
+        shear_2m = shapes[mask_2m, 3, 1].mean()
+        
+        resp_1p = Rs[mask_1p, 0, 0, 0].mean()
+        resp_1m = Rs[mask_1m, 1, 0, 0].mean()
+        resp_2p = Rs[mask_2p, 2, 1, 1].mean()
+        resp_2m = Rs[mask_2m, 3, 1, 1].mean()
+    else:
+        shears = shapes.mean(axis=0) # (4,2)
+        responses = Rs.mean(axis=0) # (4, 2, 2)
+        shear_1p = shears[0, 0]
+        shear_1m = shears[1, 0]
+        shear_2p = shears[2, 1]
+        shear_2m = shears[3, 1]
+        resp_1p = responses[0, 0, 0]
+        resp_1m = responses[1, 0, 0]
+        resp_2p = responses[2, 1, 1]
+        resp_2m = responses[3, 1, 1]
+    
+    m1 = (shear_1p - shear_1m) / (resp_1p + resp_1m)
+    m2 = (shear_2p - shear_2m) / (resp_2p + resp_2m)
+    c1 = (shear_1p + shear_1m) / (resp_1p + resp_1m)
+    c2 = (shear_2p + shear_2m) / (resp_2p + resp_2m)
 
     return np.array([m1, m2]), np.array([c1, c2])
         

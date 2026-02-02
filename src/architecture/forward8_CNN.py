@@ -321,7 +321,170 @@ class Forward8_simp_CNN(Forward8_base):
         e2 = self.head_e2(v2)
         e = torch.cat([e1, e2], dim=-1)  # [B,2]
         return e
-    
+
+class Forward8_ShapeletHead_CNN(Forward8_fixW_CNN):
+    """
+    在 Forward8_fixW_CNN 的基础上，用 shapelet-like 矩来读出 feature。
+    只改 head，不改 trunk / D4 结构 / 归一化方式。
+    """
+
+    def __init__(
+        self,
+        in_dim=1,
+        base_channels=32,
+        head_hidden=128,
+        out_dim=2,
+        num_layers=5,
+        res_factor=0.1,
+        nl_sigma=16,
+        gw_sigma=16,
+        use_gap_feature=True,
+    ):
+        """
+        use_gap_feature: 如果 True，则在 shapelet 矩特征外，再拼上原来的 GAP 向量。
+        """
+        super().__init__(
+            in_dim=in_dim,
+            base_channels=base_channels,
+            head_hidden=head_hidden,
+            out_dim=out_dim,
+            num_layers=num_layers,
+            res_factor=res_factor,
+            nl_sigma=nl_sigma,
+            gw_sigma=gw_sigma,
+        )
+
+        self.use_gap_feature = use_gap_feature
+        self._coord_cache = {}  # 缓存 (Hf,Wf,device,dtype) -> (xx,yy)
+
+        C = base_channels
+        # 我们对每个 channel 计算 (M00, M22c, M22s) 三个矩 → 3C 维
+        in_dim_head = 3 * C
+        if self.use_gap_feature:
+            # 如果要额外拼上原来的 GAP (C 维) 特征
+            in_dim_head += C
+
+        # 重建 head_e1, head_e2，使之接受新的输入维度
+        self.head_e1 = BiasFreeMLP(in_dim_head, hidden=head_hidden)
+        self.head_e2 = BiasFreeMLP(in_dim_head, hidden=head_hidden)
+
+    # ------------------------------------------------------------
+    # 内部工具：缓存坐标网格和 shapelet-like 矩
+    # ------------------------------------------------------------
+    def _get_coord_grid(self, hw, device, dtype):
+        """
+        返回规范化到 [-1,1] 的坐标网格 xx,yy，形状 [1,1,H,W]，用于构造 (x^2-y^2), 2xy。
+        """
+        key = (hw[0], hw[1], device.type, str(dtype))
+        cached = self._coord_cache.get(key)
+        if cached is not None:
+            return cached
+
+        H, W = hw
+        yy, xx = torch.meshgrid(
+            torch.linspace(-1.0, 1.0, H, device=device, dtype=dtype),
+            torch.linspace(-1.0, 1.0, W, device=device, dtype=dtype),
+            indexing="ij",
+        )
+        xx = xx.unsqueeze(0).unsqueeze(0)  # [1,1,H,W]
+        yy = yy.unsqueeze(0).unsqueeze(0)
+        self._coord_cache[key] = (xx, yy)
+        return xx, yy
+
+    def _shapelet_moments(self, F, w_f, xx, yy, eps=1e-8):
+        """
+        在 feature 图上计算类 shapelet 矩。
+        F:   [B,C,Hf,Wf]
+        w_f: [1,1,Hf,Wf]  高斯权重
+        xx,yy: [1,1,Hf,Wf] 匹配的坐标网格
+
+        返回:
+          moms: [B,C,3]  对每个 channel 的 (M00, M22c, M22s)
+        """
+        # 归一化权重，让 sum_w ≈ 1 （避免数值偏移）
+        w_norm = w_f / (w_f.sum(dim=(-2, -1), keepdim=True) + eps)  # [1,1,Hf,Wf]
+
+        # 0 阶矩：类似 M00
+        M00 = (F * w_norm).sum(dim=(-2, -1))  # [B,C]
+
+        # 2 阶矩核：Qc = x^2 - y^2, Qs = 2xy
+        Qc = xx * xx - yy * yy
+        Qs = 2.0 * xx * yy
+
+        M22c = (F * w_norm * Qc).sum(dim=(-2, -1))  # [B,C]
+        M22s = (F * w_norm * Qs).sum(dim=(-2, -1))  # [B,C]
+
+        moms = torch.stack([M00, M22c, M22s], dim=-1)  # [B,C,3]
+        return moms
+
+    # ------------------------------------------------------------
+    # Forward：复制父类 forward 的整体流程，只改 head 部分
+    # ------------------------------------------------------------
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # --- Normalization（和父类保持一致） ---
+        w_nl = self._get_cached_weight(
+            x.shape[-2:], sigma=self.nl_sigma, device=x.device, dtype=x.dtype
+        )
+        m = (x * w_nl).sum(dim=(1, 2, 3), keepdim=True) * 100  # mean brightness
+        norm = 1 + F.softplus(m - 1, beta=10.0, threshold=20)
+        x = x / norm
+
+        # --- D4 orbit and inverse aggregation（完全复用父类逻辑） ---
+        xs = self._d4_orbit_stack(x)  # [8,B,C,H,W]
+        B = x.size(0)
+        x8 = xs.view(-1, xs.size(2), xs.size(3), xs.size(4))  # [8B,C,H,W]
+
+        # 单 trunk
+        f8 = self._trunk_feature(x8)  # [8B,C,Hf,Wf]
+        f8 = f8.view(8, B, f8.size(1), f8.size(2), f8.size(3))  # [8,B,C,Hf,Wf]
+
+        # inverse 回 canonical frame
+        feats = self._d4_inverse_stack(f8)  # [8,B,C,Hf,Wf]
+
+        # --- sign-weighted mean for e1/e2（和父类一致） ---
+        s1 = self.signs_e1.view(8, 1, 1, 1, 1).to(feats)
+        s2 = self.signs_e2.view(8, 1, 1, 1, 1).to(feats)
+
+        self.f_mean_e1 = (feats * s1).mean(dim=0)  # [B,C,Hf,Wf]
+        self.f_mean_e2 = (feats * s2).mean(dim=0)  # [B,C,Hf,Wf]
+
+        # --- Align weight map to feature map size ---
+        Hf, Wf = self.f_mean_e1.shape[-2:]
+        w_f = self._get_cached_weight(
+            (Hf, Wf),
+            sigma=self.gw_sigma,
+            device=self.f_mean_e1.device,
+            dtype=self.f_mean_e1.dtype,
+        )  # [1,1,Hf,Wf]
+
+        # --- 坐标网格（只根据 Hf,Wf 生成一次并缓存） ---
+        xx, yy = self._get_coord_grid(
+            (Hf, Wf),
+            device=self.f_mean_e1.device,
+            dtype=self.f_mean_e1.dtype,
+        )
+
+        # --- 在 feature 上计算 shapelet-like moments ---
+        moms1 = self._shapelet_moments(self.f_mean_e1, w_f, xx, yy)  # [B,C,3]
+        moms2 = self._shapelet_moments(self.f_mean_e2, w_f, xx, yy)  # [B,C,3]
+
+        # 展平到 [B, 3C]
+        v1 = moms1.view(moms1.size(0), -1)
+        v2 = moms2.view(moms2.size(0), -1)
+
+        if self.use_gap_feature:
+            # 额外拼上原本的 weighted GAP 特征（相当于 M00 的另一种统计）
+            gap1 = self._weighted_gap(self.f_mean_e1, w_f)  # [B,C]
+            gap2 = self._weighted_gap(self.f_mean_e2, w_f)  # [B,C]
+            v1 = torch.cat([v1, gap1], dim=-1)  # [B,3C+C]
+            v2 = torch.cat([v2, gap2], dim=-1)
+
+        # --- Heads ---
+        e1 = self.head_e1(v1)  # [B,1]
+        e2 = self.head_e2(v2)  # [B,1]
+        e = torch.cat([e1, e2], dim=-1)  # [B,2]
+        return e
+
 class Forward8_fixW_nores_CNN(Forward8_base):
     """
     D4-equivariant CNN model with Gaussian smoothing and weighted pooling.

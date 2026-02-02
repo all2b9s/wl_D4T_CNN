@@ -451,3 +451,36 @@ def predictor(model, img, normalize = "none"):
         y_pred_t = model(img_t)          # [1,2]
     y_pred = y_pred_t.squeeze(0).cpu().numpy() 
     return y_pred
+
+
+
+class PairedShearWrapper(nn.Module):
+    """
+    包装一个原始的 shape 模型：
+    - 原模型: 输入 [N, H, W] -> 输出 [N, 2]
+    - 包装后: 输入 [N, 2, H, W] (每个样本两张 sheared 图像)
+            -> 输出 (shape1, shape2)，各自都是 [N, 2]
+    """
+    def __init__(self, base_model: nn.Module):
+        super().__init__()
+        self.base_model = base_model
+
+    def forward(self, imgs_pair: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        imgs_pair: [N, 2, H, W]
+            imgs_pair[:, 0, ...] 是第一种 shear 的图像
+            imgs_pair[:, 1, ...] 是第二种 shear 的图像
+
+        返回:
+            shape1: [N, 2]
+            shape2: [N, 2]
+        """
+        img_p = imgs_pair[:,0]
+        img_n = imgs_pair[:,1]
+        
+        shape_p = self.base_model(img_p)   # [N, 2]
+        shape_n = self.base_model(img_n)   # [N, 2]
+        
+        e_mean = 0.5 * (shape_p + shape_n)
+        delta_e = 0.5 * (shape_p - shape_n)
+        return e_mean, delta_e
