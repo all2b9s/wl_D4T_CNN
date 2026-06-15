@@ -103,6 +103,7 @@ def xlens_gal_sim(
     skymap_config.pixelScale = pixel_scale             # arcsec/pixel
     skymap_config.tractOverlap = 0.0                   # no overlap
     
+    
     # Create the skymap
     skymap = DiscreteSkyMap(skymap_config)
 
@@ -125,7 +126,7 @@ def xlens_gal_sim(
         task_config.apply_lensing_position_shifts = False
     task_config.select_observable = ['i_ab']
     task_config.select_lower_limit = [0]
-    task_config.select_upper_limit = [25.3]
+    task_config.select_upper_limit = [24.5]
     task_config.sep_arcsec = sep # arcsec
 
     cattask = CatalogShearTask(config=task_config)
@@ -204,19 +205,14 @@ def xlens_gal_sim(
 
     # Save outputs
     os.makedirs(output_dir, exist_ok=True)
-    full_img_path = os.path.join(output_dir, "full_image.npy")
-
-    # Check if file exists before deleting
-    '''if os.path.exists(full_img_path):
-        os.remove(full_img_path)
-        print(f"Deleted: {full_img_path}")
-    else:
-        print(f"File not found: {full_img_path}")'''
     np.save(os.path.join(output_dir, "psf_image.npy"), psf_array)
-    #np.save(full_img_path, gal_array)
     np.save(os.path.join(output_dir, "cutouts.npy"), cutouts)
     gal_cat.to_csv(os.path.join(output_dir, "gt_cat.csv"), index=False)
-    np.save('./plots/patch_img.npy',gal_array)
+    #np.save('./plots/patch_img.npy',gal_array)
+    plt.imshow(gal_array, norm=simple_norm(gal_array, 'sqrt', percent=99.5), cmap='gray')
+    plt.axis('off')
+    plt.savefig(os.path.join('./plots/', "full_image.png"), bbox_inches='tight', pad_inches=0)
+    plt.close()
     return gal_array,psf_array,gal_cat
 
 class xlen_simulator():
@@ -225,7 +221,6 @@ class xlen_simulator():
                  ori_seed = 666,
                  image_size = 1000,
                  pixel_scale = 0.2,
-                 separation = 18.0,
                  num_workers=8,
                  has_shift = True,
                  around_corner = False,
@@ -238,7 +233,6 @@ class xlen_simulator():
         self.abs_shear = abs_shear
         self.image_size = image_size
         self.pixel_scale = pixel_scale
-        self.separation = separation
         self.num_workers = num_workers
         self.around_corner = around_corner
         self.has_shift = has_shift
@@ -275,21 +269,6 @@ class xlen_simulator():
                     desc=f"Mode {shear_mode}, Comp {shear_comp}"
                 ))
                 results.extend(res)
-        '''for shear_mode, shear_comp in shear_tasks:
-            for index in tqdm(range(num_sims), desc=f"Mode {shear_mode}, Comp {shear_comp}"):
-                seed = seeds[index]
-                output_dir = f'{self.output_dir}/{shear_comp}_{shear_mode}_val_{self.abs_shear:.3f}/img_{int(index)}/'
-                temp = xlens_gal_sim(
-                    output_dir = output_dir,
-                    shear_mode = shear_mode,
-                    shear_comp = shear_comp,
-                    shear_value = self.abs_shear,
-                    seed = seed,
-                    dim = self.image_size,
-                    pixel_scale = self.pixel_scale,
-                    sep = self.separation,
-                )
-                results.append(temp)'''
         print("Simulation finished")
         return results
 
@@ -304,7 +283,7 @@ class xlen_simulator():
             seed = seed,
             dim = self.image_size,
             pixel_scale = self.pixel_scale,
-            sep = self.separation,
+            sep = 90*self.pixel_scale,
             psf_e=self.psf_e,
             has_shift=self.has_shift,
             around_corner = self.around_corner,
@@ -318,17 +297,19 @@ print(f'psf_e: {psf_e}')
                             psf_e=psf_e,
                             has_shift=True, ori_seed=666)
 simulator(200_000)'''
-simulator = xlen_simulator('/work/nvme/bfmo/wenyinli/datasets/xlens_shift/', 
+'''simulator = xlen_simulator('/work/nvme/bfmo/wenyinli/datasets/xlens_shift/', 
                             num_workers=128, mode='training',
                             rotId=1, init_id=200_000,
                             psf_e=psf_e,
                             has_shift=True, ori_seed=666)
-simulator(200_000)
-'''simulator = xlen_simulator('/work/nvme/bfmo/wenyinli/datasets/xlens_sims_test/', 
+simulator(200_000)'''
+simulator = xlen_simulator('/work/nvme/bfmo/wenyinli/datasets/xlens_sims_test_px0.1/', 
                             num_workers=64, mode='training',
                             rotId=0, init_id=0,
                             psf_e=0,
-                            has_shift=False, around_corner = True,ori_seed=999)
-simulator(1)'''
+                            pixel_scale=0.1,
+                            image_size=1100,
+                            has_shift=False, around_corner = True, ori_seed=999)
+simulator(10_000)
 
 

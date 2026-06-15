@@ -8,8 +8,57 @@ import torch
 from torch import nn
 import torch.nn.functional as F
 
-from src.datasets.single_gal_dataset import make_loaders, rotate_spin2, rotate_image_90, flip_image_y, flip_spin2
+
 # Basic Modules
+
+def flip_image_y(x):
+    """
+    Reflect across the y-axis (horizontal flip).
+    x: [B, C, H, W]
+    """
+    return torch.flip(x, dims=(-1,))  # flip width
+
+def flip_image_x(x):
+    """
+    Reflect across the x-axis (vertical flip).
+    x: [B, C, H, W]
+    """
+    return torch.flip(x, dims=(-2,))  # flip height
+
+def flip_spin2(y):
+    """
+    Spin-2 conjugation: (e1, e2) -> (e1, -e2).
+    y: [..., 2]
+    """
+    y = y.clone()
+    y[..., 1] = -y[..., 1]
+    return y
+
+def rotate_spin2(y: torch.Tensor, k: int, inverse = True):
+    """
+    y: [B, 2]  (e1,e2) or (g1,g2)
+    Rotation angle theta = k * 90°; spin-2 requires rotation by 2*theta.
+    inverse=True means rotating the output back to the original coordinate system (use -2*theta)
+    """
+    if k == 0:
+        return y
+    theta = k * (math.pi/2.0) * 2.0
+    if inverse:
+        theta = -theta
+    c, s = math.cos(theta), math.sin(theta)
+    e1, e2 = y[..., 0], y[..., 1]
+    y1 = c*e1 - s*e2
+    y2 = s*e1 + c*e2
+    return torch.stack([y1, y2], dim=-1)
+
+def rotate_image_90(img: torch.Tensor, k: int) -> torch.Tensor:
+    # img: [1,H,W] or [H,W]
+    if k == 0:
+        return img
+    # torch.rot90 works on [*, H, W]
+    if img.ndim == 2:
+        return torch.rot90(img, k, dims=(0,1))
+    return torch.rot90(img, k, dims=(-2,-1))
 
 class ChannelLayerNorm2d(nn.Module):
     def __init__(self, num_channels, eps=1e-5, affine=True):
@@ -110,7 +159,7 @@ class R180Inv_Conv2d(nn.Module):
         self.act = nn.GELU()
 
     @staticmethod
-    def _rot180(W):  # 180°旋转 = 上下+左右翻转
+    def _rot180(W):  
         return torch.flip(W, dims=(-2, -1))
 
     def forward(self, x):
@@ -220,7 +269,38 @@ class ConvGELU_Res(nn.Module):
 
     def forward(self, x):
         residual = self.skip(x) if self.skip is not None else x
-        #y = self.pad(x)
+        y = self.conv(x)
+        y = self.norm(y)
+        y = self.act(y)
+        return y + self.residual_scale * residual
+
+class ConvReLU_Res(nn.Module):
+    """
+    Conv2d(3×3) + LayerNorm(GroupNorm) + ReLU
+    + residual connection
+
+    Same as ConvGELU_Res but with ReLU activation.
+    """
+
+    def __init__(self, in_ch, out_ch, residual_scale: float = 1, kernel_size: int =3):
+        super().__init__()
+        self.residual_scale = residual_scale
+        self.conv = nn.Conv2d(in_ch, out_ch, kernel_size=kernel_size, stride=1, padding=kernel_size//2, bias=True)
+        self.norm = ChannelLayerNorm2d(out_ch, eps=1e-5, affine=True)
+        self.act = nn.ReLU()
+
+        # optional 1x1 skip if channel mismatch
+        self.skip = nn.Conv2d(in_ch, out_ch, kernel_size=1, stride=1, bias=False) if in_ch != out_ch else None
+
+        # initialization
+        nn.init.kaiming_normal_(self.conv.weight, nonlinearity="relu")
+        if self.conv.bias is not None:
+            nn.init.zeros_(self.conv.bias)
+        if self.skip is not None:
+            nn.init.kaiming_normal_(self.skip.weight, nonlinearity="linear")
+
+    def forward(self, x):
+        residual = self.skip(x) if self.skip is not None else x
         y = self.conv(x)
         y = self.norm(y)
         y = self.act(y)
@@ -264,16 +344,16 @@ class ConvGELU_layernorm(nn.Module):
 
 
 class BiasFreeMLP(nn.Module):
-    def __init__(self, in_dim: int, hidden: int = 128):
+    def __init__(self, in_dim: int, hidden: int = 128, activation: Literal['tanh', 'relu'] = 'tanh'):
         super().__init__()
         self.net = nn.Sequential(
             nn.Flatten(),
             nn.Linear(in_dim, hidden, bias=False),
-            nn.Tanh(),
+            nn.ReLU() if activation == 'relu' else nn.Tanh(),
             nn.Linear(hidden, hidden, bias=False),
-            nn.Tanh(),
+            nn.ReLU() if activation == 'relu' else nn.Tanh(),
             nn.Linear(hidden, hidden, bias=False),
-            nn.Tanh(),
+            nn.ReLU() if activation == 'relu' else nn.Tanh(),
             nn.Linear(hidden, 1, bias=False)
         )
 
@@ -402,25 +482,25 @@ class OddMultiheadAttnPool(nn.Module):
 
     def forward( 
         self,
-        x: torch.Tensor,                        # [B,C,H,W] —— 用于 Value（奇）
-        mask: torch.Tensor | None = None,       # [B,1,H,W] 或 [B,H,W]，可选
-        K_even_src: torch.Tensor | None = None, # [B,C,H,W]，外部偶特征（比如8旋平均）
+        x: torch.Tensor,                        # [B,C,H,W] 
+        mask: torch.Tensor | None = None,       # [B,1,H,W] or [B,H,W]，
+        K_even_src: torch.Tensor | None = None, # [B,C,H,W]
     ) -> torch.Tensor:
         B, C, H, W = x.shape
         N = H * W
 
         # --- tokens & query ---
-        V_odd  = x.view(B, C, N).permute(0, 2, 1).contiguous()   # [B,N,C]（奇）
+        V_odd  = x.view(B, C, N).permute(0, 2, 1).contiguous()   # [B,N,C]
         Q      = self.q.expand(B, 1, C)                          # [B,1,C]
 
-        # --- Key 的“偶部分”来源 ---
+        
         if K_even_src is None:
-            K_even_map = x**2                                    # 传统方案：保证对符号偶
+            K_even_map = x**2                                  
         else:
-            K_even_map = K_even_src                              # 你的 8 旋平均特征
+            K_even_map = K_even_src                              
         K_even = K_even_map.view(B, C, N).permute(0, 2, 1).contiguous()  # [B,N,C]
 
-        # --- 连续 mask 的 log-bias（可选） ---
+        
         attn_mask = None
         if mask is not None:
             if mask.ndim == 3:

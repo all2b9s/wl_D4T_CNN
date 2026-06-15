@@ -11,7 +11,7 @@ import torchvision.transforms as T
 from torchvision.models.resnet import resnet18, ResNet18_Weights
 
 from src.architecture.CNN_toolkit import D4_eq_weight, center_crop_to, quad_gaussian_2d, gaussian_weight_2d
-from src.architecture.CNN_module import R180Inv_Conv2d, D4Inv_Conv2d, ConvGELU, BiasFreeMLP, ResConvBNGELU
+from src.architecture.CNN_module import R180Inv_Conv2d, D4Inv_Conv2d, ConvGELU, BiasFreeMLP, ResConvBNGELU, ConvGELU_Res
 #######################################################################################################
 # CNN models:
 #######################################################################################################
@@ -20,7 +20,7 @@ from src.architecture.CNN_module import R180Inv_Conv2d, D4Inv_Conv2d, ConvGELU, 
 class SmoothCNN_GeLU(nn.Module):
     """
       input:  [B, in_dim, H, W]
-      output: [B, 2]  (e1, e2), D4 协变
+            output: [B, 2]  (e1, e2), D4-equivariant
     """
     def __init__(self, 
                  in_dim=1, 
@@ -51,7 +51,7 @@ class SmoothCNN_GeLU(nn.Module):
         self.register_buffer('signs_e1', torch.tensor([+1, -1, +1, -1, +1, -1, +1, -1], dtype=torch.float32))
         self.register_buffer('signs_e2', torch.tensor([+1, -1, +1, -1, -1, +1, -1, +1], dtype=torch.float32))
 
-    # ----------------- D4 空间作用 -----------------
+    # ----------------- D4 spatial actions -----------------
     @staticmethod
     def _rot90_k(x, k: int):
         return torch.rot90(x, k % 4, dims=(-2, -1))
@@ -75,7 +75,7 @@ class SmoothCNN_GeLU(nn.Module):
             k = idx - 4
             return self._rot90_k(self._reflect_x(x), -k)
 
-    # ----------------- trunk：提取 feature map -----------------
+    # ----------------- trunk: extract feature maps -----------------
     def _trunk_feature(self, x):
         H = x.size(-2) - 6
         W = x.size(-1) - 6
@@ -139,7 +139,6 @@ class SmoothCNN_GeLU(nn.Module):
         e2 = self.head_e2(v2)  # [B,1]
         e  = torch.cat([e1, e2], dim=-1)
         return e
-
 
 class R180Inv_CNN_GeLU(nn.Module):
     """
@@ -223,10 +222,10 @@ class D4T_CNN_GeLU(nn.Module):
         norm = 1 + F.softplus(m - 1, beta=10.0, threshold=20)
         x = x / norm
 
-        # --- inpad 后走特征提取 ---
+        # --- run feature extraction after inpad ---
         y = self.inpad(x)  # [B, C, H+12, W+12]
         for block in self.blocks:
-            y = block(y)   # 期望保持空间尺寸不变：仍约 [B, C, H+12, W+12]
+            y = block(y)   # expected to keep spatial size unchanged: still about [B, C, H+12, W+12]
 
         self.y  = center_crop_to(y,  (H, W))  # [B, C, H+8, W+8]
         self.w0 = self._get_cached_weight([H,W], sigma=4, device=x.device, dtype=x.dtype, mode="x2-y2")
@@ -251,7 +250,7 @@ class ShpaeResNet_GeLU(nn.Module):
         weights = ResNet18_Weights.DEFAULT if pretrained else None
         self.backbone = resnet18(weights=weights)
 
-        # 1. First conv 改成 1-channel
+        # 1. Change the first conv to 1-channel
         old_conv = self.backbone.conv1
         self.backbone.conv1 = nn.Conv2d(
             in_channels=1,
@@ -262,7 +261,7 @@ class ShpaeResNet_GeLU(nn.Module):
             bias=False
         )
 
-        # 2. 将所有 ReLU 改成 GELU（遍历替换）
+        # 2. Replace all ReLU with GELU (recursive traversal)
         def replace_relu_with_gelu(module: nn.Module):
             for name, child in module.named_children():
                 if isinstance(child, nn.ReLU):
@@ -272,7 +271,7 @@ class ShpaeResNet_GeLU(nn.Module):
 
         replace_relu_with_gelu(self.backbone)
 
-        # 3. 自定义全连接 head（用 GELU）
+        # 3. Custom fully connected head (using GELU)
         in_features = self.backbone.fc.in_features
         self.backbone.fc = nn.Sequential(
             nn.Linear(in_features, 256),
@@ -283,7 +282,5 @@ class ShpaeResNet_GeLU(nn.Module):
 
     def forward(self, x):
         return self.backbone(x)
-
-
 
 

@@ -59,32 +59,47 @@ def _fpfs_worker(idx):
     """Process a single galaxy index for measurements."""
     g = _FPFS_GLOBALS
 
-    cutout = g["cutouts"][idx].astype(np.float64)
-    psf    = g["psfs"][idx].astype(np.float64)
-    noise  = g["noises"][idx].astype(np.float64)
+    try:
+        cutout = g["cutouts"][idx].astype(np.float64, copy=False)
+        psf    = g["psfs"][idx].astype(np.float64, copy=False)
+        noise  = g["noises"][idx].astype(np.float64, copy=False)
 
-    out = anacal.fpfs.process_image(
-        fpfs_config=g["fpfs_config"],
-        mag_zero=g["mag_zero"],
-        gal_array=cutout,
-        psf_array=psf,
-        pixel_scale=g["pixel_scale"],
-        noise_variance=g["noise_variance"],
-        noise_array=noise,
-        detection=g["detection"],
-        do_compute_detect_weight=False,
-    )
+        out = anacal.fpfs.process_image(
+            fpfs_config=g["fpfs_config"],
+            mag_zero=g["mag_zero"],
+            gal_array=cutout,
+            psf_array=psf,
+            pixel_scale=g["pixel_scale"],
+            noise_variance=g["noise_variance"],
+            noise_array=noise,
+            detection=g["detection"],
+            do_compute_detect_weight=False,
+        )
 
-    e1 = (out["fpfs1_e1"])[0]
-    e2 = (out["fpfs1_e2"])[0]
-    R11 = (out["fpfs1_de1_dg1"])[0]
-    R22 = (out["fpfs1_de2_dg2"])[0]
-    m00 = (out["fpfs1_m00"])[0]
-    dm00_dg1 = (out["fpfs1_dm00_dg1"])[0]
-    dm00_dg2 = (out["fpfs1_dm00_dg2"])[0]
+        # ---- Key: guard against empty results ----
+        if out is None or (hasattr(out, "shape") and out.shape[0] == 0) or (len(out) == 0):
+            return (np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, idx)
 
-    # Return a small tuple to the parent
-    return (e1, e2, R11, R22, m00, dm00_dg1, dm00_dg2, idx)
+        e1 = out["fpfs1_e1"][0]
+        e2 = out["fpfs1_e2"][0]
+        R11 = out["fpfs1_de1_dg1"][0]
+        R22 = out["fpfs1_de2_dg2"][0]
+        m00 = out["fpfs1_m00"][0]
+        dm00_dg1 = out["fpfs1_dm00_dg1"][0]
+        dm00_dg2 = out["fpfs1_dm00_dg2"][0]
+
+        return (e1, e2, R11, R22, m00, dm00_dg1, dm00_dg2, idx)
+
+    except Exception as e:
+        # Keep logging minimal to avoid flooding output with 64 processes;
+        # you can also write errors to a log file.
+        msg = str(e)
+        if ("max() iterable argument is empty" in msg) or ("merge_arrays" in msg):
+            return (np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, idx)
+
+        print(f"[FPFS failed] idx={idx} err={e}")
+        # print(traceback.format_exc())  # enable for detailed debugging
+        return (np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, idx)
 
 
 
@@ -100,6 +115,7 @@ def fpfs_measure(
     pixel_scale = 0.2,
     shear_task = (2, "g1"),
     fname = 'fpfs',
+    if_return = False,
 ):
     print(f"Measuring shape and magnitude with FPFS for {str(dir)}, under noise_level={noise_level}")
     nBs = img_nB_range[1] - img_nB_range[0]
@@ -127,6 +143,12 @@ def fpfs_measure(
         folder_name = 'nada'
     else:
         folder_name = format_number(noise_level)
+    
+    if if_return:
+        shapes_all = []
+        R_ana_all = []
+        flux_all = []
+        Rflux_all = []
 
 
     # Process all batches
@@ -170,18 +192,32 @@ def fpfs_measure(
         results_arr = np.array(results)           # (e1, e2, R11, R22, m00, dm00_dg1, dm00_dg2, idx) -- (n_gal, 8)
         shapes = results_arr[:, 0:2]
         R_ana = results_arr[:, 2:4]
-        flux = results_arr[:, 4:5] *4*np.pi*(sigma_shapelets**2)
-        Rflux = results_arr[:, 5:7] *4*np.pi*(sigma_shapelets**2)
+        flux = results_arr[:, 4:5] *4*np.pi*(sigma_shapelets1**2)/2
+        Rflux = results_arr[:, 5:7] *4*np.pi*(sigma_shapelets1**2)/2
 
-        save_name = f'/projects/bfmo/wenyinli/datasets/xlens_sims/{folder_name}/{shear_comp}_{shear_mode}/'
-        if not os.path.exists(save_name):
-            os.makedirs(save_name)
-        np.save(save_name + f'{fname}_e_fpfs_{start}.npy', shapes)
-        np.save(save_name + f'{fname}_R_fpfs_{start}.npy', R_ana)
-        np.save(save_name + f'{fname}_m00_{start}.npy', flux)
-        np.save(save_name + f'{fname}_Rm00_{start}.npy', Rflux)
+        if if_return:
+            shapes_all.append(shapes)
+            R_ana_all.append(R_ana)
+            flux_all.append(flux)
+            Rflux_all.append(Rflux)
+
+        else:
+            save_name = f'/work/hdd/bfmo/wenyinli/measurement/xlens_sims/{folder_name}/{shear_comp}_{shear_mode}/'
+            if not os.path.exists(save_name):
+                os.makedirs(save_name)
+            np.save(save_name + f'{fname}_e_fpfs_{start}.npy', shapes)
+            np.save(save_name + f'{fname}_R_fpfs_{start}.npy', R_ana)
+            np.save(save_name + f'{fname}_m00_{start}.npy', flux)
+            np.save(save_name + f'{fname}_Rm00_{start}.npy', Rflux)
 
         del all_cutouts, all_psfs, all_cats, noises, results, results_arr
+
+    if if_return:
+        shapes_all = np.concatenate(shapes_all, axis=0)
+        R_ana_all = np.concatenate(R_ana_all, axis=0)
+        flux_all = np.concatenate(flux_all, axis=0)
+        Rflux_all = np.concatenate(Rflux_all, axis=0)
+        return shapes_all, R_ana_all, flux_all, Rflux_all
 
 
 

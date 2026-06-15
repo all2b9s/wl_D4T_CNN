@@ -12,7 +12,7 @@ from e2cnn import gspaces, nn as enn
 from src.datasets.single_gal_dataset import make_loaders, rotate_spin2, rotate_image_90
 
 # --------------------------
-# GeLU 激活
+# GeLU activation
 class GeLU(enn.EquivariantModule):
     def __init__(self, field_type):
         super().__init__()
@@ -39,7 +39,7 @@ E2_D4 = gspace_D4.fibergroup.irreps['irrep_1,1']
 spin2_type_D4 = enn.FieldType(gspace_D4, [E2_D4])
 
 # --------------------------
-# 等变 block，添加了 BatchNorm 和 GeLU
+# Equivariant block with BatchNorm and GeLU
 class D4Block(enn.EquivariantModule):
     def __init__(self, in_type, out_type, k=3, p=1):
         super().__init__()
@@ -58,7 +58,7 @@ class D4Block(enn.EquivariantModule):
         return self.block.evaluate_output_shape(input_shape)
 
 # --------------------------
-# 主体网络，包含 5 层等变 block
+# Main network with 5 equivariant blocks
 class D4ShapeNet(nn.Module):
     def __init__(self, in_ch=1, C=32):
         super().__init__()

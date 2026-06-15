@@ -2,7 +2,7 @@ import os
 import math
 import numpy as np
 import pandas as pd
-from typing import Literal, Tuple
+from typing import Literal, Tuple, Optional
 
 import torch
 from torch.utils.data import get_worker_info
@@ -40,9 +40,9 @@ def flip_spin2(y):
 
 def rotate_spin2(y: torch.Tensor, k: int, inverse = True):
     """
-    y: [B, 2]  (e1,e2) 或 (g1,g2)
-    旋转角 theta = k * 90°；spin-2 需要旋转 2*theta。
-    inverse=True 表示把输出旋回到原坐标系（用 -2*theta）
+    y: [B, 2]  (e1,e2) or (g1,g2)
+    Rotation angle theta = k * 90°; spin-2 requires rotation by 2*theta.
+    inverse=True means rotating the output back to the original coordinate system (use -2*theta)
     """
     if k == 0:
         return y
@@ -119,6 +119,7 @@ class SingleGalaxyDataset(Dataset):
         augment: bool = True,
         normalize: Literal["per_image","none"] = "per_image",
         channel_first: bool = True,
+        shape_path: Optional[str] = None,
     ):
         super().__init__()
         assert os.path.exists(images_path), images_path
@@ -146,7 +147,40 @@ class SingleGalaxyDataset(Dataset):
         self.normalize = normalize
         self.channel_first = channel_first
         if target == "e":
-            self.targets = df[["e1","e2"]].to_numpy().astype(np.float32)
+            if shape_path is not None:
+                assert os.path.exists(shape_path), shape_path
+                if shape_path.endswith(".npy"):
+                    shape_arr = np.load(shape_path)
+                    if shape_arr.ndim != 2 or shape_arr.shape[1] < 2:
+                        raise ValueError("shape_path .npy must have shape (N, 2+) for (e1, e2)")
+                    shape_arr = shape_arr[:, :2].astype(np.float32)
+                    if shape_arr.shape[0] > int(self.ids.max()):
+                        self.targets = shape_arr[self.ids]
+                    elif shape_arr.shape[0] == len(self.ids):
+                        self.targets = shape_arr
+                    else:
+                        raise ValueError(
+                            f"shape_path rows ({shape_arr.shape[0]}) do not match ids range (max id={int(self.ids.max())}) "
+                            f"or split length ({len(self.ids)})"
+                        )
+                elif shape_path.endswith(".csv"):
+                    shape_df = pd.read_csv(shape_path)
+                    if {"e1", "e2"}.issubset(shape_df.columns):
+                        if "id" in shape_df.columns:
+                            indexed = shape_df.set_index("id")[["e1", "e2"]]
+                            self.targets = indexed.loc[self.ids].to_numpy().astype(np.float32)
+                        elif len(shape_df) == len(self.ids):
+                            self.targets = shape_df[["e1", "e2"]].to_numpy().astype(np.float32)
+                        else:
+                            raise ValueError(
+                                "shape_path csv without 'id' must have the same number of rows as this split"
+                            )
+                    else:
+                        raise ValueError("shape_path csv must include columns 'e1' and 'e2'")
+                else:
+                    raise ValueError("shape_path must be a .npy or .csv file")
+            else:
+                self.targets = df[["e1","e2"]].to_numpy().astype(np.float32)
         else:
             raise ValueError("target must be 'e' or 'g'")
 
@@ -201,14 +235,14 @@ class SingleGalaxyDataset(Dataset):
         y = torch.tensor(self.targets[idx], dtype=torch.float32)  # [2]
 
         # data augmentation: random 0,90,180,270 rotation with proper spin-2 update
-        if self.augment:
+        '''if self.augment:
             do_shear = torch.rand(1).item() < 0.8
             if do_shear and (self.shear_imgs is not None):
                 shear = torch.rand(2)*0.04 - 0.02  # [-0.02,0.02]
                 img = img + torch.tensor(self.shear_imgs[i,0]) * shear[0]+ torch.tensor(self.shear_imgs[i,1]) * shear[1]
                 y = y + shear*torch.tensor(self.responses[idx], dtype=torch.float32)
 
-            img, y = self.augment_galaxy(img, y)
+            img, y = self.augment_galaxy(img, y)'''
         return img, y
 
 class PairedGalaxyDataset(SingleGalaxyDataset):
@@ -225,8 +259,9 @@ class PairedGalaxyDataset(SingleGalaxyDataset):
         augment: bool = True,
         normalize: Literal["per_image","none"] = "per_image",
         channel_first: bool = True,
+        shape_path: Optional[str] = None,
     ):
-        super().__init__(images_path, csv_path, split, target, augment, normalize, channel_first)
+        super().__init__(images_path, csv_path, split, target, augment, normalize, channel_first, shape_path)
 
     def __getitem__(self, idx):
         i = self.ids[idx]
@@ -280,10 +315,11 @@ def make_loaders(
     target: Literal["e","g"] = "e",
     augment: bool = True,
     normalize: Literal["per_image","none"] = "none",
+    shape_path: Optional[str] = None,
 ) -> Tuple[DataLoader, DataLoader, DataLoader]:
-    train_ds = SingleGalaxyDataset(images_path, csv_path, "train", target, augment, normalize)
-    val_ds   = SingleGalaxyDataset(images_path, csv_path, "val",   target, False,   normalize)
-    test_ds  = SingleGalaxyDataset(images_path, csv_path, "test",  target, False,   normalize)
+    train_ds = SingleGalaxyDataset(images_path, csv_path, "train", target, augment, normalize, shape_path=shape_path)
+    val_ds   = SingleGalaxyDataset(images_path, csv_path, "val",   target, False,   normalize, shape_path=shape_path)
+    test_ds  = SingleGalaxyDataset(images_path, csv_path, "test",  target, False,   normalize, shape_path=shape_path)
 
     pin = torch.cuda.is_available()
     train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True,

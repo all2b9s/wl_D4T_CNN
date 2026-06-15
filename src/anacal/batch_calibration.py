@@ -4,6 +4,7 @@ import torch
 from src.anacal.pixel_response import anacal_pix_r
 from src.architecture.CNN_toolkit import shape_pixel_gradients, predictor, plot_shape_bidirectional, D4_eq_weight
 from concurrent.futures import ProcessPoolExecutor
+from concurrent.futures.process import BrokenProcessPool
 from functools import partial
 from tqdm import tqdm
 import os
@@ -147,10 +148,22 @@ def _bs_worker(bs_ind):
     return (m / shear - 1.0, c)         # normalize m here to reduce post work
 
 def _bootstrap(N, bs_size, rng=None, dtype=np.int32):
-    """单次 bootstrap 抽样，包装成函数方便重用。"""
+    """Draw one bootstrap sample; wrapped as a helper for reuse."""
     if rng is None:
         rng = np.random.default_rng()
     return rng.integers(0, N, size=bs_size, dtype=dtype)
+
+
+def _get_total_memory_bytes(default=64 * (1024 ** 3)):
+    """Best-effort total RAM detection on Linux; fallback to 64GB."""
+    try:
+        pages = os.sysconf("SC_PHYS_PAGES")
+        page_size = os.sysconf("SC_PAGE_SIZE")
+        if pages > 0 and page_size > 0:
+            return int(pages * page_size)
+    except Exception:
+        pass
+    return default
 
 
 def get_biases(
@@ -163,8 +176,8 @@ def get_biases(
     n_factor=1.0,
     is_twin=False,
     n_jobs=4,
-    chunk_bs=10,          # 每一批次做多少次 bootstrap，可调参
-    base_seed=12345,     # 如需可复现
+    chunk_bs=10,         
+    base_seed=12345,     
 ):
     """
     shapes: (N, 4, 2) numpy array 
@@ -178,7 +191,7 @@ def get_biases(
     """
     N_total = shapes.shape[0]
 
-    # twin 情况下，N_total = 2 * N_eff，只在抽样时用前半段
+    # Use the effective number of galaxies is half if is_twin is True
     if is_twin:
         N_eff = N_total // 2
         bs_size = bs_size // 2
@@ -188,28 +201,63 @@ def get_biases(
     if n_jobs is None:
         n_jobs = os.cpu_count() or 1
 
-    # 全样本估计（不 bootstrap）
     m_mean, c_mean = _calibration(shapes, Rs, mask=mask)
     m_mean = m_mean / shear_value - 1.0
 
-    # bootstrap 结果容器
+    # Heuristic memory estimate for one bootstrap slice inside one worker.
+    # Large bs_size with many workers can easily OOM and crash process pools.
+    shape_itemsize = np.dtype(shapes.dtype).itemsize
+    resp_itemsize = np.dtype(Rs.dtype).itemsize
+    mask_itemsize = np.dtype(mask.dtype).itemsize if mask is not None else 0
+    shape_elems_per_obj = int(np.prod(shapes.shape[1:]))
+    resp_elems_per_obj = int(np.prod(Rs.shape[1:]))
+    mask_elems_per_obj = int(np.prod(mask.shape[1:])) if mask is not None else 0
+    est_bytes_per_sample = bs_size * (
+        shape_elems_per_obj * shape_itemsize
+        + resp_elems_per_obj * resp_itemsize
+        + mask_elems_per_obj * mask_itemsize
+    )
+    est_mb_per_sample = est_bytes_per_sample / (1024 ** 2)
+
+    total_mem_bytes = _get_total_memory_bytes()
+    # Reserve part of RAM for base arrays / Python / other processes.
+    # Keep bootstrap worker temporary slices within ~35% of total RAM.
+    worker_budget_bytes = int(total_mem_bytes * 0.35)
+
+    if est_bytes_per_sample > 0 and n_jobs > 1:
+        max_safe_jobs = worker_budget_bytes // est_bytes_per_sample
+        max_safe_jobs = max(1, int(max_safe_jobs))
+
+        if max_safe_jobs < n_jobs:
+            old_jobs = n_jobs
+            n_jobs = max_safe_jobs
+            # Avoid submitting too many large bootstrap jobs in one chunk.
+            chunk_bs = min(chunk_bs, max(1, n_jobs * 2))
+            print(
+                f"[get_biases] Bootstrap sample ~{est_mb_per_sample:.1f} MB/task, "
+                f"RAM budget ~{worker_budget_bytes / (1024 ** 3):.1f} GB. "
+                f"Adjusting n_jobs {old_jobs} -> {n_jobs}, chunk_bs -> {chunk_bs}."
+            )
+
+    # Bootstrap result containers
     m_list = []
     c_list = []
 
     rng = np.random.default_rng(base_seed)
 
-    # 以 chunk_bs 为单位分批做 bootstrap
-    with ProcessPoolExecutor(
-        max_workers=n_jobs,
-        initializer=_bs_init_pool,
-        initargs=(shapes, Rs, shear_value, mask),
-    ) as ex:
-        done = 0
-        with tqdm(total=bs_times, desc="Bootstrap") as pbar:
+    done = 0
+    pbar = tqdm(total=bs_times, desc="Bootstrap")
+    try:
+        with ProcessPoolExecutor(
+            max_workers=n_jobs,
+            initializer=_bs_init_pool,
+            initargs=(shapes, Rs, shear_value, mask),
+        ) as ex:
             while done < bs_times:
                 cur = min(chunk_bs, bs_times - done)
 
-                # 这一批次只生成 cur 个索引数组，内存 ≈ cur * bs_size * sizeof(int)
+                # Generate only cur index arrays for this batch;
+                # memory ≈ cur * bs_size * sizeof(int)
                 bs_inds = []
                 for _ in range(cur):
                     inds = _bootstrap(N_eff, bs_size, rng=rng, dtype=np.int32)
@@ -217,7 +265,6 @@ def get_biases(
                         inds = np.concatenate([inds, inds + N_eff])
                     bs_inds.append(inds)
 
-                # 并行跑这一小批次
                 results = list(ex.map(_bs_worker, bs_inds))
 
                 m_list.extend(r[0] for r in results)
@@ -225,11 +272,32 @@ def get_biases(
 
                 done += cur
                 pbar.update(cur)
+    except BrokenProcessPool:
+        print(
+            f"[get_biases] BrokenProcessPool at {done}/{bs_times}; "
+            "falling back to serial bootstrap for remaining iterations."
+        )
+
+        for _ in range(done, bs_times):
+            inds = _bootstrap(N_eff, bs_size, rng=rng, dtype=np.int32)
+            if is_twin:
+                inds = np.concatenate([inds, inds + N_eff])
+
+            local_shapes = shapes[inds]
+            local_Rs = Rs[inds]
+            local_mask = mask[inds] if mask is not None else None
+
+            m, c = _calibration(local_shapes, local_Rs, mask=local_mask)
+            m_list.append(m / shear_value - 1.0)
+            c_list.append(c)
+            pbar.update(1)
+    finally:
+        pbar.close()
 
     m_list = np.asarray(m_list, dtype=np.float64)  # (bs_times, 2)
     c_list = np.asarray(c_list, dtype=np.float64)  # (bs_times, 2)
 
-    # bootstrap 标准差
+    # Bootstrap standard deviation
     m_std = m_list.std(axis=0, ddof=1) * n_factor
     c_std = c_list.std(axis=0, ddof=1) * n_factor
 
