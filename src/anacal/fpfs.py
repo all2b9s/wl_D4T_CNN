@@ -16,12 +16,18 @@ import multiprocessing as mp
 
 sigma_shapelets=0.52
 sigma_shapelets1=0.45
+sigma_shapelets2=0.55
 
-fpfs_config = anacal.fpfs.FpfsConfig(
+'''fpfs_config = anacal.fpfs.FpfsConfig(
     sigma_shapelets=sigma_shapelets,  # The first measurement scale (also for detection)
     sigma_shapelets1=sigma_shapelets1,  # The second measurement scale
-)
+)'''
 
+fpfs_config = anacal.fpfs.FpfsConfig(
+    sigma_shapelets=0.52,  # The first measurement scale (also for detection)
+    sigma_shapelets1=0.45,  # The second measurement scale
+    sigma_shapelets2=0.55,  # The second measurement scale
+)
 
 def format_number(x: float) -> str:
     s = f"{x:.3f}".rstrip('0').rstrip('.')  # keep up to 3 decimal places, trim trailing zeros
@@ -39,11 +45,12 @@ _FPFS_GLOBALS = {
     "pixel_scale": None,
     "noise_variance": None,
     "detection": None,
+    "do_detection": False,
 }
 
 def _init_fpfs_worker(cutouts, psfs, noises,
                       fpfs_config, mag_zero, pixel_scale,
-                      noise_variance, detection):
+                      noise_variance, detection, do_detection):
     """Initializer: store large arrays & constants in worker-local globals."""
     _FPFS_GLOBALS["cutouts"]        = cutouts
     _FPFS_GLOBALS["psfs"]           = psfs
@@ -53,6 +60,7 @@ def _init_fpfs_worker(cutouts, psfs, noises,
     _FPFS_GLOBALS["mag_zero"]       = mag_zero
     _FPFS_GLOBALS["pixel_scale"]    = pixel_scale
     _FPFS_GLOBALS["noise_variance"] = noise_variance
+    _FPFS_GLOBALS["do_detection"]   = do_detection
 
 
 def _fpfs_worker(idx):
@@ -73,12 +81,14 @@ def _fpfs_worker(idx):
             noise_variance=g["noise_variance"],
             noise_array=noise,
             detection=g["detection"],
-            do_compute_detect_weight=False,
+            do_compute_detect_weight=g["do_detection"],
         )
 
         # ---- Key: guard against empty results ----
         if out is None or (hasattr(out, "shape") and out.shape[0] == 0) or (len(out) == 0):
-            return (np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, idx)
+            #print(f"[FPFS empty result] idx={idx} out={out}")
+            return (np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan,
+                    np.nan, np.nan, np.nan, idx)
 
         e1 = out["fpfs1_e1"][0]
         e2 = out["fpfs1_e2"][0]
@@ -88,18 +98,29 @@ def _fpfs_worker(idx):
         dm00_dg1 = out["fpfs1_dm00_dg1"][0]
         dm00_dg2 = out["fpfs1_dm00_dg2"][0]
 
-        return (e1, e2, R11, R22, m00, dm00_dg1, dm00_dg2, idx)
+        if g["do_detection"]:
+            w = out["fpfs_w"][0]
+            dw_dg1 = out["fpfs_dw_dg1"][0]
+            dw_dg2 = out["fpfs_dw_dg2"][0]
+        else:
+            w = np.nan
+            dw_dg1 = np.nan
+            dw_dg2 = np.nan
+
+        return (e1, e2, R11, R22, m00, dm00_dg1, dm00_dg2, w, dw_dg1, dw_dg2, idx)
 
     except Exception as e:
         # Keep logging minimal to avoid flooding output with 64 processes;
         # you can also write errors to a log file.
         msg = str(e)
         if ("max() iterable argument is empty" in msg) or ("merge_arrays" in msg):
-            return (np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, idx)
+            return (np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan,
+                    np.nan, np.nan, np.nan, idx)
 
         print(f"[FPFS failed] idx={idx} err={e}")
         # print(traceback.format_exc())  # enable for detailed debugging
-        return (np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, idx)
+        return (np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan,
+                np.nan, np.nan, np.nan, idx)
 
 
 
@@ -116,23 +137,28 @@ def fpfs_measure(
     shear_task = (2, "g1"),
     fname = 'fpfs',
     if_return = False,
+    do_detection = False,
 ):
     print(f"Measuring shape and magnitude with FPFS for {str(dir)}, under noise_level={noise_level}")
     nBs = img_nB_range[1] - img_nB_range[0]
     shear_mode, shear_comp = shear_task
     gal_per_file = 100      # how your build_dataset is arranged per index_range step
 
-    # Initialize detection array once
-    dtype = np.dtype(
-    [
-        ("y", np.int32),
-        ("x", np.int32),
-    ]
-    )
-    detection = np.empty(1, dtype=dtype)
-    detection["y"] = center[0]
-    detection["x"] = center[1]
+    if do_detection:
+        detection = None
+    else:
+        # Initialize detection array once
+        dtype = np.dtype(
+        [
+            ("y", np.int32),
+            ("x", np.int32),
+        ]
+        )
+        detection = np.empty(1, dtype=dtype)
+        detection["y"] = center[0]
+        detection["x"] = center[1]
 
+    # Determine noise variance for FPFS config
     if noise_level > 0:
         noise_variance = noise_level**2.0
     else:
@@ -144,13 +170,17 @@ def fpfs_measure(
     else:
         folder_name = format_number(noise_level)
     
+    ####################
     if if_return:
         shapes_all = []
         R_ana_all = []
         flux_all = []
         Rflux_all = []
+        if do_detection:
+            w_all = []
+            dw_all = []
 
-
+    ######################################################
     # Process all batches
     for start in range(img_nB_range[0], img_nB_range[1]):
         print(f'Processing batch {start}')
@@ -164,7 +194,10 @@ def fpfs_measure(
 
         # noise per-galaxy
         np.random.seed(20020620 + start)
-        noises = np.random.normal(0, 1, all_cutouts.shape) * noise_levels.reshape(-1, 1, 1)
+        if do_detection:
+            noises = None
+        else:
+            noises = np.random.normal(0, 1, all_cutouts.shape) * noise_levels.reshape(-1, 1, 1)
 
         n_gal = all_cutouts.shape[0]   # should be 10000 here
 
@@ -181,6 +214,7 @@ def fpfs_measure(
                 pixel_scale,
                 noise_variance,
                 detection,
+                do_detection,
             ),
         ) as pool:
             # map over indices 0..n_gal-1
@@ -188,8 +222,8 @@ def fpfs_measure(
             # adjust chunksize for performance if need
             results = pool.map(_fpfs_worker, indices, chunksize=50)
         
-        # results is a list of (e1, e2, R11, R22, m00, dm00_dg1, dm00_dg2, idx) tuples
-        results_arr = np.array(results)           # (e1, e2, R11, R22, m00, dm00_dg1, dm00_dg2, idx) -- (n_gal, 8)
+        # results: (e1, e2, R11, R22, m00, dm00_dg1, dm00_dg2, w, dw_dg1, dw_dg2, idx)
+        results_arr = np.array(results)           # (n_gal, 11)
         shapes = results_arr[:, 0:2]
         R_ana = results_arr[:, 2:4]
         flux = results_arr[:, 4:5] *4*np.pi*(sigma_shapelets1**2)/2
@@ -200,6 +234,9 @@ def fpfs_measure(
             R_ana_all.append(R_ana)
             flux_all.append(flux)
             Rflux_all.append(Rflux)
+            if do_detection:
+                w_all.append(results_arr[:, 7:8])
+                dw_all.append(results_arr[:, 8:10])
 
         else:
             save_name = f'/work/hdd/bfmo/wenyinli/measurement/xlens_sims/{folder_name}/{shear_comp}_{shear_mode}/'
@@ -209,6 +246,9 @@ def fpfs_measure(
             np.save(save_name + f'{fname}_R_fpfs_{start}.npy', R_ana)
             np.save(save_name + f'{fname}_m00_{start}.npy', flux)
             np.save(save_name + f'{fname}_Rm00_{start}.npy', Rflux)
+            if do_detection:
+                np.save(save_name + f'{fname}_w_{start}.npy', results_arr[:, 7])
+                np.save(save_name + f'{fname}_dw_{start}.npy', results_arr[:, 8:10])
 
         del all_cutouts, all_psfs, all_cats, noises, results, results_arr
 
@@ -217,6 +257,10 @@ def fpfs_measure(
         R_ana_all = np.concatenate(R_ana_all, axis=0)
         flux_all = np.concatenate(flux_all, axis=0)
         Rflux_all = np.concatenate(Rflux_all, axis=0)
+        if do_detection:
+            w_all = np.concatenate(w_all, axis=0)
+            dw_all = np.concatenate(dw_all, axis=0)
+            return shapes_all, R_ana_all, flux_all, Rflux_all, w_all, dw_all
         return shapes_all, R_ana_all, flux_all, Rflux_all
 
 
