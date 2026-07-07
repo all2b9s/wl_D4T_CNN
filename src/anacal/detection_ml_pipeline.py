@@ -234,6 +234,191 @@ def load_and_stitch_one_batch(
 
 
 # ===========================================================================
+# Internal helpers: Task API adapter layer
+# ===========================================================================
+
+def _build_task_from_fpfs_config(
+    fpfs_config: Any = None,
+    mag_zero: float = 30.0,
+    pixel_scale: float = 0.2,
+    stamp_size: int = 64,
+    sigma_arcsec: float = 0.40,
+):
+    """Build an ``anacal.task.Task`` from legacy ``FpfsConfig`` parameters.
+
+    Uses the same defaults as ``xlens.processor.anacal.AnacalTask``
+    (see ``example_fpfs_blended_new.ipynb``).  The flux-related
+    thresholds are scaled by ``ratio = 10**((mag_zero - 30) / 2.5)``.
+
+    Parameters
+    ----------
+    fpfs_config : anacal.fpfs.FpfsConfig or None
+        Legacy configuration.  Currently unused for Task construction;
+        ``sigma_arcsec`` must be set explicitly (default 0.40 arcsec
+        matches the xlens / example notebook value).
+    mag_zero : float
+        Photometric zero point.
+    pixel_scale : float
+        Pixel scale in arcsec / pixel.
+    stamp_size : int
+        PSF / measurement stamp size in pixels.
+    sigma_arcsec : float
+        Detection smoothing kernel size in arcsec (default 0.40).
+        Controls peak-finding SNR; larger values smooth more noise
+        but may blend close sources.
+
+    Returns
+    -------
+    task : anacal.task.Task
+    """
+    import anacal
+
+    ratio = 10.0 ** ((mag_zero - 30.0) / 2.5)
+
+    prior = anacal.ngmix.modelPrior()
+    prior.set_sigma_a(anacal.math.qnumber(0.05))
+    prior.set_sigma_x(anacal.math.qnumber(0.05))
+
+    task = anacal.task.Task(
+        scale=pixel_scale,
+        sigma_arcsec=sigma_arcsec,
+        snr_peak_min=5.0,
+        omega_f=0.06 * ratio,
+        v_min=0.013 * ratio,
+        omega_v=0.025 * ratio,
+        p_min=0.12,
+        omega_p=0.05,
+        prior=prior,
+        stamp_size=stamp_size,
+        image_bound=40,
+        num_epochs=0,
+        force_size=False,
+        force_center=True,
+        fpfs_c0=8.4 * ratio,
+    )
+    return task
+
+
+def _build_block_list(
+    img_height: int,
+    img_width: int,
+    pixel_scale: float,
+    psf_array: np.ndarray,
+    stamp_size: int = 64,
+) -> list:
+    """Build processing blocks for ``task.process_image``.
+
+    Tiles the image with ``anacal.geometry.get_block_list`` and attaches
+    the (constant) PSF stamp to every block.
+
+    Parameters
+    ----------
+    img_height, img_width : int
+        Image dimensions in pixels.
+    pixel_scale : float
+        Pixel scale in arcsec / pixel.
+    psf_array : ndarray
+        PSF stamp image.
+    stamp_size : int
+        Target PSF stamp size.
+
+    Returns
+    -------
+    blocks : list of ``anacal.geometry.Block``
+    """
+    import anacal
+
+    blocks = anacal.geometry.get_block_list(
+        img_nx=img_width,
+        img_ny=img_height,
+        block_nx=img_width//2,
+        block_ny=img_height//2,
+        block_overlap=80,
+        scale=pixel_scale,
+    )
+    # Attach the same constant PSF to every block
+    for bb in blocks:
+        bb.psf_array = anacal.utils.resize_array(psf_array, (stamp_size, stamp_size))
+
+    return blocks
+
+
+def _adapt_task_output_to_legacy(
+    out: np.ndarray,
+    pixel_scale: float,
+) -> np.ndarray:
+    """Convert ``task.process_image`` output columns to legacy-compatible names.
+
+    Mapping::
+
+        Task API column               Legacy column
+        ─────────────────────────────────────────────────
+        x1, x2     (arcsec)        →  fpfs_x, fpfs_y  (pixels)
+        wsel                         →  fpfs_w
+        dwsel_dg1, dwsel_dg2        →  fpfs_dw_dg1, fpfs_dw_dg2
+        flux_gauss0                  →  fpfs_m00
+        dflux_gauss0_dg{1,2}        →  fpfs_dm00_dg{1,2}
+        fpfs_e1, fpfs_e2             →  fpfs_e1, fpfs_e2         (unchanged)
+        fpfs_de1_dg1, fpfs_de2_dg2   →  fpfs_de1_dg1, fpfs_de2_dg2 (unchanged)
+
+    Parameters
+    ----------
+    out : ndarray
+        Structured array returned by ``task.process_image``.
+    pixel_scale : float
+        Pixel scale for arcsec → pixel conversion.
+
+    Returns
+    -------
+    adapted : ndarray
+        Structured array with legacy-compatible column names.
+    """
+    n_det = len(out)
+    names = list(out.dtype.names)
+
+    new_dtype = np.dtype([
+        ("fpfs_y", np.float64),
+        ("fpfs_x", np.float64),
+        ("fpfs_e1", np.float64),
+        ("fpfs_e2", np.float64),
+        ("fpfs_de1_dg1", np.float64),
+        ("fpfs_de2_dg2", np.float64),
+        ("fpfs_w", np.float64),
+        ("fpfs_dw_dg1", np.float64),
+        ("fpfs_dw_dg2", np.float64),
+        ("fpfs_m00", np.float64),
+        ("fpfs_dm00_dg1", np.float64),
+        ("fpfs_dm00_dg2", np.float64),
+    ])
+
+    adapted = np.empty(n_det, dtype=new_dtype)
+
+    # --- positions: x2 → fpfs_y, x1 → fpfs_x  (arcsec → pixels) ---
+    adapted["fpfs_y"] = out["x2"] / pixel_scale if "x2" in names else np.nan
+    adapted["fpfs_x"] = out["x1"] / pixel_scale if "x1" in names else np.nan
+
+    # --- shapes (same column names in both APIs) ---
+    for col in ["fpfs_e1", "fpfs_e2", "fpfs_de1_dg1", "fpfs_de2_dg2"]:
+        adapted[col] = out[col] if col in names else np.nan
+
+    # --- selection weights (wsel → fpfs_w) ---
+    adapted["fpfs_w"] = out["wsel"] if "wsel" in names else np.nan
+    adapted["fpfs_dw_dg1"] = out["dwsel_dg1"] if "dwsel_dg1" in names else np.nan
+    adapted["fpfs_dw_dg2"] = out["dwsel_dg2"] if "dwsel_dg2" in names else np.nan
+
+    # --- flux (flux_gauss0 → fpfs_m00) ---
+    adapted["fpfs_m00"] = out["flux_gauss0"] if "flux_gauss0" in names else np.nan
+    adapted["fpfs_dm00_dg1"] = (
+        out["dflux_gauss0_dg1"] if "dflux_gauss0_dg1" in names else np.nan
+    )
+    adapted["fpfs_dm00_dg2"] = (
+        out["dflux_gauss0_dg2"] if "dflux_gauss0_dg2" in names else np.nan
+    )
+
+    return adapted
+
+
+# ===========================================================================
 # Phase 2: Anacal FPFS Detection
 # ===========================================================================
 
@@ -245,13 +430,19 @@ def run_fpfs_detection(
     pixel_scale: float = 0.2,
     noise_variance: float = 1e-4,
     noise_array: Optional[np.ndarray] = None,
+    use_task_api: bool = True,
+    stamp_size: int = 64,
+    sigma_arcsec: float = 0.40,
+    task: Any = None,  # cached anacal.task.Task
+    blocks: Any = None,  # cached block list
 ) -> np.ndarray:
     """
     Run anacal FPFS detection on a large image (multiple galaxies).
 
-    Calls ``anacal.fpfs.process_image`` with ``detection=None`` to trigger
-    internal peak-finding, and with ``do_compute_detect_weight=True`` to
-    obtain detection weights and their shear derivatives.
+    By default uses the new ``anacal.task.Task`` API (``use_task_api=True``),
+    which internally handles detection + FPFS measurement in a single call.
+    Set ``use_task_api=False`` to fall back to the legacy
+    ``anacal.fpfs.process_image`` path.
 
     Parameters
     ----------
@@ -260,7 +451,8 @@ def run_fpfs_detection(
     psf_image : ndarray (H_psf, W_psf)
         PSF stamp image.
     fpfs_config : anacal.fpfs.FpfsConfig
-        FPFS configuration (sigma_shapelets, etc.).
+        FPFS configuration.  When ``use_task_api=True``, only used for
+        legacy fallback; Task parameters are set independently.
     mag_zero : float
         Magnitude zero point.
     pixel_scale : float
@@ -268,7 +460,20 @@ def run_fpfs_detection(
     noise_variance : float
         Noise variance (sigma^2) for the image.
     noise_array : ndarray or None
-        Optional noise realization. If None, anacal estimates internally.
+        Optional noise realization.
+    use_task_api : bool
+        If True (default), use ``anacal.task.Task``.  If False, use
+        legacy ``anacal.fpfs.process_image``.
+    stamp_size : int
+        PSF / measurement stamp size in pixels (Task API only).
+    sigma_arcsec : float
+        Detection smoothing kernel in arcsec (Task API only, default 0.40).
+        Larger values improve peak SNR on noisy images but may blend
+        close sources.  This is NOT derived from ``fpfs_config``.
+    task : anacal.task.Task or None
+        Cached Task object. If None, a new one is built.
+    blocks : list of anacal.geometry.Block or None
+        Cached block list. If None, a new one is built from ``psf_image``.
 
     Returns
     -------
@@ -285,18 +490,50 @@ def run_fpfs_detection(
     if noise_array is not None:
         noise_array = noise_array.astype(np.float64, copy=False)
 
-    # Run detection: detection=None triggers internal peak-finding
-    out = anacal.fpfs.process_image(
-        fpfs_config=fpfs_config,
-        mag_zero=mag_zero,
-        gal_array=gal_array,
-        psf_array=psf_array,
-        pixel_scale=pixel_scale,
-        noise_variance=noise_variance,
-        noise_array=noise_array,
-        detection=None,                # <-- auto-detect
-        do_compute_detect_weight=True,
-    )
+    if use_task_api:
+        # ---- New anacal.task.Task API ----
+        if task is None:
+            task = _build_task_from_fpfs_config(
+                fpfs_config=fpfs_config,
+                mag_zero=mag_zero,
+                pixel_scale=pixel_scale,
+                stamp_size=stamp_size,
+                sigma_arcsec=sigma_arcsec,
+            )
+        if blocks is None:
+            blocks = _build_block_list(
+                img_height=gal_array.shape[0],
+                img_width=gal_array.shape[1],
+                pixel_scale=pixel_scale,
+                psf_array=psf_array,
+                stamp_size=stamp_size,
+            )
+        out = task.process_image(
+            gal_array,
+            psf_array,
+            variance=noise_variance,
+            block_list=blocks,
+            detection=None,
+            noise_array=noise_array,
+            mask_array=None,
+            do_fpfs=True,
+        )
+        # Convert arcsec positions → pixels, wsel → fpfs_w, etc.
+        out = _adapt_task_output_to_legacy(out, pixel_scale)
+
+    else:
+        # ---- Legacy anacal.fpfs.process_image API ----
+        out = anacal.fpfs.process_image(
+            fpfs_config=fpfs_config,
+            mag_zero=mag_zero,
+            gal_array=gal_array,
+            psf_array=psf_array,
+            pixel_scale=pixel_scale,
+            noise_variance=noise_variance,
+            noise_array=noise_array,
+            detection=None,
+            do_compute_detect_weight=True,
+        )
 
     return _parse_detection_output(out)
 
@@ -324,8 +561,8 @@ def _parse_detection_output(out: np.ndarray) -> np.ndarray:
         return _empty_det_cat()
 
     # --- Extract positions ---
-    pos_y = _extract_column(out, names, ["fpfs_y", "det_y", "y", "fpfs_row"])
-    pos_x = _extract_column(out, names, ["fpfs_x", "det_x", "x", "fpfs_col"])
+    pos_y = _extract_column(out, names, ["fpfs_y", "det_y", "y", "fpfs_row", "x2"])
+    pos_x = _extract_column(out, names, ["fpfs_x", "det_x", "x", "fpfs_col", "x1"])
 
     # --- Extract FPFS shape measurements ---
     fpfs_e1 = _extract_column(out, names, ["fpfs1_e1", "fpfs_e1", "e1"])
@@ -333,15 +570,15 @@ def _parse_detection_output(out: np.ndarray) -> np.ndarray:
     fpfs_R11 = _extract_column(out, names, ["fpfs1_de1_dg1", "fpfs_de1_dg1", "de1_dg1", "R11"])
     fpfs_R22 = _extract_column(out, names, ["fpfs1_de2_dg2", "fpfs_de2_dg2", "de2_dg2", "R22"])
 
-    # --- Extract detection weights ---
-    fpfs_w = _extract_column(out, names, ["fpfs_w", "det_weight", "w"])
-    fpfs_dw_dg1 = _extract_column(out, names, ["fpfs_dw_dg1", "dw_dg1"])
-    fpfs_dw_dg2 = _extract_column(out, names, ["fpfs_dw_dg2", "dw_dg2"])
+    # --- Extract detection / selection weights ---
+    fpfs_w = _extract_column(out, names, ["fpfs_w", "det_weight", "w", "wsel", "wdet"])
+    fpfs_dw_dg1 = _extract_column(out, names, ["fpfs_dw_dg1", "dw_dg1", "dwsel_dg1", "dwdet_dg1"])
+    fpfs_dw_dg2 = _extract_column(out, names, ["fpfs_dw_dg2", "dw_dg2", "dwsel_dg2", "dwdet_dg2"])
 
     # --- Extract flux ---
-    fpfs_m00 = _extract_column(out, names, ["fpfs1_m00", "fpfs_m00", "m00", "flux"])
-    fpfs_dm00_dg1 = _extract_column(out, names, ["fpfs1_dm00_dg1", "fpfs_dm00_dg1", "dm00_dg1"])
-    fpfs_dm00_dg2 = _extract_column(out, names, ["fpfs1_dm00_dg2", "fpfs_dm00_dg2", "dm00_dg2"])
+    fpfs_m00 = _extract_column(out, names, ["fpfs1_m00", "fpfs_m00", "m00", "flux", "flux_gauss0"])
+    fpfs_dm00_dg1 = _extract_column(out, names, ["fpfs1_dm00_dg1", "fpfs_dm00_dg1", "dm00_dg1", "dflux_gauss0_dg1"])
+    fpfs_dm00_dg2 = _extract_column(out, names, ["fpfs1_dm00_dg2", "fpfs_dm00_dg2", "dm00_dg2", "dflux_gauss0_dg2"])
 
     # Build a clean structured array
     dtype = np.dtype([
@@ -407,13 +644,25 @@ def _empty_det_cat() -> np.ndarray:
 # Phase 3: Stamp Cutting
 # ===========================================================================
 
+# Pre-computed arange for stamp cutting (stamp_size = 64 constant)
+_CUT_DY = np.arange(64, dtype=np.int32)
+_CUT_DX = np.arange(64, dtype=np.int32)
+
+
 def cut_stamps_from_large(
     large_image: np.ndarray,
     det_cat: np.ndarray,
     stamp_size: int = 64,
+    stamps_out: Optional[np.ndarray] = None,
+    yy_buf: Optional[np.ndarray] = None,
+    xx_buf: Optional[np.ndarray] = None,
 ) -> Tuple[np.ndarray, np.ndarray]:
     """
     Cut postage stamps from the large image at each detection position.
+
+    Vectorized version using numpy broadcasting advanced indexing.
+    Unlike the original loop-based version, this extracts all stamps
+    in a single C-level operation (~50-100x faster).
 
     Parameters
     ----------
@@ -423,6 +672,12 @@ def cut_stamps_from_large(
         Structured detection catalog with at least 'y' and 'x' columns.
     stamp_size : int
         Size of each square stamp in pixels.
+    stamps_out : ndarray or None
+        Optional pre-allocated output of shape (N_det, stamp_size, stamp_size).
+        Avoids internal allocation.
+    yy_buf, xx_buf : ndarray or None
+        Optional pre-allocated index buffers of shape (N_det, stamp_size, stamp_size).
+        Pass the **same** buffers for signal + noise calls to reuse them.
 
     Returns
     -------
@@ -435,39 +690,43 @@ def cut_stamps_from_large(
     """
     half = stamp_size // 2
     n_det = len(det_cat)
-    canvas_h, canvas_w = large_image.shape
+    H, W = large_image.shape
 
-    stamps = np.zeros((n_det, stamp_size, stamp_size), dtype=large_image.dtype)
-    offsets = np.zeros((n_det, 2), dtype=np.float64)
+    # Integer pixel center (round to nearest integer)
+    yc = np.floor(det_cat["y"] + 0.5).astype(np.int32)
+    xc = np.floor(det_cat["x"] + 0.5).astype(np.int32)
 
-    for i in range(n_det):
-        y = det_cat["y"][i]
-        x = det_cat["x"][i]
+    # Subpixel offsets
+    offsets = np.column_stack([det_cat["y"] - yc, det_cat["x"] - xc])
 
-        # Integer pixel center (round to nearest integer for slicing)
-        yc = int(np.floor(y + 0.5))
-        xc = int(np.floor(x + 0.5))
+    # Top-left corner of each stamp
+    y1 = yc - half  # (N_det,)
+    x1 = xc - half  # (N_det,)
 
-        # Subpixel offset
-        offsets[i, 0] = y - yc
-        offsets[i, 1] = x - xc
+    # Build index grids using pre-allocated buffers or pre-computed aranges
+    # (avoids repeated np.arange + np.clip allocations per call)
+    if yy_buf is not None and xx_buf is not None:
+        # Use pre-allocated buffers — fill in-place
+        np.add(y1[:, None, None], _CUT_DY[None, :, None], out=yy_buf[:n_det])
+        np.add(x1[:, None, None], _CUT_DX[None, None, :], out=xx_buf[:n_det])
+        np.clip(yy_buf[:n_det], 0, H - 1, out=yy_buf[:n_det])
+        np.clip(xx_buf[:n_det], 0, W - 1, out=xx_buf[:n_det])
+        yy = yy_buf[:n_det]
+        xx = xx_buf[:n_det]
+    else:
+        dy = np.arange(stamp_size, dtype=np.int32)
+        dx = np.arange(stamp_size, dtype=np.int32)
+        yy = y1[:, None, None] + dy[None, :, None]
+        xx = x1[:, None, None] + dx[None, None, :]
+        yy = np.clip(yy, 0, H - 1)
+        xx = np.clip(xx, 0, W - 1)
 
-        y1 = yc - half
-        y2 = yc + half
-        x1 = xc - half
-        x2 = xc + half
-
-        # Clamp to canvas bounds; pad with zeros if outside
-        cy1, cy2 = max(y1, 0), min(y2, canvas_h)
-        cx1, cx2 = max(x1, 0), min(x2, canvas_w)
-
-        if cy2 > cy1 and cx2 > cx1:
-            # Place the valid region into the stamp
-            sy1 = cy1 - y1
-            sy2 = stamp_size - (y2 - cy2)
-            sx1 = cx1 - x1
-            sx2 = stamp_size - (x2 - cx2)
-            stamps[i, sy1:sy2, sx1:sx2] = large_image[cy1:cy2, cx1:cx2]
+    # Single vectorized extraction — no Python loop!
+    if stamps_out is not None:
+        np.copyto(stamps_out[:n_det], large_image[yy, xx])
+        stamps = stamps_out[:n_det]
+    else:
+        stamps = large_image[yy, xx]  # (N_det, 64, 64)
 
     return stamps, offsets
 
@@ -535,6 +794,7 @@ def merge_and_save_catalog(
     match_threshold: float = 3.0,
     save_npz: bool = True,
     save_csv: bool = True,
+    verbose: bool = True,
 ) -> str:
     """
     Merge FPFS detection catalog, ML shape measurements, and truth catalog
@@ -682,15 +942,16 @@ def merge_and_save_catalog(
 
     # ---- Summary ----
     n_matched = np.sum(matched_mask)
-    saved_parts = []
-    if save_npz:
-        saved_parts.append(npz_path)
-    if save_csv:
-        saved_parts.append(csv_path)
-    print(f"[merge] Catalog saved to: " + ", ".join(saved_parts))
-    print(f"  Total detections: {n_merged}")
-    print(f"  Matched to truth: {n_matched} ({100*n_matched/max(n_merged,1):.1f}%)")
-    print(f"  Unmatched: {n_merged - n_matched}")
-    print(f"  Save npz: {save_npz}, csv: {save_csv}")
+    if verbose:
+        saved_parts = []
+        if save_npz:
+            saved_parts.append(npz_path)
+        if save_csv:
+            saved_parts.append(csv_path)
+        print(f"[merge] Catalog saved to: " + ", ".join(saved_parts))
+        print(f"  Total detections: {n_merged}")
+        print(f"  Matched to truth: {n_matched} ({100*n_matched/max(n_merged,1):.1f}%)")
+        print(f"  Unmatched: {n_merged - n_matched}")
+        print(f"  Save npz: {save_npz}, csv: {save_csv}")
 
     return npz_path

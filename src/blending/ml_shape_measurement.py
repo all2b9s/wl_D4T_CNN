@@ -7,6 +7,7 @@ Reuses:
     - src/anacal/pixel_response.py    : anacal_pix_r (via prepare_q_images)
 """
 
+import time
 import numpy as np
 from typing import Tuple, Optional
 
@@ -22,11 +23,13 @@ def ml_shape_measure(
     psf_fwhm: float = 0.85,
     noise_std: float = 0.0,
     noise_levels: Optional[np.ndarray] = None,  # per-stamp noise sigma (N,)
+    noise_arrays: Optional[np.ndarray] = None,  # pre-generated noise stamps (N, H, W)
     n_workers: int = 32,
     flim: float = 10.0,
     dtype: str = "float32",
     ml_batch_size: int = 800,
     seed: int = 20020620,
+    verbose: bool = True,
 ) -> Tuple[np.ndarray, np.ndarray]:
     """
     Run ML shape measurement on a set of postage stamps.
@@ -53,8 +56,11 @@ def ml_shape_measure(
         An independent Gaussian noise realization with this amplitude is
         generated and passed to ``prepare_q_images`` for noise calibration.
         Set to 0 for noise-free data.
-    noise_levels : Optional[np.ndarray] = None  # per-stamp noise sigma (N,)
-        If provided, use these noise levels instead of the global noise_std.
+    noise_arrays : Optional[np.ndarray] = None  # pre-generated noise stamps (N, H, W)
+        If provided, used directly as the independent noise realization for
+        Q-image calibration — the same noise array should be passed to the
+        detection step for consistent noise-bias handling.  Overrides
+        ``noise_std`` and ``noise_levels``.
     n_workers : int
         Number of parallel workers for Q-image preparation.
     flim : float
@@ -84,8 +90,13 @@ def ml_shape_measure(
     # Independent Gaussian noise realization for Q-image calibration.
     # Must NOT be the same noise that is already in the stamps —
     # it is used internally by anacal to compute noise bias corrections.
-    # Supports both scalar noise_std and per-stamp noise_levels array.
-    if noise_levels is not None and np.any(noise_levels > 0):
+    # Supports both scalar noise_std, per-stamp noise_levels array, and
+    # pre-generated noise_arrays (for consistent noise between detection & measurement).
+    t_noise_start = time.perf_counter()
+    if noise_arrays is not None:
+        # Use the pre-generated noise directly — must match the noise passed to detection
+        noises = noise_arrays.astype(np.float64 if dtype == "float64" else np.float32)
+    elif noise_levels is not None and np.any(noise_levels > 0):
         # Per-stamp noise levels: shape (N,)  →  broadcast to (N, H, W)
         rng = np.random.default_rng(seed)
         noises = rng.normal(0, 1, stamps.shape) * noise_levels.reshape(-1, 1, 1)
@@ -94,8 +105,10 @@ def ml_shape_measure(
         noises = rng.normal(0, noise_std, stamps.shape)
     else:
         noises = None
+    t_noise = time.perf_counter() - t_noise_start
 
     # Prepare Q-images
+    t_prepare_start = time.perf_counter()
     q_imgs = prepare_q_images(
         images=stamps,
         psfs=psfs,
@@ -106,6 +119,7 @@ def ml_shape_measure(
         flim=flim,
         workers=n_workers,
     )
+    t_prepare = time.perf_counter() - t_prepare_start
 
     # Q-images have shape (N, 5, H, W) with an extra border;
     # strip the padding added by anacal: keep the central valid region.
@@ -119,13 +133,26 @@ def ml_shape_measure(
         pass
 
     # Cast to requested dtype
+    t_cast_start = time.perf_counter()
     if dtype == "float32":
         q_imgs = q_imgs.astype(np.float32)
     elif dtype == "float64":
         q_imgs = q_imgs.astype(np.float64)
+    t_cast = time.perf_counter() - t_cast_start
 
     # Run ML measurement
+    t_shape_start = time.perf_counter()
     ml_shapes, ml_R = calibrator.shape_measure(q_imgs, batch_size=ml_batch_size)
+    t_shape = time.perf_counter() - t_shape_start
+
+    if verbose:
+        print(f"  [ml_shape_measure timing]  n_stamps={n_stamps}")
+        print(f"    noise prep:  {t_noise:.2f}s")
+        print(f"    prepare_q:   {t_prepare:.2f}s  ← CPU multi-process (anacal FFT)")
+        print(f"    dtype cast:  {t_cast:.2f}s")
+        print(f"    shape_meas:  {t_shape:.2f}s  ← GPU forward+backward + response loop")
+        print(f"    ─────────────────────────────")
+        print(f"    total:       {t_noise + t_prepare + t_cast + t_shape:.2f}s")
 
     return ml_shapes, ml_R
 

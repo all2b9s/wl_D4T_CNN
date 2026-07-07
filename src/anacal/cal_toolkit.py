@@ -123,8 +123,8 @@ def build_dataset(
     return_imgs = True,
     use_threads=True,
 ):
-    # 1) Probe shapes once
-    cutouts0, psfs0, cat0, _ = load_img(
+    # 1) Probe shapes once — capture noise levels too
+    cutouts0, psfs0, cat0, noise0 = load_img(
         shear_comp=shear_comp,
         shear_mode=shear_mode,
         abs_shear_value=abs_shear_value,
@@ -144,38 +144,45 @@ def build_dataset(
     all_noise = np.empty((N,), dtype=np.float32)
     cat_chunks  = [None] * N_BATCH
 
+    # 3) Fill first batch (already loaded above) — avoids reloading it
+    if return_imgs:
+        all_cutouts[0:B] = cutouts0
+        all_psfs[0:B]    = psfs0
+    all_noise[0:B] = noise0
+    cat_chunks[0] = cat0
 
-    # 4) Parallel read remaining batches with a progress bar
+    # 4) Parallel read REMAINING batches (skip index_range[0])
     Exec = ThreadPoolExecutor if use_threads else ProcessPoolExecutor
-    max_w = min(workers, max(1, N_BATCH - 1))
+    remaining = N_BATCH - 1
+    if remaining > 0:
+        max_w = min(workers, remaining)
 
-    
+        loader = partial(load_one, 
+                         shear_comp=shear_comp, 
+                         shear_mode=shear_mode, 
+                         abs_shear_value=abs_shear_value, 
+                         noise_level=noise_level,
+                         noise_mode=noise_mode, 
+                         directory=directory)
 
-    loader = partial(load_one, 
-                     shear_comp=shear_comp, 
-                     shear_mode=shear_mode, 
-                     abs_shear_value=abs_shear_value, 
-                     noise_level=noise_level,
-                     noise_mode=noise_mode, 
-                     directory=directory)
+        map_kwargs = {}
+        if not use_threads:
+            map_kwargs["chunksize"] = 4  # tune 2–16 for processes
 
-    map_kwargs = {}
-    if not use_threads:
-        map_kwargs["chunksize"] = 4  # tune 2–16 for processes
-
-    with Exec(max_workers=max_w) as ex:
-        it = ex.map(loader, range(index_range[0], index_range[1]), **map_kwargs)
-        for i, (cutouts, psfs, cat, noise_level) in enumerate(
-            tqdm(it, total=N_BATCH, desc="Reading batches", unit="batch"),
-            start=0,
-        ):
-            s = i * B
-            e = s + B
-            if return_imgs:
-                all_cutouts[s:e] = cutouts
-                all_psfs[s:e]    = psfs
-            all_noise[s:e] = noise_level
-            cat_chunks[i]    = cat
+        with Exec(max_workers=max_w) as ex:
+            it = ex.map(loader, range(index_range[0] + 1, index_range[1]), **map_kwargs)
+            for i_rem, (cutouts, psfs, cat, noise_level) in enumerate(
+                tqdm(it, total=remaining, desc="Reading batches", unit="batch"),
+                start=0,
+            ):
+                i = i_rem + 1  # skip first slot
+                s = i * B
+                e = s + B
+                if return_imgs:
+                    all_cutouts[s:e] = cutouts
+                    all_psfs[s:e]    = psfs
+                all_noise[s:e] = noise_level
+                cat_chunks[i]    = cat
 
     all_cats = pd.concat(cat_chunks, ignore_index=True)
     if return_imgs:
