@@ -24,6 +24,7 @@ plt.colorbar()
 plt.title("PSF at the center of the exposure")
 plt.savefig("psf_center.png")
 plt.show()
+np.save("psf_center.npy", psf_array)
 
 
 # 4) Force a fixed stamp size (matches xlens.utils.image.resize_array). The PSF

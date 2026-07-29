@@ -275,12 +275,44 @@ def shape_pixel_gradients(
         for p, f in zip(model.parameters(), prev_flags):
             p.requires_grad_(f)
 
-        if 'go1' in locals():
-            del go1  
-        if 'go2' in locals():
-            del go2 
-        if 'go' in locals():
-            del go 
+        # Explicitly free GPU tensors that may hold retained autograd graphs.
+        # These may not all exist depending on the 'mode' branch taken.
+        try:
+            del go1
+        except (NameError, UnboundLocalError):
+            pass
+        try:
+            del go2
+        except (NameError, UnboundLocalError):
+            pass
+        try:
+            del go
+        except (NameError, UnboundLocalError):
+            pass
+        try:
+            del pred
+        except (NameError, UnboundLocalError):
+            pass
+        try:
+            del pred2
+        except (NameError, UnboundLocalError):
+            pass
+        try:
+            del gx1
+        except (NameError, UnboundLocalError):
+            pass
+        try:
+            del gx2
+        except (NameError, UnboundLocalError):
+            pass
+        try:
+            del x
+        except (NameError, UnboundLocalError):
+            pass
+        try:
+            del x2
+        except (NameError, UnboundLocalError):
+            pass
 
     return pred_np, grad_e1_np, grad_e2_np
 

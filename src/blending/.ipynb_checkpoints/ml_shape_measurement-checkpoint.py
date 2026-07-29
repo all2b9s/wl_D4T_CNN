@@ -1,0 +1,219 @@
+"""
+ML Shape Measurement for Postage Stamps
+=======================================
+
+Reuses:
+    - src/anacal/batch_calibration.py : Calibrator, prepare_q_images
+    - src/anacal/pixel_response.py    : anacal_pix_r (via prepare_q_images)
+"""
+
+import time
+import numpy as np
+from typing import Tuple, Optional
+
+# ===========================================================================
+# ML Shape Measurement
+# ===========================================================================
+
+def ml_shape_measure(
+    stamps: np.ndarray,
+    psf_image: np.ndarray,
+    calibrator: "Calibrator",
+    pixel_scale: float = 0.2,
+    psf_fwhm: float = 0.85,
+    noise_std: float = 0.0,
+    noise_levels: Optional[np.ndarray] = None,  # per-stamp noise sigma (N,)
+    noise_arrays: Optional[np.ndarray] = None,  # pre-generated noise stamps (N, H, W)
+    n_workers: int = 32,
+    flim: float = 10.0,
+    dtype: str = "float32",
+    ml_batch_size: int = 800,
+    seed: int = 20020620,
+    verbose: bool = True,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Run ML shape measurement on a set of postage stamps.
+
+    Steps:
+        1. Prepare Q-images via ``prepare_q_images()`` (from batch_calibration.py).
+        2. Run ML measurement via ``calibrator.shape_measure()``.
+
+    Parameters
+    ----------
+    stamps : ndarray (N, H, W)
+        Postage stamps cut from the large image (already noisy).
+    psf_image : ndarray (H_psf, W_psf)
+        Single PSF stamp image. Will be tiled to match the number of stamps.
+    calibrator : Calibrator
+        Instance of ``Calibrator`` from ``src/anacal/batch_calibration.py``,
+        wrapping the trained ML model.
+    pixel_scale : float
+        Pixel scale in arcsec/pixel.
+    psf_fwhm : float
+        PSF FWHM in arcsec. Used to compute sigma_arcsec = fwhm / 2.355.
+    noise_std : float
+        Noise standard deviation (sigma) of the image noise.
+        An independent Gaussian noise realization with this amplitude is
+        generated and passed to ``prepare_q_images`` for noise calibration.
+        Set to 0 for noise-free data.
+    noise_arrays : Optional[np.ndarray] = None  # pre-generated noise stamps (N, H, W)
+        If provided, used directly as the independent noise realization for
+        Q-image calibration — the same noise array should be passed to the
+        detection step for consistent noise-bias handling.  Overrides
+        ``noise_std`` and ``noise_levels``.
+    n_workers : int
+        Number of parallel workers for Q-image preparation.
+    flim : float
+        Frequency limit for anacal Q-image computation.
+    dtype : str
+        'float32' or 'float64' — precision for Q-image and measurement.
+    ml_batch_size : int
+        Batch size for ML measurement.
+    seed : int
+        Random seed for generating the independent noise realization.
+
+    Returns
+    -------
+    ml_shapes : ndarray (N, 2)
+        ML-measured (e1, e2) for each stamp.
+    ml_R : ndarray (N, 1, 2, 2)
+        ML response matrix for each stamp.
+    """
+    from src.anacal.batch_calibration import prepare_q_images
+
+    n_stamps = stamps.shape[0]
+    sigma_arcsec = psf_fwhm / 2.355
+
+    # Tile PSF to (N, H_psf, W_psf)
+    psfs = np.tile(psf_image, (n_stamps, 1, 1))
+
+    # Independent Gaussian noise realization for Q-image calibration.
+    # Must NOT be the same noise that is already in the stamps —
+    # it is used internally by anacal to compute noise bias corrections.
+    # Supports both scalar noise_std, per-stamp noise_levels array, and
+    # pre-generated noise_arrays (for consistent noise between detection & measurement).
+    t_noise_start = time.perf_counter()
+    if noise_arrays is not None:
+        # Use the pre-generated noise directly — must match the noise passed to detection
+        noises = noise_arrays.astype(np.float64 if dtype == "float64" else np.float32)
+    elif noise_levels is not None and np.any(noise_levels > 0):
+        # Per-stamp noise levels: shape (N,)  →  broadcast to (N, H, W)
+        rng = np.random.default_rng(seed)
+        noises = rng.normal(0, 1, stamps.shape) * noise_levels.reshape(-1, 1, 1)
+    elif isinstance(noise_std, (int, float)) and noise_std > 0:
+        rng = np.random.default_rng(seed)
+        noises = rng.normal(0, noise_std, stamps.shape)
+    else:
+        noises = None
+    t_noise = time.perf_counter() - t_noise_start
+
+    # Prepare Q-images
+    t_prepare_start = time.perf_counter()
+    q_imgs = prepare_q_images(
+        images=stamps,
+        psfs=psfs,
+        noises=noises,
+        cat=None,                     # no subpixel offsets needed
+        pixel_scale=pixel_scale,
+        sigma_arcsec=sigma_arcsec,
+        flim=flim,
+        workers=n_workers,
+    )
+    t_prepare = time.perf_counter() - t_prepare_start
+
+    # Q-images have shape (N, 5, H, W) with an extra border;
+    # strip the padding added by anacal: keep the central valid region.
+    # prepare_q_images returns padded images; we crop to the core:
+    # The border added by anacal.image.ImageQ is typically 1 pixel on each side
+    # for the 5-tap kernels used in the pixel response computation.
+    # For 64x64 input with default settings, output is (N, 5, 62, 62).
+    # We can use them directly — Calibrator.shape_measure handles the shape.
+    if q_imgs.shape[-1] < stamps.shape[-1]:
+        # Q-images are already cropped by anacal; proceed as-is
+        pass
+
+    # Cast to requested dtype
+    t_cast_start = time.perf_counter()
+    if dtype == "float32":
+        q_imgs = q_imgs.astype(np.float32)
+    elif dtype == "float64":
+        q_imgs = q_imgs.astype(np.float64)
+    t_cast = time.perf_counter() - t_cast_start
+
+    # Run ML measurement
+    t_shape_start = time.perf_counter()
+    ml_shapes, ml_R = calibrator.shape_measure(q_imgs, batch_size=ml_batch_size)
+    t_shape = time.perf_counter() - t_shape_start
+
+    if verbose:
+        print(f"  [ml_shape_measure timing]  n_stamps={n_stamps}")
+        print(f"    noise prep:  {t_noise:.2f}s")
+        print(f"    prepare_q:   {t_prepare:.2f}s  ← CPU multi-process (anacal FFT)")
+        print(f"    dtype cast:  {t_cast:.2f}s")
+        print(f"    shape_meas:  {t_shape:.2f}s  ← GPU forward+backward + response loop")
+        print(f"    ─────────────────────────────")
+        print(f"    total:       {t_noise + t_prepare + t_cast + t_shape:.2f}s")
+
+    return ml_shapes, ml_R
+
+
+# ===========================================================================
+# Convenience: full Phase 3 pipeline for one batch
+# ===========================================================================
+
+def run_ml_on_detections(
+    large_image: np.ndarray,
+    det_cat: np.ndarray,
+    psf_image: np.ndarray,
+    calibrator: "Calibrator",
+    stamp_size: int = 64,
+    pixel_scale: float = 0.2,
+    psf_fwhm: float = 0.85,
+    noise_std: float = 0.0,
+    noise_levels: Optional[np.ndarray] = None,
+    n_workers: int = 32,
+    dtype: str = "float32",
+    ml_batch_size: int = 800,
+    seed: int = 20020620,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """
+    Convenience function: cut stamps from large image at detection positions,
+    then run ML shape measurement.
+
+    Parameters
+    ----------
+    large_image, det_cat, psf_image, calibrator :
+        See individual functions.
+    stamp_size, pixel_scale, psf_fwhm, n_workers, dtype :
+        See ``cut_stamps_from_large`` and ``ml_shape_measure``.
+
+    Returns
+    -------
+    stamps : ndarray (N, stamp_size, stamp_size)
+    offsets : ndarray (N, 2)
+    ml_shapes : ndarray (N, 2)
+    ml_R : ndarray (N, 1, 2, 2)
+    """
+    from src.anacal.detection_ml_pipeline import cut_stamps_from_large
+
+    stamps, offsets = cut_stamps_from_large(
+        large_image=large_image,
+        det_cat=det_cat,
+        stamp_size=stamp_size,
+    )
+
+    ml_shapes, ml_R = ml_shape_measure(
+        stamps=stamps,
+        psf_image=psf_image,
+        calibrator=calibrator,
+        pixel_scale=pixel_scale,
+        psf_fwhm=psf_fwhm,
+        noise_std=noise_std,
+        noise_levels=noise_levels,
+        n_workers=n_workers,
+        dtype=dtype,
+        ml_batch_size=ml_batch_size,
+        seed=seed,
+    )
+
+    return stamps, offsets, ml_shapes, ml_R

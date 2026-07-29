@@ -75,6 +75,7 @@ class Calibrator:
             if not with_grad:
                 out = predictor(self.model, inp)[:, :2]  # (B, 2)
                 shapes = out.detach().cpu().numpy().astype(self.np_dtype)
+                del inp, out
                 return shapes, [None]*len(shapes), [None]*len(shapes)
 
             else:
@@ -83,6 +84,7 @@ class Calibrator:
                 shapes = shapes_t.astype(self.np_dtype)
                 g1 = g1_t.astype(self.np_dtype)
                 g2 = g2_t.astype(self.np_dtype)
+                del inp
                 return shapes, g1, g2
 
 
@@ -91,6 +93,9 @@ class Calibrator:
         for i in range(0, len(q_imgs), batch_size):
             batch = q_imgs[i:i+batch_size]
             results.append(process_q_imgs(batch))
+            # Force CUDA to release retained autograd graphs between batches
+            if self.device == "cuda" and with_grad:
+                torch.cuda.empty_cache()
 
         # unpack
         all_shape, all_grad_e1, all_grad_e2 = zip(*results)
