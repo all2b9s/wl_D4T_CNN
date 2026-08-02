@@ -3,78 +3,24 @@ import torch
 import numpy as np
 import matplotlib.pyplot as plt
 from typing import Tuple
-from src.datasets.single_gal_dataset import make_loaders
 import torch.nn.functional as F
 from torch import nn
-import pandas as pd
 
-# Testing plotting and data loading
-
-def load_test_item(
-    images_path: str = "images.npy",
-    csv_path: str = "gt_info.csv",
-    index_range: list = None,   # e.g. [0, 10]
-    target: str = "e",          # "e" -> (e1, e2), "g" -> (g1, g2)
-    normalize: str = "none"     # or "per_image"
-):
-    if index_range is None or len(index_range) != 2:
-        raise ValueError("index_range must be a list like [start, end].")
-
-    # Load CSV and select test subset
-    df = pd.read_csv(csv_path)
-    df_test = df[df["split"] == "test"].sort_values("id").reset_index(drop=True)
-
-    idx_min, idx_max = index_range
-    if idx_min < 0 or idx_max > len(df_test):
-        raise IndexError("index_range is out of bounds for test dataset.")
-
-    # Load all images (mmap for memory efficiency)
-    imgs = np.load(images_path, mmap_mode="r")
-
-    img_list, y_list = [], []
-
-    for index in range(idx_min, idx_max):
-        row = df_test.iloc[index]
-        img_id = int(row["id"])
-
-        # read image
-        img = imgs[img_id].astype(np.float64, copy=True)
-
-        # normalization
-        if normalize == "per_image":
-            m, s = img.mean(), img.std()
-            img = (img - m) / s if s > 0 else (img - m)
-
-        # target
-        if target == "e":
-            y = np.array([row["e1"], row["e2"]], dtype=np.float64)
-        elif target == "g":
-            y = np.array([row["g1"], row["g2"]], dtype=np.float64)
-        else:
-            raise ValueError("target must be 'e' or 'g'")
-
-        img_list.append(img)
-        y_list.append(y)
-
-    imgs_out = np.stack(img_list)   # shape [N, H, W]
-    ys_out = np.stack(y_list)       # shape [N, 2]
-
-    return imgs_out, ys_out
 
 def plot_shape_bidirectional(
     img: np.ndarray,                 # [H, W]
-    y_gt: np.ndarray,                # [2], (e1,e2) 或 (g1,g2)
-    y_pred: np.ndarray,# 可选 [2]，若传则一并画出
-    arrow_scale: float = 0.35,       # 箭头长度系数（再乘 |e| 或固定长度）
-    fixed_length: bool = False,      # True: 忽略|e|，固定长度只显示方向
-    percent_clip: float = 99.5,      # 对比度截断
+    y_gt: np.ndarray,                # [2], (e1,e2) or (g1,g2)
+    y_pred: np.ndarray,# optional [2]; if provided, plot it too
+    arrow_scale: float = 0.35,       # arrow length coefficient (scaled by |e| or fixed length)
+    fixed_length: bool = False,      # True: ignore |e|, use a fixed length to show direction only
+    percent_clip: float = 99.5,      # contrast percentile clip
     title = None,
-    fig_ax = None,     # 可传入 (fig, ax)，否则自动创建
+    fig_ax = None,     # optional (fig, ax); auto-created if not given
 ):
     """
-    - 将 (e1,e2) 视为 spin-2 形状：主轴角 φ = 0.5 * atan2(e2, e1)（π 周期）
-    - 在图像中心沿 ±φ 方向各画一支箭头
-    - y_pred 若提供，则：蓝色=pred，橙色=gt；只给 y_gt 就只画 gt
+    - Treat (e1,e2) as a spin-2 shape: principal-axis angle phi = 0.5 * atan2(e2, e1) (pi-periodic)
+    - Draw one arrow along each +/-phi direction at the image center
+    - If y_pred is provided: blue = pred, orange = gt; if only y_gt is given, draw gt only
     """
     assert img.ndim == 2, "img should be [H, W]"
     H, W = img.shape
@@ -98,7 +44,7 @@ def plot_shape_bidirectional(
             ax.quiver([cx], [cy], [ dx], [ dy], angles='xy', scale_units='xy', scale=1,
                   width=0.006, color=color)
 
-    # 显示图像（robust 对比度）
+    # display image (robust contrast)
     #lo, hi = np.percentile(img, [100 - percent_clip, percent_clip])
     if fig_ax is None:
         fig, ax = plt.subplots(1, 1, figsize=(3.5, 3.5))
@@ -108,11 +54,11 @@ def plot_shape_bidirectional(
     ax.imshow(img, cmap="gray", origin="lower", interpolation="nearest")
     ax.set_xticks([]); ax.set_yticks([])
 
-    # 画 GT
+    # draw GT
     phi_gt, amp_gt = _phi_amp(y_gt)
     _draw_bidirectional(ax, phi_gt, amp_gt, color="orange")
 
-    # 可选：画预测
+    # optional: draw prediction
     if y_pred is not None:
         phi_pr, amp_pr = _phi_amp(y_pred)
         _draw_bidirectional(ax, phi_pr, amp_pr, color="blue", inverse = True)
@@ -143,7 +89,7 @@ def D4_eq_weight(img):
     dd5 = torch.tensor([-1, 16, -30, 16, -1], device=img.device, dtype=img.dtype) / 12.0
 
     # reshape to conv2d friendly 2D separable kernels
-    # x方向核: [1,1,KW,1]; y方向核: [1,1,1,KH]
+    # x-direction kernel: [1,1,KW,1]; y-direction kernel: [1,1,1,KH]
     kx_s5  = s5.view(1, 1, -1, 1).repeat(C, 1, 1, 1)    
     ky_s5  = s5.view(1, 1,  1, -1).repeat(C, 1, 1, 1)
     kx_d5s = d5s.view(1, 1, -1, 1).repeat(C, 1, 1, 1)
@@ -170,7 +116,7 @@ def D4_eq_weight(img):
 
 @torch.no_grad()
 def _to_device(x, device):
-    # 仅在此 helper 中关闭 grad，加速搬运；主函数会在需要的位置重新开启
+    # disable grad only inside this helper to speed up transfers; the main function re-enables it where needed
     if isinstance(x, torch.Tensor):
         return x.to(device=device, dtype=x.dtype, non_blocking=True)
     return torch.from_numpy(np.asarray(x, dtype=x.dtype)).to(device, non_blocking=True)
@@ -193,10 +139,10 @@ def shape_pixel_gradients(
     assert mode in ("memory", "speed")
     device = device or ("cuda" if torch.cuda.is_available() else "cpu")
 
-    # ---- 1) 准备输入到 device（此处不追踪梯度以减少开销）----
+    # ---- 1) prepare input on device (no gradient tracking here to reduce overhead) ----
     x = _to_device(img_np, device)
 
-    # 统一到 [B, H, W]
+    # normalize to [B, H, W]
     if x.ndim == 2:
         x = x.unsqueeze(0)              # [1,H,W]
     elif x.ndim == 4 and x.shape[1] == 1:
@@ -206,7 +152,7 @@ def shape_pixel_gradients(
 
     B, H, W = x.shape
 
-    # ---- 2) 归一化（在 requires_grad 之前，就地操作）----
+    # ---- 2) normalization (in-place, before requires_grad) ----
     if normalize == "per_image":
         m = x.mean(dim=(-1, -2), keepdim=True)
         s = x.std(dim=(-1, -2), keepdim=True).clamp_min(eps)
@@ -214,10 +160,10 @@ def shape_pixel_gradients(
     elif normalize != "none":
         raise ValueError("normalize must be 'per_image' or 'none'")
 
-    # 加回通道 -> [B,1,H,W]
+    # add channel back -> [B,1,H,W]
     x = x.unsqueeze(1)
 
-    # ---- 3) 模型设置：关闭参数梯度，eval 模式 ----
+    # ---- 3) model setup: disable parameter gradients, eval mode ----
     model = model.to(device).eval()
     prev_flags = [p.requires_grad for p in model.parameters()]
     for p in model.parameters():
@@ -225,11 +171,11 @@ def shape_pixel_gradients(
 
     try:
         if mode == "memory":
-            # ---- 4A) 单次前向，两次反传（省显存）----
+            # ---- 4A) single forward, two backward passes (saves memory) ----
             x.requires_grad_(True)
             pred = model(x)[:, :2]          # [B,2]
 
-            # e1 梯度
+            # e1 gradient
             go1 = torch.zeros_like(pred)
             go1[:, 0] = 1.0
             (gx1,) = torch.autograd.grad(
@@ -237,7 +183,7 @@ def shape_pixel_gradients(
                 retain_graph=True, create_graph=False, allow_unused=False
             )
 
-            # e2 梯度
+            # e2 gradient
             go2 = torch.zeros_like(pred)
             go2[:, 1] = 1.0
             (gx2,) = torch.autograd.grad(
@@ -266,7 +212,7 @@ def shape_pixel_gradients(
             grad_e1 = gx2[:B]
             grad_e2 = gx2[B:]
 
-        # ---- 5) 转 numpy（保持 [B,1,H,W]）----
+        # ---- 5) convert to numpy (keep [B,1,H,W]) ----
         pred_np = pred.detach().float().cpu().numpy()
         grad_e1_np = grad_e1.detach().float().cpu().numpy()
         grad_e2_np = grad_e2.detach().float().cpu().numpy()
@@ -283,29 +229,6 @@ def shape_pixel_gradients(
             del go 
 
     return pred_np, grad_e1_np, grad_e2_np
-
-def draw_grad(model, img):
-    pred, grad_e1, grad_e2 = shape_pixel_gradients(model, img, normalize="none")
-
-    print("pred (e1,e2):", pred)
-    fig, axs = plt.subplots(1, 3, figsize=(10, 3))
-    im0 = axs[0].imshow(img, cmap="gray", origin="lower")
-    axs[0].set_title("input")
-    im1 = axs[1].imshow(grad_e1[0][0], cmap="bwr", origin="lower", vmax = np.abs(grad_e1).max(), vmin = -np.abs(grad_e1).max())
-    axs[1].set_title(r"$\partial e_1/\partial I$")
-    im2 = axs[2].imshow(grad_e2[0][0], cmap="bwr", origin="lower", vmax = np.abs(grad_e2).max(), vmin = -np.abs(grad_e2).max())
-    axs[2].set_title(r"$\partial e_2/\partial I$")
-
-    fig.colorbar(im0, ax=axs[0])
-    fig.colorbar(im1, ax=axs[1])
-    fig.colorbar(im2, ax=axs[2])
-
-    for ax in axs:
-        ax.set_xticks([])
-        ax.set_yticks([])
-    plt.tight_layout()
-    plt.show()
-    return pred, grad_e1, grad_e2
 
 # --------------------------
 # Utils: geometry & sizing
@@ -451,36 +374,3 @@ def predictor(model, img, normalize = "none"):
         y_pred_t = model(img_t)          # [1,2]
     y_pred = y_pred_t.squeeze(0).cpu().numpy() 
     return y_pred
-
-
-
-class PairedShearWrapper(nn.Module):
-    """
-    包装一个原始的 shape 模型：
-    - 原模型: 输入 [N, H, W] -> 输出 [N, 2]
-    - 包装后: 输入 [N, 2, H, W] (每个样本两张 sheared 图像)
-            -> 输出 (shape1, shape2)，各自都是 [N, 2]
-    """
-    def __init__(self, base_model: nn.Module):
-        super().__init__()
-        self.base_model = base_model
-
-    def forward(self, imgs_pair: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        """
-        imgs_pair: [N, 2, H, W]
-            imgs_pair[:, 0, ...] 是第一种 shear 的图像
-            imgs_pair[:, 1, ...] 是第二种 shear 的图像
-
-        返回:
-            shape1: [N, 2]
-            shape2: [N, 2]
-        """
-        img_p = imgs_pair[:,0]
-        img_n = imgs_pair[:,1]
-        
-        shape_p = self.base_model(img_p)   # [N, 2]
-        shape_n = self.base_model(img_n)   # [N, 2]
-        
-        e_mean = 0.5 * (shape_p + shape_n)
-        delta_e = 0.5 * (shape_p - shape_n)
-        return e_mean, delta_e

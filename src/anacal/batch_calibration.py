@@ -147,7 +147,7 @@ def _bs_worker(bs_ind):
     return (m / shear - 1.0, c)         # normalize m here to reduce post work
 
 def _bootstrap(N, bs_size, rng=None, dtype=np.int32):
-    """单次 bootstrap 抽样，包装成函数方便重用。"""
+    """Single bootstrap sampling, wrapped as a function for easy reuse."""
     if rng is None:
         rng = np.random.default_rng()
     return rng.integers(0, N, size=bs_size, dtype=dtype)
@@ -163,8 +163,8 @@ def get_biases(
     n_factor=1.0,
     is_twin=False,
     n_jobs=4,
-    chunk_bs=10,          # 每一批次做多少次 bootstrap，可调参
-    base_seed=12345,     # 如需可复现
+    chunk_bs=10,          # how many bootstrap samples per chunk, tunable
+    base_seed=12345,     # set for reproducibility
 ):
     """
     shapes: (N, 4, 2) numpy array 
@@ -178,7 +178,7 @@ def get_biases(
     """
     N_total = shapes.shape[0]
 
-    # twin 情况下，N_total = 2 * N_eff，只在抽样时用前半段
+    # for twins, N_total = 2 * N_eff; only sample from the first half
     if is_twin:
         N_eff = N_total // 2
         bs_size = bs_size // 2
@@ -188,17 +188,17 @@ def get_biases(
     if n_jobs is None:
         n_jobs = os.cpu_count() or 1
 
-    # 全样本估计（不 bootstrap）
+    # full-sample estimate (no bootstrap)
     m_mean, c_mean = _calibration(shapes, Rs, mask=mask)
     m_mean = m_mean / shear_value - 1.0
 
-    # bootstrap 结果容器
+    # containers for bootstrap results
     m_list = []
     c_list = []
 
     rng = np.random.default_rng(base_seed)
 
-    # 以 chunk_bs 为单位分批做 bootstrap
+    # run bootstrap in chunks of chunk_bs
     with ProcessPoolExecutor(
         max_workers=n_jobs,
         initializer=_bs_init_pool,
@@ -209,7 +209,7 @@ def get_biases(
             while done < bs_times:
                 cur = min(chunk_bs, bs_times - done)
 
-                # 这一批次只生成 cur 个索引数组，内存 ≈ cur * bs_size * sizeof(int)
+                # this chunk only generates cur index arrays; memory ~= cur * bs_size * sizeof(int)
                 bs_inds = []
                 for _ in range(cur):
                     inds = _bootstrap(N_eff, bs_size, rng=rng, dtype=np.int32)
@@ -217,7 +217,7 @@ def get_biases(
                         inds = np.concatenate([inds, inds + N_eff])
                     bs_inds.append(inds)
 
-                # 并行跑这一小批次
+                # run this small batch in parallel
                 results = list(ex.map(_bs_worker, bs_inds))
 
                 m_list.extend(r[0] for r in results)
@@ -229,7 +229,7 @@ def get_biases(
     m_list = np.asarray(m_list, dtype=np.float64)  # (bs_times, 2)
     c_list = np.asarray(c_list, dtype=np.float64)  # (bs_times, 2)
 
-    # bootstrap 标准差
+    # bootstrap standard deviation
     m_std = m_list.std(axis=0, ddof=1) * n_factor
     c_std = c_list.std(axis=0, ddof=1) * n_factor
 

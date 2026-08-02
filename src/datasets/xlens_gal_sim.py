@@ -312,23 +312,13 @@ class xlen_simulator():
 
 psf_e = 0
 print(f'psf_e: {psf_e}')
-'''simulator = xlen_simulator('/work/nvme/bfmo/wenyinli/datasets/xlens_shift/', 
-                            num_workers=128, mode='training', 
-                            rotId=0,
-                            psf_e=psf_e,
-                            has_shift=True, ori_seed=666)
-simulator(200_000)'''
-simulator = xlen_simulator('/work/nvme/bfmo/wenyinli/datasets/xlens_shift/', 
+
+simulator = xlen_simulator('./datasets/', 
                             num_workers=128, mode='training',
                             rotId=1, init_id=200_000,
                             psf_e=psf_e,
                             has_shift=True, ori_seed=666)
 simulator(200_000)
-'''simulator = xlen_simulator('/work/nvme/bfmo/wenyinli/datasets/xlens_sims_test/', 
-                            num_workers=64, mode='training',
-                            rotId=0, init_id=0,
-                            psf_e=0,
-                            has_shift=False, around_corner = True,ori_seed=999)
-simulator(1)'''
+
 
 

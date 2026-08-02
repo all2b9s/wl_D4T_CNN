@@ -20,7 +20,7 @@ from src.architecture.CNN_module import R180Inv_Conv2d, D4Inv_Conv2d, ConvGELU, 
 class SmoothCNN_GeLU(nn.Module):
     """
       input:  [B, in_dim, H, W]
-      output: [B, 2]  (e1, e2), D4 协变
+      output: [B, 2]  (e1, e2), D4-covariant
     """
     def __init__(self, 
                  in_dim=1, 
@@ -51,7 +51,7 @@ class SmoothCNN_GeLU(nn.Module):
         self.register_buffer('signs_e1', torch.tensor([+1, -1, +1, -1, +1, -1, +1, -1], dtype=torch.float32))
         self.register_buffer('signs_e2', torch.tensor([+1, -1, +1, -1, -1, +1, -1, +1], dtype=torch.float32))
 
-    # ----------------- D4 空间作用 -----------------
+    # ----------------- D4 group action -----------------
     @staticmethod
     def _rot90_k(x, k: int):
         return torch.rot90(x, k % 4, dims=(-2, -1))
@@ -75,7 +75,7 @@ class SmoothCNN_GeLU(nn.Module):
             k = idx - 4
             return self._rot90_k(self._reflect_x(x), -k)
 
-    # ----------------- trunk：提取 feature map -----------------
+    # ----------------- trunk: extract feature map -----------------
     def _trunk_feature(self, x):
         H = x.size(-2) - 6
         W = x.size(-1) - 6
@@ -223,10 +223,10 @@ class D4T_CNN_GeLU(nn.Module):
         norm = 1 + F.softplus(m - 1, beta=10.0, threshold=20)
         x = x / norm
 
-        # --- inpad 后走特征提取 ---
+        # --- feature extraction after inpad ---
         y = self.inpad(x)  # [B, C, H+12, W+12]
         for block in self.blocks:
-            y = block(y)   # 期望保持空间尺寸不变：仍约 [B, C, H+12, W+12]
+            y = block(y)   # expected to keep the spatial size: still approx [B, C, H+12, W+12]
 
         self.y  = center_crop_to(y,  (H, W))  # [B, C, H+8, W+8]
         self.w0 = self._get_cached_weight([H,W], sigma=4, device=x.device, dtype=x.dtype, mode="x2-y2")
@@ -243,46 +243,6 @@ class D4T_CNN_GeLU(nn.Module):
 
         out = torch.cat([shape0, shape1], dim=-1)  # [B, 2]
         return out
-
-class ShpaeResNet_GeLU(nn.Module):
-    def __init__(self, out_dim: int = 2, pretrained: bool = False):
-        super().__init__()
-
-        weights = ResNet18_Weights.DEFAULT if pretrained else None
-        self.backbone = resnet18(weights=weights)
-
-        # 1. First conv 改成 1-channel
-        old_conv = self.backbone.conv1
-        self.backbone.conv1 = nn.Conv2d(
-            in_channels=1,
-            out_channels=old_conv.out_channels,
-            kernel_size=old_conv.kernel_size,
-            stride=old_conv.stride,
-            padding=old_conv.padding,
-            bias=False
-        )
-
-        # 2. 将所有 ReLU 改成 GELU（遍历替换）
-        def replace_relu_with_gelu(module: nn.Module):
-            for name, child in module.named_children():
-                if isinstance(child, nn.ReLU):
-                    setattr(module, name, nn.GELU())
-                else:
-                    replace_relu_with_gelu(child)
-
-        replace_relu_with_gelu(self.backbone)
-
-        # 3. 自定义全连接 head（用 GELU）
-        in_features = self.backbone.fc.in_features
-        self.backbone.fc = nn.Sequential(
-            nn.Linear(in_features, 256),
-            nn.GELU(),
-            nn.Dropout(0.2),
-            nn.Linear(256, out_dim),
-        )
-
-    def forward(self, x):
-        return self.backbone(x)
 
 
 

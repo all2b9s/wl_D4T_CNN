@@ -1,0 +1,29 @@
+# Python caches
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Jupyter
+.ipynb_checkpoints/
+
+
+# Model weights (*.pth) — uncomment to exclude from repo
+# models/*.pth
+
+# OS generated
+.DS_Store
+Thumbs.db
+
+# Logs
+logs/
+*.log
+
+# IDE
+.vscode/
+.idea/
+
+# Conda/pip
+*.egg-info/
+dist/
+build/
