@@ -126,7 +126,7 @@ def xlens_gal_sim(
         task_config.apply_lensing_position_shifts = False
     task_config.select_observable = ['i_ab']
     task_config.select_lower_limit = [0]
-    task_config.select_upper_limit = [24.5]
+    task_config.select_upper_limit = [25.3]
     task_config.sep_arcsec = sep # arcsec
 
     cattask = CatalogShearTask(config=task_config)
@@ -148,6 +148,7 @@ def xlens_gal_sim(
     )
     config.draw_image_noise = False
     config.truncate_stamp_size = 65
+    config.force_galaxy_profile = 1 # profile (1: gaussian, 2: exponential); 0 keeps the catalog's native
     #config.rotId = rotId
     config.psf_e1 = psf_e
     config.psf_e2 = -psf_e
@@ -297,19 +298,19 @@ print(f'psf_e: {psf_e}')
                             psf_e=psf_e,
                             has_shift=True, ori_seed=666)
 simulator(200_000)'''
-'''simulator = xlen_simulator('/work/nvme/bfmo/wenyinli/datasets/xlens_shift/', 
-                            num_workers=128, mode='training',
+simulator = xlen_simulator('/work/hdd/bdsp/wenyinli/datasets/xlens_gauss_distribution/', 
+                            num_workers=128, mode='calibration',
                             rotId=1, init_id=200_000,
                             psf_e=psf_e,
                             has_shift=True, ori_seed=666)
-simulator(200_000)'''
-simulator = xlen_simulator('/work/nvme/bfmo/wenyinli/datasets/xlens_sims_test_px0.1/', 
+simulator(200_000)
+'''simulator = xlen_simulator('/work/nvme/bfmo/wenyinli/datasets/xlens_sims_test_px0.1/', 
                             num_workers=64, mode='training',
                             rotId=0, init_id=0,
                             psf_e=0,
                             pixel_scale=0.1,
                             image_size=1100,
                             has_shift=False, around_corner = True, ori_seed=999)
-simulator(10_000)
+simulator(10_000)'''
 
 

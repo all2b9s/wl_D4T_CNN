@@ -3,9 +3,12 @@ FPFS Detection + ML Shape Measurement Pipeline
 ==============================================
 
 Phase 1: Stitch isolated galaxy cutouts into large images
-Phase 2: Run anacal FPFS detection on the large image
+Phase 2: Run AnaCal detection + measurement (anacal.task.Task,
+         do_measure=True → wsel selection weight) +
+         FPFS measurement (anacal.fpfs.process_image, detection=...)
 Phase 3: Cut postage stamps at detected positions & run ML shape measurement
-Phase 4: Merge anacal detection info (w/dw, m00/dm00, FPFS shape) with ML results (shape/R)
+Phase 4: Merge anacal selection info (wsel/dwsel, m00/dm00, FPFS shape)
+         with ML results (shape/R)
 
 Reuses heavily from:
     - src/anacal/cal_toolkit.py   (load_img, build_dataset, format_number)
@@ -234,38 +237,69 @@ def load_and_stitch_one_batch(
 
 
 # ===========================================================================
-# Internal helpers: Task API adapter layer
+# Internal helpers: AnaCal detection (new two-step API)
 # ===========================================================================
 
 def _build_task_from_fpfs_config(
-    fpfs_config: Any = None,
     mag_zero: float = 30.0,
     pixel_scale: float = 0.2,
-    stamp_size: int = 64,
     sigma_arcsec: float = 0.40,
+    snr_peak_min: float = 10.0,
+    omega_f: Optional[float] = None,
+    omega_v: Optional[float] = None,
+    fpfs_c0: float = 30.0,
+    num_epochs: int = 0,
+    force_center: bool = True,
+    prior: Optional[Any] = None,
+    prior_sigma_a: float = 0.05,
+    prior_sigma_x: float = 0.05,
 ):
-    """Build an ``anacal.task.Task`` from legacy ``FpfsConfig`` parameters.
+    """Build an ``anacal.task.Task`` for source detection + measurement.
 
-    Uses the same defaults as ``xlens.processor.anacal.AnacalTask``
-    (see ``example_fpfs_blended_new.ipynb``).  The flux-related
-    thresholds are scaled by ``ratio = 10**((mag_zero - 30) / 2.5)``.
+    Task used with ``process_image(do_measure=True)``, so the output catalog
+    carries the full selection weight ``wsel`` / ``dwsel_dg{1,2}`` (the
+    detection weight refined by the FPFS flux/size cut) that the shear
+    estimator uses -- the same configuration as ``example_fpfs_blended.ipynb``.
+
+    The flux-related thresholds (``omega_f``, ``omega_v``, ``fpfs_c0``) are
+    BASE values defined at the reference zeropoint ``mag_zero = 31.4``
+    (``anacal.task.THRESHOLD_REF_MAG_ZERO``); the C++ ``Task`` constructor
+    rescales them internally to this image's ``mag_zero``.  Callers must pass
+    the base-31.4 values unchanged -- do NOT rescale them here (the legacy
+    ``10**((mag_zero - 30)/2.5)`` base-30 scaling would double-scale).
 
     Parameters
     ----------
-    fpfs_config : anacal.fpfs.FpfsConfig or None
-        Legacy configuration.  Currently unused for Task construction;
-        ``sigma_arcsec`` must be set explicitly (default 0.40 arcsec
-        matches the xlens / example notebook value).
     mag_zero : float
         Photometric zero point.
     pixel_scale : float
         Pixel scale in arcsec / pixel.
-    stamp_size : int
-        PSF / measurement stamp size in pixels.
     sigma_arcsec : float
         Detection smoothing kernel size in arcsec (default 0.40).
         Controls peak-finding SNR; larger values smooth more noise
         but may blend close sources.
+    snr_peak_min : float
+        Minimum peak SNR for detection (default 10.0).
+    omega_f : float or None
+        Base flux threshold for peak selection (defined at mag_zero=31.4).
+        Default ``0.218`` (example_fpfs_blended; effective ~0.060 at
+        mag_zero=30).
+    omega_v : float or None
+        Base variance threshold (defined at mag_zero=31.4).
+        Default ``0.011`` (effective ~0.0030 at mag_zero=30).
+    fpfs_c0 : float
+        Base FPFS flux/size selection cut for the measurement stage
+        (defined at mag_zero=31.4).  Default 30.0 (example).
+    num_epochs : int
+        Measurement fit epochs.  Default 0 (example).
+    force_center : bool
+        Force the measured center to the detection position.
+        Default True (example).
+    prior : anacal.ngmix.modelPrior or None
+        Prior for the C++ ngmix fit.  If None, a default ``modelPrior`` with
+        sigma_a = sigma_x = 0.05 is built (same as example).
+    prior_sigma_a, prior_sigma_x : float
+        Prior widths used when ``prior`` is None.
 
     Returns
     -------
@@ -273,43 +307,49 @@ def _build_task_from_fpfs_config(
     """
     import anacal
 
-    ratio = 10.0 ** ((mag_zero - 30.0) / 2.5)
-
-    prior = anacal.ngmix.modelPrior()
-    prior.set_sigma_a(anacal.math.qnumber(0.05))
-    prior.set_sigma_x(anacal.math.qnumber(0.05))
+    # omega_f / omega_v / fpfs_c0 are BASE thresholds defined at the
+    # reference zeropoint THRESHOLD_REF_MAG_ZERO = 31.4; the C++ Task
+    # rescales them internally to this image's mag_zero (task.h).  Pass the
+    # base-31.4 values unchanged -- the legacy base-30 external rescaling
+    # (10**((mag_zero - 30)/2.5)) would double-scale.
+    if omega_f is None:
+        omega_f = 0.218   # example_fpfs_blended (effective ~0.060 at mag_zero=30)
+    if omega_v is None:
+        omega_v = 0.011   # example_fpfs_blended (effective ~0.0030 at mag_zero=30)
+    if prior is None:
+        # Same prior as example_fpfs_blended.ipynb.
+        prior = anacal.ngmix.modelPrior()
+        prior.set_sigma_a(anacal.math.qnumber(prior_sigma_a))
+        prior.set_sigma_x(anacal.math.qnumber(prior_sigma_x))
 
     task = anacal.task.Task(
         scale=pixel_scale,
         sigma_arcsec=sigma_arcsec,
-        snr_peak_min=5.0,
-        omega_f=0.06 * ratio,
-        v_min=0.013 * ratio,
-        omega_v=0.025 * ratio,
-        p_min=0.12,
-        omega_p=0.05,
+        snr_peak_min=snr_peak_min,
+        omega_f=omega_f,
+        omega_v=omega_v,
         prior=prior,
-        stamp_size=stamp_size,
-        image_bound=40,
-        num_epochs=0,
-        force_size=False,
-        force_center=True,
-        fpfs_c0=8.4 * ratio,
+        num_epochs=num_epochs,
+        force_center=force_center,
+        fpfs_c0=fpfs_c0,
+        mag_zero=mag_zero,
     )
     return task
 
 
-def _build_block_list(
+def _build_cell_list(
     img_height: int,
     img_width: int,
     pixel_scale: float,
-    psf_array: np.ndarray,
-    stamp_size: int = 64,
+    cell_nx: int = 250,
+    cell_ny: int = 250,
+    cell_overlap: int = 80,
 ) -> list:
-    """Build processing blocks for ``task.process_image``.
+    """Build processing cells for ``anacal.task.Task.process_image``.
 
-    Tiles the image with ``anacal.geometry.get_block_list`` and attaches
-    the (constant) PSF stamp to every block.
+    Tiles the image with ``anacal.geometry.get_cell_list`` for detection.
+    The (constant) PSF is passed directly to ``process_image`` — no PSF
+    attachment to cells is needed.
 
     Parameters
     ----------
@@ -317,112 +357,32 @@ def _build_block_list(
         Image dimensions in pixels.
     pixel_scale : float
         Pixel scale in arcsec / pixel.
-    psf_array : ndarray
-        PSF stamp image.
-    stamp_size : int
-        Target PSF stamp size.
+    cell_nx, cell_ny : int
+        Cell size in pixels (default 250).
+    cell_overlap : int
+        Overlap between cells in pixels (default 80).
 
     Returns
     -------
-    blocks : list of ``anacal.geometry.Block``
+    cells : list of ``anacal.geometry.Cell``
     """
     import anacal
 
-    blocks = anacal.geometry.get_block_list(
+    return anacal.geometry.get_cell_list(
         img_nx=img_width,
         img_ny=img_height,
-        block_nx=img_width//2,
-        block_ny=img_height//2,
-        block_overlap=80,
+        cell_nx=cell_nx,
+        cell_ny=cell_ny,
+        cell_overlap=cell_overlap,
         scale=pixel_scale,
     )
-    # Attach the same constant PSF to every block
-    for bb in blocks:
-        bb.psf_array = anacal.utils.resize_array(psf_array, (stamp_size, stamp_size))
-
-    return blocks
-
-
-def _adapt_task_output_to_legacy(
-    out: np.ndarray,
-    pixel_scale: float,
-) -> np.ndarray:
-    """Convert ``task.process_image`` output columns to legacy-compatible names.
-
-    Mapping::
-
-        Task API column               Legacy column
-        ─────────────────────────────────────────────────
-        x1, x2     (arcsec)        →  fpfs_x, fpfs_y  (pixels)
-        wsel                         →  fpfs_w
-        dwsel_dg1, dwsel_dg2        →  fpfs_dw_dg1, fpfs_dw_dg2
-        flux_gauss0                  →  fpfs_m00
-        dflux_gauss0_dg{1,2}        →  fpfs_dm00_dg{1,2}
-        fpfs_e1, fpfs_e2             →  fpfs_e1, fpfs_e2         (unchanged)
-        fpfs_de1_dg1, fpfs_de2_dg2   →  fpfs_de1_dg1, fpfs_de2_dg2 (unchanged)
-
-    Parameters
-    ----------
-    out : ndarray
-        Structured array returned by ``task.process_image``.
-    pixel_scale : float
-        Pixel scale for arcsec → pixel conversion.
-
-    Returns
-    -------
-    adapted : ndarray
-        Structured array with legacy-compatible column names.
-    """
-    n_det = len(out)
-    names = list(out.dtype.names)
-
-    new_dtype = np.dtype([
-        ("fpfs_y", np.float64),
-        ("fpfs_x", np.float64),
-        ("fpfs_e1", np.float64),
-        ("fpfs_e2", np.float64),
-        ("fpfs_de1_dg1", np.float64),
-        ("fpfs_de2_dg2", np.float64),
-        ("fpfs_w", np.float64),
-        ("fpfs_dw_dg1", np.float64),
-        ("fpfs_dw_dg2", np.float64),
-        ("fpfs_m00", np.float64),
-        ("fpfs_dm00_dg1", np.float64),
-        ("fpfs_dm00_dg2", np.float64),
-    ])
-
-    adapted = np.empty(n_det, dtype=new_dtype)
-
-    # --- positions: x2 → fpfs_y, x1 → fpfs_x  (arcsec → pixels) ---
-    adapted["fpfs_y"] = out["x2"] / pixel_scale if "x2" in names else np.nan
-    adapted["fpfs_x"] = out["x1"] / pixel_scale if "x1" in names else np.nan
-
-    # --- shapes (same column names in both APIs) ---
-    for col in ["fpfs_e1", "fpfs_e2", "fpfs_de1_dg1", "fpfs_de2_dg2"]:
-        adapted[col] = out[col] if col in names else np.nan
-
-    # --- selection weights (wsel → fpfs_w) ---
-    adapted["fpfs_w"] = out["wsel"] if "wsel" in names else np.nan
-    adapted["fpfs_dw_dg1"] = out["dwsel_dg1"] if "dwsel_dg1" in names else np.nan
-    adapted["fpfs_dw_dg2"] = out["dwsel_dg2"] if "dwsel_dg2" in names else np.nan
-
-    # --- flux (flux_gauss0 → fpfs_m00) ---
-    adapted["fpfs_m00"] = out["flux_gauss0"] if "flux_gauss0" in names else np.nan
-    adapted["fpfs_dm00_dg1"] = (
-        out["dflux_gauss0_dg1"] if "dflux_gauss0_dg1" in names else np.nan
-    )
-    adapted["fpfs_dm00_dg2"] = (
-        out["dflux_gauss0_dg2"] if "dflux_gauss0_dg2" in names else np.nan
-    )
-
-    return adapted
 
 
 # ===========================================================================
-# Phase 2: Anacal FPFS Detection
+# Phase 2: AnaCal Detection + FPFS Measurement (new two-step API)
 # ===========================================================================
 
-def run_fpfs_detection(
+def run_detection_and_fpfs(
     large_image: np.ndarray,
     psf_image: np.ndarray,
     fpfs_config: Any = None,  # anacal.fpfs.FpfsConfig
@@ -430,29 +390,45 @@ def run_fpfs_detection(
     pixel_scale: float = 0.2,
     noise_variance: float = 1e-4,
     noise_array: Optional[np.ndarray] = None,
-    use_task_api: bool = True,
-    stamp_size: int = 64,
+    task: Any = None,  # cached anacal.task.Task (detection)
+    cells: Any = None,  # cached cell list
     sigma_arcsec: float = 0.40,
-    task: Any = None,  # cached anacal.task.Task
-    blocks: Any = None,  # cached block list
+    snr_peak_min: float = 5.0,
+    omega_f: Optional[float] = None,
+    omega_v: Optional[float] = None,
+    fpfs_c0: float = 30.0,
+    num_epochs: int = 0,
+    force_center: bool = True,
+    prior: Optional[Any] = None,
 ) -> np.ndarray:
     """
-    Run anacal FPFS detection on a large image (multiple galaxies).
+    Run AnaCal detection + FPFS measurement on a large image (new two-step API).
 
-    By default uses the new ``anacal.task.Task`` API (``use_task_api=True``),
-    which internally handles detection + FPFS measurement in a single call.
-    Set ``use_task_api=False`` to fall back to the legacy
-    ``anacal.fpfs.process_image`` path.
+    FPFS no longer detects internally.  This function runs:
+
+    1. **Detection + measurement** — ``anacal.task.Task.process_image(
+       do_measure=True)`` with a cell-list tiling.  Returns detector
+       positions (``x1_det``, ``x2_det`` in arcsec) and the full
+       differentiable selection weight (``wsel``, ``dwsel_dg1``,
+       ``dwsel_dg2`` — detection weight refined by the FPFS flux/size cut).
+    2. **FPFS measurement** — the Task's task-kernel FPFS measurement
+       (``fpfs_e{1,2}`` / ``fpfs_de{1,2}_dg{1,2}`` / ``fpfs_m0``) is the
+       production estimator, self-consistent with the selection weight.
+       A forced multi-kernel measurement (``anacal.fpfs.process_image``,
+       ``fpfs1_*``) is also run and kept as a fallback.
+
+    The selection weight is carried into the output catalog as
+    ``fpfs_w`` / ``fpfs_dw_dg{1,2}``, and the task-kernel FPFS quantities as
+    ``fpfs_e{1,2}`` / ``fpfs_R{11,22}`` / ``fpfs_m00``.
 
     Parameters
     ----------
     large_image : ndarray (H, W)
-        The stitched large image with galaxies placed on a grid.
+        The large image with galaxies.
     psf_image : ndarray (H_psf, W_psf)
         PSF stamp image.
     fpfs_config : anacal.fpfs.FpfsConfig
-        FPFS configuration.  When ``use_task_api=True``, only used for
-        legacy fallback; Task parameters are set independently.
+        FPFS measurement configuration (two shapelet scales).
     mag_zero : float
         Magnitude zero point.
     pixel_scale : float
@@ -460,27 +436,42 @@ def run_fpfs_detection(
     noise_variance : float
         Noise variance (sigma^2) for the image.
     noise_array : ndarray or None
-        Optional noise realization.
-    use_task_api : bool
-        If True (default), use ``anacal.task.Task``.  If False, use
-        legacy ``anacal.fpfs.process_image``.
-    stamp_size : int
-        PSF / measurement stamp size in pixels (Task API only).
-    sigma_arcsec : float
-        Detection smoothing kernel in arcsec (Task API only, default 0.40).
-        Larger values improve peak SNR on noisy images but may blend
-        close sources.  This is NOT derived from ``fpfs_config``.
+        Pure-noise realization with the same statistics as the image
+        noise (only needed for noisy images).  Used for the renoising
+        noise-bias correction: it is forwarded to BOTH the Task
+        (``task.process_image`` -- detection + task-kernel FPFS
+        measurement) and the forced ``anacal.fpfs.process_image`` call.
+        When present, the Task internally adds the noise to the
+        deconvolved data and doubles the input ``noise_variance`` so the
+        renoised covariance is consistent.  Pass ``None`` only for
+        noise-free images.
     task : anacal.task.Task or None
-        Cached Task object. If None, a new one is built.
-    blocks : list of anacal.geometry.Block or None
-        Cached block list. If None, a new one is built from ``psf_image``.
+        Cached detection Task. If None, a new one is built.
+    cells : list of anacal.geometry.Cell or None
+        Cached cell list. If None, a new one is built.
+    sigma_arcsec : float
+        Detection smoothing kernel in arcsec (default 0.40).
+    snr_peak_min : float
+        Minimum peak SNR for detection (default 5.0).
+    omega_f, omega_v : float or None
+        Base flux / variance thresholds, defined at mag_zero = 31.4 and
+        rescaled internally by the Task (defaults 0.218 / 0.011).
+    fpfs_c0 : float
+        Base FPFS flux/size selection cut for the measurement stage
+        (defined at mag_zero = 31.4; default 30.0).
+    num_epochs : int
+        Measurement fit epochs (default 0).
+    force_center : bool
+        Force the measured center to the detection position (default True).
+    prior : anacal.ngmix.modelPrior or None
+        Prior for the C++ ngmix fit (default: sigma_a = sigma_x = 0.05).
 
     Returns
     -------
     det_cat : ndarray
         Structured array with one row per detected object.
         Columns include detection positions, FPFS shapes, responses,
-        detection weights, and flux measurements.
+        selection weights (``wsel``), and flux measurements.
     """
     import anacal
 
@@ -490,97 +481,123 @@ def run_fpfs_detection(
     if noise_array is not None:
         noise_array = noise_array.astype(np.float64, copy=False)
 
-    if use_task_api:
-        # ---- New anacal.task.Task API ----
-        if task is None:
-            task = _build_task_from_fpfs_config(
-                fpfs_config=fpfs_config,
-                mag_zero=mag_zero,
-                pixel_scale=pixel_scale,
-                stamp_size=stamp_size,
-                sigma_arcsec=sigma_arcsec,
-            )
-        if blocks is None:
-            blocks = _build_block_list(
-                img_height=gal_array.shape[0],
-                img_width=gal_array.shape[1],
-                pixel_scale=pixel_scale,
-                psf_array=psf_array,
-                stamp_size=stamp_size,
-            )
-        out = task.process_image(
-            gal_array,
-            psf_array,
-            variance=noise_variance,
-            block_list=blocks,
-            detection=None,
-            noise_array=noise_array,
-            mask_array=None,
-            do_fpfs=True,
-        )
-        # Convert arcsec positions → pixels, wsel → fpfs_w, etc.
-        out = _adapt_task_output_to_legacy(out, pixel_scale)
-
-    else:
-        # ---- Legacy anacal.fpfs.process_image API ----
-        out = anacal.fpfs.process_image(
-            fpfs_config=fpfs_config,
+    # ---- Step 1: AnaCal detection + measurement (do_measure=True) ----
+    if task is None:
+        task = _build_task_from_fpfs_config(
             mag_zero=mag_zero,
-            gal_array=gal_array,
-            psf_array=psf_array,
             pixel_scale=pixel_scale,
-            noise_variance=noise_variance,
-            noise_array=noise_array,
-            detection=None,
-            do_compute_detect_weight=True,
+            sigma_arcsec=sigma_arcsec,
+            snr_peak_min=snr_peak_min,
+            omega_f=omega_f,
+            omega_v=omega_v,
+            fpfs_c0=fpfs_c0,
+            num_epochs=num_epochs,
+            force_center=force_center,
+            prior=prior,
+        )
+    if cells is None:
+        cells = _build_cell_list(
+            img_height=gal_array.shape[0],
+            img_width=gal_array.shape[1],
+            pixel_scale=pixel_scale,
         )
 
-    return _parse_detection_output(out)
+    det_cat_raw = task.process_image(
+        np.asarray(gal_array, dtype=np.float32),
+        psf_array,
+        variance=noise_variance,
+        # Renoising (noise-bias correction): passing the pure-noise
+        # realization activates the analytic noise correction inside the
+        # Task -- it adds the deconvolved noise to the measurement data
+        # and doubles ``variance`` internally (task.h).  This is required
+        # for the production task-kernel FPFS estimator (fpfs_e1 / fpfs_R11)
+        # to be unbiased under noise; without it the moment ratio
+        # e = M22/(M00+C0) picks up a positive multiplicative noise bias.
+        noise_array=noise_array,
+        cell_list=cells,
+        do_measure=True,
+    )
 
-
-def _parse_detection_output(out: np.ndarray) -> np.ndarray:
-    """
-    Parse the structured array returned by ``anacal.fpfs.process_image``
-    into a standardized detection catalog.
-
-    Handles the case of empty results (no detections) gracefully.
-    """
-    if out is None:
-        return _empty_det_cat()
-
-    # Handle both structured arrays and recarrays
-    if hasattr(out, "dtype") and hasattr(out.dtype, "names") and out.dtype.names is not None:
-        names = list(out.dtype.names)
-    else:
-        if hasattr(out, "shape") and out.shape[0] == 0:
-            return _empty_det_cat()
-        names = []
-
-    n_det = len(out) if hasattr(out, "__len__") else 0
+    n_det = len(det_cat_raw) if det_cat_raw is not None else 0
     if n_det == 0:
         return _empty_det_cat()
 
-    # --- Extract positions ---
-    pos_y = _extract_column(out, names, ["fpfs_y", "det_y", "y", "fpfs_row", "x2"])
-    pos_x = _extract_column(out, names, ["fpfs_x", "det_x", "x", "fpfs_col", "x1"])
+    # ---- Convert detector positions (arcsec) → pixel catalogue ----
+    det_names = list(det_cat_raw.dtype.names)
+    pos_y_arc = _extract_column(det_cat_raw, det_names, ["x2_det", "x2", "y"])
+    pos_x_arc = _extract_column(det_cat_raw, det_names, ["x1_det", "x1", "x"])
+    if pos_y_arc is None or pos_x_arc is None:
+        return _empty_det_cat()
 
-    # --- Extract FPFS shape measurements ---
-    fpfs_e1 = _extract_column(out, names, ["fpfs1_e1", "fpfs_e1", "e1"])
-    fpfs_e2 = _extract_column(out, names, ["fpfs1_e2", "fpfs_e2", "e2"])
-    fpfs_R11 = _extract_column(out, names, ["fpfs1_de1_dg1", "fpfs_de1_dg1", "de1_dg1", "R11"])
-    fpfs_R22 = _extract_column(out, names, ["fpfs1_de2_dg2", "fpfs_de2_dg2", "de2_dg2", "R22"])
+    detection = np.zeros(n_det, dtype=[("y", "f8"), ("x", "f8")])
+    detection["y"] = pos_y_arc / pixel_scale
+    detection["x"] = pos_x_arc / pixel_scale
 
-    # --- Extract detection / selection weights ---
-    fpfs_w = _extract_column(out, names, ["fpfs_w", "det_weight", "w", "wsel", "wdet"])
-    fpfs_dw_dg1 = _extract_column(out, names, ["fpfs_dw_dg1", "dw_dg1", "dwsel_dg1", "dwdet_dg1"])
-    fpfs_dw_dg2 = _extract_column(out, names, ["fpfs_dw_dg2", "dw_dg2", "dwsel_dg2", "dwdet_dg2"])
+    # ---- Step 2: FPFS measurement at detected positions ----
+    # FPFS requires the PSF stamp to be (npix, npix) with npix =
+    # fpfs_config.npix (default 64).  The raw PSF may be a different size
+    # (e.g. 48×48 after border trimming), so resize it to match -- the
+    # same convention the legacy block-based pipeline used (it resized
+    # the PSF to stamp_size before measurement).
+    npix = fpfs_config.npix
+    if psf_array.shape != (npix, npix):
+        psf_fpfs = anacal.utils.resize_array(psf_array, (npix, npix))
+    else:
+        psf_fpfs = psf_array
 
-    # --- Extract flux ---
-    fpfs_m00 = _extract_column(out, names, ["fpfs1_m00", "fpfs_m00", "m00", "flux", "flux_gauss0"])
-    fpfs_dm00_dg1 = _extract_column(out, names, ["fpfs1_dm00_dg1", "fpfs_dm00_dg1", "dm00_dg1", "dflux_gauss0_dg1"])
-    fpfs_dm00_dg2 = _extract_column(out, names, ["fpfs1_dm00_dg2", "fpfs_dm00_dg2", "dm00_dg2", "dflux_gauss0_dg2"])
+    fpfs_out = anacal.fpfs.process_image(
+        fpfs_config=fpfs_config,
+        mag_zero=mag_zero,
+        gal_array=gal_array,
+        psf_array=psf_fpfs,
+        pixel_scale=pixel_scale,
+        noise_variance=noise_variance,
+        noise_array=noise_array,
+        detection=detection,
+    )
 
-    # Build a clean structured array
+    # ---- Merge detector weight + FPFS shapes ----
+    return _merge_detection_and_fpfs(det_cat_raw, fpfs_out, pixel_scale)
+
+
+def _merge_detection_and_fpfs(
+    det_cat: np.ndarray,
+    fpfs_out: np.ndarray,
+    pixel_scale: float,
+) -> np.ndarray:
+    """
+    Merge AnaCal detector output with FPFS measurement output.
+
+    Detector output provides positions (``x1_det``, ``x2_det`` in arcsec),
+    the full differentiable selection weight (``wsel``, ``dwsel_dg1``,
+    ``dwsel_dg2`` — detection weight refined by the FPFS flux/size cut)
+    and the task-kernel FPFS shapes/flux (``fpfs_e{1,2}``,
+    ``fpfs_de{1,2}_dg{1,2}``, ``fpfs_m0``).  The task-kernel quantities are
+    the production estimator and are used directly; the forced ``fpfs1_*``
+    columns in ``fpfs_out`` are only a fallback.
+
+    Parameters
+    ----------
+    det_cat : ndarray
+        Structured array from ``anacal.task.Task.process_image(do_measure=True)``.
+    fpfs_out : ndarray
+        Structured array from ``anacal.fpfs.process_image(detection=...)``.
+    pixel_scale : float
+        Pixel scale for arcsec → pixel conversion.
+
+    Returns
+    -------
+    merged : ndarray
+        Standardized detection catalog (same dtype as before).
+    """
+    if det_cat is None or len(det_cat) == 0:
+        return _empty_det_cat()
+
+    n_det = len(det_cat)
+    det_names = list(det_cat.dtype.names)
+    fpfs_names = list(fpfs_out.dtype.names) if fpfs_out is not None else []
+
+    # Build a clean structured array (unchanged schema)
     dtype = np.dtype([
         ("det_id", np.int32),
         ("y", np.float64), ("x", np.float64),
@@ -592,22 +609,79 @@ def _parse_detection_output(out: np.ndarray) -> np.ndarray:
         ("fpfs_dm00_dg1", np.float64), ("fpfs_dm00_dg2", np.float64),
     ])
 
-    det_cat = np.empty(n_det, dtype=dtype)
-    det_cat["det_id"] = np.arange(n_det, dtype=np.int32)
-    det_cat["y"] = pos_y if pos_y is not None else np.nan
-    det_cat["x"] = pos_x if pos_x is not None else np.nan
-    det_cat["fpfs_e1"] = fpfs_e1 if fpfs_e1 is not None else np.nan
-    det_cat["fpfs_e2"] = fpfs_e2 if fpfs_e2 is not None else np.nan
-    det_cat["fpfs_R11"] = fpfs_R11 if fpfs_R11 is not None else np.nan
-    det_cat["fpfs_R22"] = fpfs_R22 if fpfs_R22 is not None else np.nan
-    det_cat["fpfs_w"] = fpfs_w if fpfs_w is not None else np.nan
-    det_cat["fpfs_dw_dg1"] = fpfs_dw_dg1 if fpfs_dw_dg1 is not None else np.nan
-    det_cat["fpfs_dw_dg2"] = fpfs_dw_dg2 if fpfs_dw_dg2 is not None else np.nan
-    det_cat["fpfs_m00"] = fpfs_m00 if fpfs_m00 is not None else np.nan
-    det_cat["fpfs_dm00_dg1"] = fpfs_dm00_dg1 if fpfs_dm00_dg1 is not None else np.nan
-    det_cat["fpfs_dm00_dg2"] = fpfs_dm00_dg2 if fpfs_dm00_dg2 is not None else np.nan
+    merged = np.empty(n_det, dtype=dtype)
+    merged["det_id"] = np.arange(n_det, dtype=np.int32)
 
-    return det_cat
+    # --- positions: from detector (x2_det → y, x1_det → x; arcsec → pixels) ---
+    pos_y = _extract_column(det_cat, det_names, ["x2_det", "x2", "y"])
+    pos_x = _extract_column(det_cat, det_names, ["x1_det", "x1", "x"])
+    merged["y"] = pos_y / pixel_scale if pos_y is not None else np.nan
+    merged["x"] = pos_x / pixel_scale if pos_x is not None else np.nan
+
+    # --- selection weight: from detector (wsel = wdet * FPFS cut) ---
+    merged["fpfs_w"] = _fill_nan(
+        _extract_column(det_cat, det_names, ["wsel", "wdet", "w"]), n_det
+    )
+    merged["fpfs_dw_dg1"] = _fill_nan(
+        _extract_column(det_cat, det_names, ["dwsel_dg1", "dwdet_dg1", "dw_dg1"]), n_det
+    )
+    merged["fpfs_dw_dg2"] = _fill_nan(
+        _extract_column(det_cat, det_names, ["dwsel_dg2", "dwdet_dg2", "dw_dg2"]), n_det
+    )
+
+    # --- FPFS shapes (task kernel, self-consistent with wsel/dwsel) ---
+    # The production FPFS estimator is the Task's task-kernel measurement
+    # (fpfs_e{1,2} / fpfs_de{1,2}_dg{1,2} / fpfs_m0), the same kernel that
+    # wsel/dwsel come from (see example_fpfs_blended.ipynb).  The forced
+    # fpfs1_* columns are only a fallback.
+    merged["fpfs_e1"] = _fill_nan(
+        _extract_preferred(det_cat, det_names, fpfs_out, fpfs_names,
+                           ["fpfs_e1", "e1"],
+                           ["fpfs1_e1", "fpfs_e1", "e1"]), n_det
+    )
+    merged["fpfs_e2"] = _fill_nan(
+        _extract_preferred(det_cat, det_names, fpfs_out, fpfs_names,
+                           ["fpfs_e2", "e2"],
+                           ["fpfs1_e2", "fpfs_e2", "e2"]), n_det
+    )
+    merged["fpfs_R11"] = _fill_nan(
+        _extract_preferred(det_cat, det_names, fpfs_out, fpfs_names,
+                           ["fpfs_de1_dg1", "de1_dg1", "R11"],
+                           ["fpfs1_de1_dg1", "fpfs_de1_dg1", "de1_dg1", "R11"]), n_det
+    )
+    merged["fpfs_R22"] = _fill_nan(
+        _extract_preferred(det_cat, det_names, fpfs_out, fpfs_names,
+                           ["fpfs_de2_dg2", "de2_dg2", "R22"],
+                           ["fpfs1_de2_dg2", "fpfs_de2_dg2", "de2_dg2", "R22"]), n_det
+    )
+
+    # --- FPFS flux (task kernel) ---
+    merged["fpfs_m00"] = _fill_nan(
+        _extract_preferred(det_cat, det_names, fpfs_out, fpfs_names,
+                           ["fpfs_m0", "m00", "flux_gauss0"],
+                           ["fpfs1_m00", "fpfs_m00", "m00", "flux_gauss0"]), n_det
+    )
+    merged["fpfs_dm00_dg1"] = _fill_nan(
+        _extract_preferred(det_cat, det_names, fpfs_out, fpfs_names,
+                           ["fpfs_dm0_dg1", "dm00_dg1", "dflux_gauss0_dg1"],
+                           ["fpfs1_dm00_dg1", "fpfs_dm00_dg1", "dm00_dg1",
+                            "dflux_gauss0_dg1"]), n_det
+    )
+    merged["fpfs_dm00_dg2"] = _fill_nan(
+        _extract_preferred(det_cat, det_names, fpfs_out, fpfs_names,
+                           ["fpfs_dm0_dg2", "dm00_dg2", "dflux_gauss0_dg2"],
+                           ["fpfs1_dm00_dg2", "fpfs_dm00_dg2", "dm00_dg2",
+                            "dflux_gauss0_dg2"]), n_det
+    )
+
+    return merged
+
+
+def _fill_nan(col: Optional[np.ndarray], n: int) -> np.ndarray:
+    """Return ``col`` as float64, or an all-NaN array of length ``n`` if None."""
+    if col is None:
+        return np.full(n, np.nan, dtype=np.float64)
+    return np.asarray(col, dtype=np.float64)
 
 
 def _extract_column(
@@ -623,6 +697,29 @@ def _extract_column(
                     col = col[:, 0]
             return np.asarray(col, dtype=np.float64)
     return None
+
+
+def _extract_preferred(
+    det_cat: np.ndarray,
+    det_names: list,
+    fpfs_out: np.ndarray,
+    fpfs_names: list,
+    det_candidates: list,
+    fpfs_candidates: list,
+) -> Optional[np.ndarray]:
+    """Extract a column, preferring the Task's task-kernel FPFS measurement.
+
+    The production FPFS estimator -- the one that is self-consistent with
+    the selection weight ``wsel``/``dwsel`` (see example_fpfs_blended.ipynb)
+    -- is the task-kernel measurement carried in ``det_cat``
+    (``fpfs_e1``/``fpfs_de1_dg1``/``fpfs_m0`` ...).  The forced ``fpfs1_*``
+    columns in ``fpfs_out`` are only a fallback when the task columns are
+    absent.
+    """
+    col = _extract_column(det_cat, det_names, det_candidates)
+    if col is None:
+        col = _extract_column(fpfs_out, fpfs_names, fpfs_candidates)
+    return col
 
 
 def _empty_det_cat() -> np.ndarray:
@@ -656,6 +753,7 @@ def cut_stamps_from_large(
     stamps_out: Optional[np.ndarray] = None,
     yy_buf: Optional[np.ndarray] = None,
     xx_buf: Optional[np.ndarray] = None,
+    parity_centering: bool = False,
 ) -> Tuple[np.ndarray, np.ndarray]:
     """
     Cut postage stamps from the large image at each detection position.
@@ -678,15 +776,25 @@ def cut_stamps_from_large(
     yy_buf, xx_buf : ndarray or None
         Optional pre-allocated index buffers of shape (N_det, stamp_size, stamp_size).
         Pass the **same** buffers for signal + noise calls to reuse them.
+    parity_centering : bool
+        If True, place the detection peak at stamp pixel ``stamp_size//2`` for
+        even detection positions, or ``stamp_size//2 - 1`` for odd ones
+        (instead of always ``stamp_size//2``).  For even-sized stamps (e.g.
+        64×64) this makes the galaxy distribution symmetric around the
+        geometric centre (31.5 for 64×64), removing the systematic 0.5-pixel
+        offset from always centering the peak on pixel 32.  Default False
+        (legacy behaviour).
 
     Returns
     -------
     stamps : ndarray (N_det, stamp_size, stamp_size)
         Cutout stamps for each detection.
     offsets : ndarray (N_det, 2)
-        Subpixel offsets (dy, dx) = (y - floor(y+0.5), x - floor(x+0.5)).
-        These represent the difference between the detection centroid and
-        the stamp center pixel, useful for subpixel corrections.
+        Subpixel offsets (dy, dx) = (y - floor(y+0.5), x - floor(x+0.5)),
+        i.e. the galaxy's subpixel phase relative to the rounded detection
+        pixel.  (With ``parity_centering`` the stamp centre pixel is no longer
+        always ``floor(y+0.5)``; the offsets keep the detection-relative
+        meaning.)
     """
     half = stamp_size // 2
     n_det = len(det_cat)
@@ -696,12 +804,24 @@ def cut_stamps_from_large(
     yc = np.floor(det_cat["y"] + 0.5).astype(np.int32)
     xc = np.floor(det_cat["x"] + 0.5).astype(np.int32)
 
-    # Subpixel offsets
+    # Subpixel offsets (galaxy phase relative to the rounded detection pixel)
     offsets = np.column_stack([det_cat["y"] - yc, det_cat["x"] - xc])
 
     # Top-left corner of each stamp
     y1 = yc - half  # (N_det,)
     x1 = xc - half  # (N_det,)
+
+    if parity_centering:
+        # Even detection positions → peak at stamp pixel `half` (e.g. 32).
+        # Odd  detection positions → peak at stamp pixel `half - 1` (e.g. 31).
+        # `yc % 2` is 0 (even) / 1 (odd); shifting the top-left corner by the
+        # parity moves the detection peak from pixel 32 to pixel 31 for odd
+        # positions.  Since parity is independent of the galaxy's subpixel
+        # offset δ ∈ (-0.5, 0.5], the combined galaxy distribution becomes
+        # symmetric around the geometric centre (31.5 for 64×64) instead of
+        # being biased toward pixel 32.
+        y1 = y1 + (yc % 2)
+        x1 = x1 + (xc % 2)
 
     # Build index grids using pre-allocated buffers or pre-computed aranges
     # (avoids repeated np.arange + np.clip allocations per call)
@@ -803,7 +923,7 @@ def merge_and_save_catalog(
     Parameters
     ----------
     det_cat : ndarray
-        FPFS detection catalog (from ``run_fpfs_detection``).
+        FPFS detection catalog (from ``run_detection_and_fpfs``).
     ml_shapes : ndarray (N_det, 2)
         ML-measured (e1, e2).
     ml_R : ndarray (N_det, 1, 2, 2)

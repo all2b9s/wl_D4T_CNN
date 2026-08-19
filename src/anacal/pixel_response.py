@@ -23,8 +23,8 @@ def anacal_pix_r(img, psf, center=None,
     """
     
     klim = freq_lim / scale_arcsec_per_pix
-    nx = img.shape[0]
-    ny = img.shape[1]
+    nx = img.shape[1]
+    ny = img.shape[0]
 
     if center is None:
         xcen = nx // 2

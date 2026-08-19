@@ -398,7 +398,8 @@ def gaussian_weight_2d(size: int | tuple[int, int], std: float = 16, device=None
     y = torch.arange(H, device=device, dtype=dtype) - (H-1)/2
     x = torch.arange(W, device=device, dtype=dtype) - (W-1)/2
     yy, xx = torch.meshgrid(y, x, indexing="ij")
-
+    
+    
     g = torch.exp(-0.5 * (xx**2 + yy**2) / (std**2))/(2*np.pi*std**2)
     g = (g + g.flip([0, 1]) + g.flip([0]) + g.flip([1]))/4 # make sure center is max
     #if normalize:

@@ -23,18 +23,18 @@ def anacal_pix_r(img, psf, center=None,
     """
     
     klim = freq_lim / scale_arcsec_per_pix
-    nx = img.shape[0]
-    ny = img.shape[1]
+    nx = img.shape[1]
+    ny = img.shape[0]
 
     if center is None:
         xcen = nx // 2
         ycen = ny // 2
     else:
         xcen, ycen = center
-    dx = xcen - round(xcen)
-    dy = ycen - round(ycen)
-    xcen = round(xcen)
-    ycen = round(ycen)
+    dx = -0.5
+    dy = -0.5
+    xcen = int(xcen+0.5)
+    ycen = int(ycen+0.5)
 
     iq = anacal.image.ImageQ(nx, ny, scale_arcsec_per_pix, sigma_arcsec, klim, True)
 

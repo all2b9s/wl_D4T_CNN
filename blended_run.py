@@ -38,6 +38,7 @@ import argparse
 import time
 import threading
 import subprocess
+from dataclasses import dataclass
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from astropy.io import fits
@@ -45,11 +46,12 @@ import fitsio
 
 from src.anacal.batch_calibration import Calibrator
 from src.anacal.detection_ml_pipeline import (
-    run_fpfs_detection,
+    run_detection_and_fpfs,
     cut_stamps_from_large,
     merge_and_save_catalog,
     _build_task_from_fpfs_config,
-    _build_block_list,
+    _build_cell_list,
+    match_detections_to_truth,
 )
 from src.blending.ml_shape_measurement import ml_shape_measure
 from src.architecture.forward8_CNN import Forward8_fixW_CNN
@@ -61,7 +63,6 @@ from src.datasets.dataset_toolkit import get_weighted_e
 # ---------------------------------------------------------------------------
 
 FPFS_CONFIG = anacal.fpfs.FpfsConfig(
-    sigma_shapelets=0.52,
     sigma_shapelets1=0.45,
     sigma_shapelets2=0.55,
 )
@@ -82,6 +83,9 @@ SIM_MODE_MAP = {
 
 PIXEL_SCALE = 0.2
 WEIGHT_THRESHOLD = 1e-6
+# Drop detections closer than this many pixels to the image border
+# (normal detection mode only) so the full stamp always fits the exposure.
+EDGE_MARGIN = 32
 
 
 # ---------------------------------------------------------------------------
@@ -242,6 +246,221 @@ def _gpu_util_monitor(interval, results):
         pass
 
 
+# ---------------------------------------------------------------------------
+# CPU preparation workers
+# ---------------------------------------------------------------------------
+
+_FAKE_DET_DTYPE = np.dtype([
+    ("det_id", np.int32),
+    ("y", np.float64), ("x", np.float64),
+    ("fpfs_e1", np.float64), ("fpfs_e2", np.float64),
+    ("fpfs_R11", np.float64), ("fpfs_R22", np.float64),
+    ("fpfs_w", np.float64),
+    ("fpfs_dw_dg1", np.float64), ("fpfs_dw_dg2", np.float64),
+    ("fpfs_m00", np.float64),
+    ("fpfs_dm00_dg1", np.float64), ("fpfs_dm00_dg2", np.float64),
+])
+
+
+@dataclass(frozen=True)
+class _CpuPreparationConfig:
+    """Immutable dependencies shared by CPU chunk and exposure workers."""
+
+    blended_dir: str
+    cat_ref: np.ndarray
+    psf_image: np.ndarray
+    noise_mode: str
+    noise_level: float | None
+    mag_zero: float
+    pixel_scale: float
+    stamp_size: int
+    skip_detection: bool
+    mag_cut: float | None
+    parity_centering: bool
+    center_on_truth: bool
+    match_threshold: float
+
+
+def _empty_stamps(stamp_size: int) -> tuple[np.ndarray, np.ndarray]:
+    """Return empty science and noise stamp arrays with the expected shape."""
+    shape = (0, stamp_size, stamp_size)
+    return np.empty(shape, dtype=np.float64), np.empty(shape, dtype=np.float64)
+
+
+def _build_truth_detection_catalog(truth_df: pd.DataFrame, mag_cut: float | None) -> np.ndarray:
+    """Create calibration-compatible detections from truth positions for test mode."""
+    if mag_cut is not None and "i_ab" in truth_df.columns:
+        truth_df = truth_df.loc[truth_df["i_ab"].to_numpy(dtype=float) < mag_cut]
+
+    det_cat = np.zeros(len(truth_df), dtype=_FAKE_DET_DTYPE)
+    det_cat["det_id"] = np.arange(len(truth_df), dtype=np.int32)
+    det_cat["y"] = truth_df["y"].to_numpy(dtype=np.float64)
+    det_cat["x"] = truth_df["x"].to_numpy(dtype=np.float64)
+    det_cat["fpfs_w"] = 1.0
+    return det_cat
+
+
+def _recenter_on_truth(
+    det_cat: np.ndarray,
+    positions: np.ndarray,
+    match_threshold: float,
+) -> np.ndarray:
+    """Crossmatch test: re-center detections on the matched truth positions.
+
+    Detections without a truth match (farther than ``match_threshold``
+    pixels) are DROPPED; the remaining detections keep their weights but
+    their stamp cut centres move to the matched truth coordinates.
+    """
+    if len(det_cat) == 0:
+        return det_cat
+
+    truth_idx, _ = match_detections_to_truth(
+        det_cat, positions, match_threshold=match_threshold,
+    )
+    matched = truth_idx >= 0
+    n_total = len(det_cat)
+    n_match = int(np.sum(matched))
+    det_cat = det_cat[matched]
+    if n_match > 0:
+        det_cat["y"] = positions[truth_idx[matched], 0]
+        det_cat["x"] = positions[truth_idx[matched], 1]
+    print(f"    [center_on_truth] {n_match}/{n_total} matched & re-centered on truth "
+          f"(thr={match_threshold} px, dropped {n_total - n_match})")
+    return det_cat
+
+
+def _cut_signal_and_noise_stamps(
+    large_img: np.ndarray,
+    noise_canvas: np.ndarray,
+    det_cat: np.ndarray,
+    stamp_size: int,
+    parity_centering: bool,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Cut matched science and renoise stamps, including the empty case."""
+    if len(det_cat) == 0:
+        return _empty_stamps(stamp_size)
+
+    stamps, _ = cut_stamps_from_large(
+        large_img, det_cat, stamp_size=stamp_size, parity_centering=parity_centering,
+    )
+    noise_stamps, _ = cut_stamps_from_large(
+        noise_canvas, det_cat, stamp_size=stamp_size, parity_centering=parity_centering,
+    )
+    return stamps, noise_stamps
+
+
+def _process_one_exposure(
+    i_local: int,
+    exp_start: int,
+    sim_mode: str,
+    config: _CpuPreparationConfig,
+) -> tuple:
+    """Load, detect, filter, and cut stamps for one exposure."""
+    exp_idx = exp_start + i_local
+    sim_dir = os.path.join(config.blended_dir, sim_mode)
+    fits_path = os.path.join(sim_dir, f"exp-i-{exp_idx:05d}.fits")
+    truth_path = os.path.join(sim_dir, f"truth-{exp_idx:05d}.fits")
+
+    t1 = time.perf_counter()
+    large_img, noise_sigma, truth_df, positions = load_blended_exposure(
+        fits_path, truth_path, config.cat_ref, config.pixel_scale,
+        config.noise_mode, config.noise_level,
+    )
+    t2 = time.perf_counter()
+    noise_canvas = np.random.default_rng(19491001 + exp_idx).normal(
+        0, noise_sigma, large_img.shape,
+    ).astype(np.float32)
+    noise_variance = noise_sigma ** 2 if noise_sigma > 0 else 1e-4
+    t3 = time.perf_counter()
+
+    if config.skip_detection:
+        det_cat = _build_truth_detection_catalog(truth_df, config.mag_cut)
+        stamps, noise_stamps = _cut_signal_and_noise_stamps(
+            large_img, noise_canvas, det_cat, config.stamp_size, False,
+        )
+        t4 = time.perf_counter()
+        timings = {
+            "load": t2 - t1, "noise_gen": t3 - t2, "build_task": 0.0,
+            "detect": 0.0, "weight_filter": 0.0, "cut": t4 - t3,
+            "n_before": len(truth_df), "n_after": len(det_cat),
+            "noise_sigma": noise_sigma, "test_mode": True,
+        }
+    else:
+        task = _build_task_from_fpfs_config(mag_zero=config.mag_zero, pixel_scale=config.pixel_scale)
+        cells = _build_cell_list(*large_img.shape, pixel_scale=config.pixel_scale)
+        t4 = time.perf_counter()
+        det_cat = run_detection_and_fpfs(
+            large_image=large_img, psf_image=config.psf_image, fpfs_config=FPFS_CONFIG,
+            mag_zero=config.mag_zero, pixel_scale=config.pixel_scale,
+            noise_variance=noise_variance, noise_array=noise_canvas, task=task, cells=cells,
+        )
+        t5 = time.perf_counter()
+        n_before = len(det_cat)
+        det_cat = det_cat[det_cat["fpfs_w"] >= WEIGHT_THRESHOLD]
+        n_after_w = len(det_cat)
+        img_ny, img_nx = large_img.shape
+        det_cat = det_cat[
+            (det_cat["y"] >= EDGE_MARGIN) & (det_cat["y"] < img_ny - EDGE_MARGIN)
+            & (det_cat["x"] >= EDGE_MARGIN) & (det_cat["x"] < img_nx - EDGE_MARGIN)
+        ]
+        # Crossmatch test: re-center stamps on the matched truth positions
+        # (same detection-selected sample & weights), isolating the stamp-
+        # centering effect from sample/selection effects.
+        if config.center_on_truth:
+            det_cat = _recenter_on_truth(det_cat, positions, config.match_threshold)
+        t6 = time.perf_counter()
+        stamps, noise_stamps = _cut_signal_and_noise_stamps(
+            large_img, noise_canvas, det_cat, config.stamp_size, config.parity_centering,
+        )
+        t7 = time.perf_counter()
+        timings = {
+            "load": t2 - t1, "noise_gen": t3 - t2, "build_task": t4 - t3,
+            "detect": t5 - t4, "weight_filter": t6 - t5, "cut": t7 - t6,
+            "n_before": n_before, "n_after": len(det_cat), "n_after_w": n_after_w,
+            "noise_sigma": noise_sigma, "test_mode": False,
+        }
+
+    return i_local, exp_idx, large_img, noise_sigma, truth_df, positions, det_cat, stamps, noise_stamps, timings
+
+
+def _prepare_cpu_chunk(
+    exp_start: int, exp_end: int, sim_mode: str, config: _CpuPreparationConfig,
+) -> dict:
+    """Prepare a chunk in parallel: load exposures, run FPFS, and cut stamps."""
+    chunk_n = exp_end - exp_start
+    started = time.time()
+    results = [None] * chunk_n
+    with ThreadPoolExecutor(max_workers=min(chunk_n, 32)) as executor:
+        futures = [executor.submit(_process_one_exposure, i, exp_start, sim_mode, config)
+                   for i in range(chunk_n)]
+        for future in as_completed(futures):
+            result = future.result()
+            results[result[0]] = result
+            _, exp_idx, _, noise_sigma, _, _, _, _, _, timings = result
+            if timings["test_mode"]:
+                mag_info = f"  mag_cut<{config.mag_cut}" if config.mag_cut is not None else "  (no mag cut)"
+                print(f"    [{sim_mode}] exp-{exp_idx:05d}: noise_sigma={noise_sigma:.4f}  "
+                      f"[TEST] truth objects: {timings['n_before']} → {timings['n_after']}{mag_info}")
+            else:
+                print(f"    [{sim_mode}] exp-{exp_idx:05d}: noise_sigma={noise_sigma:.4f}  "
+                      f"detections: {timings['n_before']} → {timings['n_after_w']} → {timings['n_after']} "
+                      f"(w<{WEIGHT_THRESHOLD}, edge<{EDGE_MARGIN}px)")
+
+    fields = list(zip(*results))
+    total_stamps = sum(len(stamps) for stamps in fields[7])
+    elapsed = time.time() - started
+    mode_tag = "[TEST]" if config.skip_detection else ""
+    print(f"  Chunk [{exp_start}:{exp_end}) {chunk_n} exposures, {total_stamps} stamps {mode_tag}  [{elapsed:.1f}s]")
+    return {
+        "exp_start": exp_start, "exp_end": exp_end, "chunk_n": chunk_n,
+        "t_cpu": elapsed, "total_stamps": total_stamps,
+        "all_large_images": list(fields[2]), "all_noise_sigmas": list(fields[3]),
+        "all_truth_dfs": list(fields[4]), "all_positions": list(fields[5]),
+        "all_det_cats": list(fields[6]), "all_stamps_list": list(fields[7]),
+        "all_noise_stamps_list": list(fields[8]),
+    }
+
+
 # ===========================================================================
 # Main pipeline
 # ===========================================================================
@@ -271,6 +490,8 @@ def run_detection_ml_pipeline(
     dtype: str = "float32",
     skip_detection: bool = False,
     mag_cut: float = None,
+    parity_centering: bool = False,
+    center_on_truth: bool = False,
 ):
     if sim_modes is None:
         sim_modes = list(SIM_MODE_MAP.keys())
@@ -319,6 +540,9 @@ def run_detection_ml_pipeline(
     print(f"[pipeline] Weight threshold: fpfs_w >= {WEIGHT_THRESHOLD}")
     print(f"[pipeline] Test mode: skip_detection={skip_detection}"
           + (f"  mag_cut={mag_cut}" if mag_cut is not None else "  (no magnitude cut)"))
+    print(f"[pipeline] Parity centering (detection only): {parity_centering}")
+    print(f"[pipeline] Center stamps on matched truth (crossmatch test): {center_on_truth}"
+          + (f"  (match_threshold={match_threshold} px)" if center_on_truth else ""))
 
     # ---- Timing accumulators ----
     is_cuda = (device == "cuda")
@@ -328,247 +552,21 @@ def run_detection_ml_pipeline(
     t_total_save = 0.0
     n_chunks_total = 0
 
-    # ---- Shared Task & block list cache (rebuilt per exposure) ----
-    # These are small to build, so we just recreate per exposure.
-
-    # ==================================================================
-    # CPU work for one chunk: load N exposures → noise → detect → cut
-    # ==================================================================
-
-    # Reusable dtype for fake detection catalog (test mode)
-    _FAKE_DET_DTYPE = np.dtype([
-        ("det_id", np.int32),
-        ("y", np.float64), ("x", np.float64),
-        ("fpfs_e1", np.float64), ("fpfs_e2", np.float64),
-        ("fpfs_R11", np.float64), ("fpfs_R22", np.float64),
-        ("fpfs_w", np.float64),
-        ("fpfs_dw_dg1", np.float64), ("fpfs_dw_dg2", np.float64),
-        ("fpfs_m00", np.float64),
-        ("fpfs_dm00_dg1", np.float64), ("fpfs_dm00_dg2", np.float64),
-    ])
-
-    def _chunk_cpu_work(cpu_args):
-        """Load + detect + cut stamps for one IO chunk of exposures."""
-        _exp_start = cpu_args["exp_start"]
-        _exp_end = cpu_args["exp_end"]
-        _sim_mode = cpu_args["sim_mode"]
-        _skip_detection = cpu_args.get("skip_detection", False)
-        _mag_cut = cpu_args.get("mag_cut", None)
-        _chunk_n = _exp_end - _exp_start
-
-        _t0 = time.time()
-
-        _all_large_images = [None] * _chunk_n
-        _all_noise_sigmas = [None] * _chunk_n
-        _all_truth_dfs = [None] * _chunk_n
-        _all_positions = [None] * _chunk_n
-        _all_det_cats = [None] * _chunk_n
-        _all_stamps_list = [None] * _chunk_n
-        _all_noise_stamps_list = [None] * _chunk_n
-
-        sim_dir = os.path.join(blended_dir, _sim_mode)
-
-        def _process_one_exposure(i_local):
-            """Load one exposure, detect, cut stamps.  Called in thread pool."""
-            exp_idx = _exp_start + i_local
-
-            fits_path = os.path.join(sim_dir, f"exp-i-{exp_idx:05d}.fits")
-            truth_path = os.path.join(sim_dir, f"truth-{exp_idx:05d}.fits")
-
-            # ---- Step 1: Load ----
-            t1 = time.perf_counter()
-            large_img, noise_sigma, truth_df, positions = load_blended_exposure(
-                fits_path=fits_path,
-                truth_path=truth_path,
-                cat_ref=cat_ref,
-                pixel_scale=pixel_scale,
-                noise_mode=noise_mode,
-                fixed_noise=noise_level,
-            )
-            t2 = time.perf_counter()
-
-            # ---- Step 2: Generate renoise canvas ----
-            rng = np.random.default_rng(20020620 + exp_idx)
-            noise_canvas = rng.normal(0, noise_sigma, large_img.shape).astype(np.float32)
-            noise_variance = noise_sigma ** 2 if noise_sigma > 0 else 1e-4
-            t3 = time.perf_counter()
-
-            if _skip_detection:
-                # =====================================================
-                # TEST MODE: use truth positions directly as detections
-                # =====================================================
-                t4 = t5 = t6 = t3  # skipped steps
-
-                # Filter by magnitude if requested
-                if _mag_cut is not None and "i_ab" in truth_df.columns:
-                    mag_mask = truth_df["i_ab"].to_numpy(dtype=float) < _mag_cut
-                    filtered_df = truth_df.loc[mag_mask].reset_index(drop=True)
-                else:
-                    filtered_df = truth_df
-
-                n_truth = len(truth_df)
-                n_after = len(filtered_df)
-                n_before = n_truth
-
-                # Build fake detection catalog from truth positions
-                det_cat = np.empty(n_after, dtype=_FAKE_DET_DTYPE)
-                det_cat["det_id"] = np.arange(n_after, dtype=np.int32)
-                det_cat["y"] = filtered_df["y"].to_numpy(dtype=np.float64)
-                det_cat["x"] = filtered_df["x"].to_numpy(dtype=np.float64)
-                # FPFS fields: shape/e1/e2/R are irrelevant (no detection),
-                # but w=1 + dw/dg=0 ensures calibration compatibility:
-                #   signal = w*e = e  (raw ML shape)
-                #   response = w*R + dw/dg*e = R  (raw ML response)
-                for _col in ["fpfs_e1", "fpfs_e2", "fpfs_R11", "fpfs_R22",
-                             "fpfs_dw_dg1", "fpfs_dw_dg2",
-                             "fpfs_m00", "fpfs_dm00_dg1", "fpfs_dm00_dg2"]:
-                    det_cat[_col] = 0.0
-                det_cat["fpfs_w"] = 1.0
-
-                # ---- Cut stamps ----
-                if n_after > 0:
-                    stamps, offsets = cut_stamps_from_large(
-                        large_img, det_cat, stamp_size=stamp_size,
-                    )
-                    noise_stamps, _ = cut_stamps_from_large(
-                        noise_canvas, det_cat, stamp_size=stamp_size,
-                    )
-                else:
-                    stamps = np.empty((0, stamp_size, stamp_size), dtype=np.float64)
-                    noise_stamps = np.empty((0, stamp_size, stamp_size), dtype=np.float64)
-                t7 = time.perf_counter()
-
-                timings = {
-                    "load": t2 - t1, "noise_gen": t3 - t2,
-                    "build_task": 0.0, "detect": 0.0,
-                    "weight_filter": 0.0, "cut": t7 - t6,
-                    "n_before": n_before, "n_after": n_after,
-                    "noise_sigma": noise_sigma,
-                    "test_mode": True,
-                }
-
-                return i_local, exp_idx, large_img, noise_sigma, truth_df, positions, \
-                    det_cat, stamps, noise_stamps, timings
-
-            # =========================================================
-            # NORMAL MODE: FPFS detection pipeline
-            # =========================================================
-
-            # ---- Step 3: Build task & blocks ----
-            task = _build_task_from_fpfs_config(
-                fpfs_config=FPFS_CONFIG,
-                mag_zero=mag_zero,
-                pixel_scale=pixel_scale,
-                stamp_size=stamp_size,
-                sigma_arcsec=0.40,
-            )
-            blocks = _build_block_list(
-                img_height=large_img.shape[0],
-                img_width=large_img.shape[1],
-                pixel_scale=pixel_scale,
-                psf_array=psf_image,
-                stamp_size=stamp_size,
-            )
-            t4 = time.perf_counter()
-
-            # ---- Step 4: FPFS detection ----
-            det_cat = run_fpfs_detection(
-                large_image=large_img,
-                psf_image=psf_image,
-                fpfs_config=FPFS_CONFIG,
-                mag_zero=mag_zero,
-                pixel_scale=pixel_scale,
-                noise_variance=noise_variance,
-                noise_array=noise_canvas,
-                task=task,
-                blocks=blocks,
-            )
-            t5 = time.perf_counter()
-
-            # ---- Step 5: Weight filtering ----
-            n_before = len(det_cat)
-            if n_before > 0:
-                keep = det_cat["fpfs_w"] >= WEIGHT_THRESHOLD
-                det_cat = det_cat[keep]
-                n_after = len(det_cat)
-            else:
-                n_after = 0
-            t6 = time.perf_counter()
-
-            # ---- Step 6: Cut stamps ----
-            if n_after > 0:
-                stamps, offsets = cut_stamps_from_large(
-                    large_img, det_cat, stamp_size=stamp_size,
-                )
-                noise_stamps, _ = cut_stamps_from_large(
-                    noise_canvas, det_cat, stamp_size=stamp_size,
-                )
-            else:
-                stamps = np.empty((0, stamp_size, stamp_size), dtype=np.float64)
-                noise_stamps = np.empty((0, stamp_size, stamp_size), dtype=np.float64)
-            t7 = time.perf_counter()
-
-            timings = {
-                "load": t2 - t1, "noise_gen": t3 - t2,
-                "build_task": t4 - t3, "detect": t5 - t4,
-                "weight_filter": t6 - t5, "cut": t7 - t6,
-                "n_before": n_before, "n_after": n_after,
-                "noise_sigma": noise_sigma,
-                "test_mode": False,
-            }
-
-            return i_local, exp_idx, large_img, noise_sigma, truth_df, positions, \
-                det_cat, stamps, noise_stamps, timings
-
-        # ---- Run in thread pool ----
-        with ThreadPoolExecutor(max_workers=min(_chunk_n, 32)) as ex:
-            futures = {
-                ex.submit(_process_one_exposure, i): i
-                for i in range(_chunk_n)
-            }
-            for future in as_completed(futures):
-                (i_local, exp_idx, large_img, noise_sigma, truth_df, positions,
-                 det_cat, stamps, noise_stamps, timings) = future.result()
-                _all_large_images[i_local] = large_img
-                _all_noise_sigmas[i_local] = noise_sigma
-                _all_truth_dfs[i_local] = truth_df
-                _all_positions[i_local] = positions
-                _all_det_cats[i_local] = det_cat
-                _all_stamps_list[i_local] = stamps
-                _all_noise_stamps_list[i_local] = noise_stamps
-                n_before = timings["n_before"]
-                n_after = timings["n_after"]
-                if timings.get("test_mode"):
-                    _mag_info = f"  mag_cut<{_mag_cut}" if _mag_cut is not None else "  (no mag cut)"
-                    print(f"    [{_sim_mode}] exp-{exp_idx:05d}: "
-                          f"noise_sigma={noise_sigma:.4f}  "
-                          f"[TEST] truth objects: {n_before} → {n_after}{_mag_info}")
-                else:
-                    print(f"    [{_sim_mode}] exp-{exp_idx:05d}: "
-                          f"noise_sigma={noise_sigma:.4f}  "
-                          f"detections: {n_before} → {n_after} (filter w<{WEIGHT_THRESHOLD})")
-
-        _total_stamps = sum(len(s) for s in _all_stamps_list if s is not None)
-        _t_cpu = time.time() - _t0
-
-        _mode_tag = "[TEST]" if _skip_detection else ""
-        print(f"  Chunk [{_exp_start}:{_exp_end}) {_chunk_n} exposures, "
-              f"{_total_stamps} stamps {_mode_tag}  [{_t_cpu:.1f}s]")
-
-        return {
-            "exp_start": _exp_start,
-            "exp_end": _exp_end,
-            "chunk_n": _chunk_n,
-            "t_cpu": _t_cpu,
-            "total_stamps": _total_stamps,
-            "all_large_images": _all_large_images,
-            "all_noise_sigmas": _all_noise_sigmas,
-            "all_truth_dfs": _all_truth_dfs,
-            "all_positions": _all_positions,
-            "all_det_cats": _all_det_cats,
-            "all_stamps_list": _all_stamps_list,
-            "all_noise_stamps_list": _all_noise_stamps_list,
-        }
+    cpu_config = _CpuPreparationConfig(
+        blended_dir=blended_dir,
+        cat_ref=cat_ref,
+        psf_image=psf_image,
+        noise_mode=noise_mode,
+        noise_level=noise_level,
+        mag_zero=mag_zero,
+        pixel_scale=pixel_scale,
+        stamp_size=stamp_size,
+        skip_detection=skip_detection,
+        mag_cut=mag_cut,
+        parity_centering=parity_centering,
+        center_on_truth=center_on_truth,
+        match_threshold=match_threshold,
+    )
 
     # ==================================================================
     # Pipeline loop: for each sim_mode, process exposure chunks
@@ -597,13 +595,9 @@ def run_detection_ml_pipeline(
                     cpu_data = cpu_future.result()
                     cpu_future = None
                 else:
-                    cpu_data = _chunk_cpu_work({
-                        "exp_start": exp_start,
-                        "exp_end": exp_end,
-                        "sim_mode": sim_mode,
-                        "skip_detection": skip_detection,
-                        "mag_cut": mag_cut,
-                    })
+                    cpu_data = _prepare_cpu_chunk(
+                        exp_start, exp_end, sim_mode, cpu_config,
+                    )
 
                 t_cpu = cpu_data["t_cpu"]
                 total_stamps = cpu_data["total_stamps"]
@@ -619,13 +613,9 @@ def run_detection_ml_pipeline(
                 if i_chunk + 1 < len(exp_indices):
                     _next_start = exp_indices[i_chunk + 1]
                     _next_end = min(_next_start + io_chunk_size, exp_range[1])
-                    cpu_future = prefetch_exec.submit(_chunk_cpu_work, {
-                        "exp_start": _next_start,
-                        "exp_end": _next_end,
-                        "sim_mode": sim_mode,
-                        "skip_detection": skip_detection,
-                        "mag_cut": mag_cut,
-                    })
+                    cpu_future = prefetch_exec.submit(
+                        _prepare_cpu_chunk, _next_start, _next_end, sim_mode, cpu_config,
+                    )
 
                 # --------------------------------------------------
                 # Step C: Big-batch ML inference on GPU
@@ -817,6 +807,19 @@ if __name__ == "__main__":
                    help="Skip NPZ output")
     p.add_argument("--skip_detection", action="store_true",
                    help="Skip FPFS detection; use truth positions directly as cutout centers")
+    p.add_argument("--parity_centering", action="store_true",
+                   help="Place odd-parity detection peaks at stamp pixel 31 "
+                        "(even at 32) to restore symmetry around the geometric "
+                        "centre for even-sized stamps. Detection mode only; "
+                        "ignored with --skip_detection.")
+    p.add_argument("--center_on_truth", action="store_true",
+                   help="Crossmatch detections to the truth catalog and cut "
+                        "postage stamps centered on the matched TRUTH positions "
+                        "instead of the detection positions. Keeps the same "
+                        "detection-selected sample and weights -- isolates the "
+                        "stamp-centering effect from sample/selection effects. "
+                        "Detection mode only; ignored with --skip_detection. "
+                        "Use a distinct --fname (e.g. det_ml_ct) for the output.")
     p.add_argument("--mag_cut", type=float, default=None,
                    help="When --skip_detection is set, only use truth objects with i_ab < mag_cut "
                         "(e.g. 24.5). Has no effect in normal detection mode.")
@@ -842,6 +845,8 @@ if __name__ == "__main__":
         save_csv=not args.no_csv,
         skip_detection=args.skip_detection,
         mag_cut=args.mag_cut,
+        parity_centering=args.parity_centering,
+        center_on_truth=args.center_on_truth,
     )
 
     print(f"[main] Total time: {time.time() - start_time:.1f}s "
