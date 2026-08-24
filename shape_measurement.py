@@ -11,17 +11,26 @@ from src.architecture.forward8_CNN import Forward8_fixW_CNN, SmoothCNN_GeLU_mock
 import argparse, os, random,re
 import time
 
+# =====================================================================
+# Configuration (adjust for your own environment)
+# =====================================================================
+# Path to the pretrained model checkpoint. Pick one that exists in ./models/,
+# e.g. './models/forward8_CNN_nada_50ep.pth' or './models/F8_fpfs_l5c32r01_50ep.pth'.
+model_path = './models/forward8_CNN_nada_50ep.pth'
+
+# Directory containing the simulated datasets (produced by build_dataset).
+# Replace this with the path to your own simulated cutouts.
+dir = ''
+
+# Output directory where shape-measurement results are saved.
+save_base = ''
 
 device = ("cuda" if torch.cuda.is_available() else "cpu")
-#model_path = './models/forward8_CNN_nada_50ep.pth'
-model_path = './models/F8simp_TBigUni_l5c32r0_20ep.pth'
-#model = Forward8_fixW_CNN(num_layers = 5, base_channels = 32, res_factor=0.1).to(device)
-model = Forward8_simp_CNN(num_layers = 5, base_channels = 32, res_factor=0).to(device)
+# model = Forward8_fixW_CNN(num_layers = 5, base_channels = 32, res_factor=0.1).to(device)
+model = Forward8_fixW_CNN(num_layers = 5, base_channels = 32, res_factor=0.1).to(device)
 
 model.load_state_dict(torch.load(model_path, map_location="cpu"))
 _ = model.eval()
-#dir = '/work/nvme/bfmo/wenyinli/datasets/xlens_pe005'
-dir = '/work/nvme/bfmo/wenyinli/datasets/xlens_shift'
 
 shear_tasks = [
             (0, "g1"),
@@ -83,11 +92,12 @@ def loop_shape_measurement(
                 q_imgs = q_imgs.astype(np.float64)
             
             shapes, R_ana = calibrator.shape_measure(q_imgs,batch_size=800)
-            save_name = f'/projects/bfmo/wenyinli/datasets/xlens_sims/{folder_name}/{shear_comp}_{shear_mode}/'
+            # Output directory — replace with your own path or pass --save_base
+            save_name = os.path.join(save_base, folder_name, f'{shear_comp}_{shear_mode}')
             if not os.path.exists(save_name):
                 os.makedirs(save_name)
-            np.save(save_name + f'{fname}_shapes_{start}.npy', shapes)
-            np.save(save_name + f'{fname}_Rana_{start}.npy', R_ana)
+            np.save(os.path.join(save_name, f'{fname}_shapes_{start}.npy'), shapes)
+            np.save(os.path.join(save_name, f'{fname}_Rana_{start}.npy'), R_ana)
             del all_cutouts, all_psfs, all_cats, noises, q_imgs, shapes, R_ana
 
 

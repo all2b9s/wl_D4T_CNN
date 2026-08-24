@@ -159,7 +159,7 @@ class R180Inv_Conv2d(nn.Module):
         self.act = nn.GELU()
 
     @staticmethod
-    def _rot180(W):  
+    def _rot180(W):  # 180-degree rotation = flip up-down + left-right
         return torch.flip(W, dims=(-2, -1))
 
     def forward(self, x):
@@ -344,6 +344,10 @@ class ConvGELU_layernorm(nn.Module):
 
 
 class BiasFreeMLP(nn.Module):
+    """
+    Bias-free MLP head (3 hidden layers + Tanh) used to predict a single
+    shape component from a pooled feature vector.
+    """
     def __init__(self, in_dim: int, hidden: int = 128, activation: Literal['tanh', 'relu'] = 'tanh'):
         super().__init__()
         self.net = nn.Sequential(
@@ -361,6 +365,9 @@ class BiasFreeMLP(nn.Module):
         return self.net(x)
     
 class BiasFreeMLP_2l(nn.Module):
+    """
+    Bias-free 2-layer MLP head (Tanh) used to predict a single shape component.
+    """
     def __init__(self, in_dim: int, hidden: int = 128):
         super().__init__()
         self.net = nn.Sequential(
@@ -482,25 +489,25 @@ class OddMultiheadAttnPool(nn.Module):
 
     def forward( 
         self,
-        x: torch.Tensor,                        # [B,C,H,W] 
-        mask: torch.Tensor | None = None,       # [B,1,H,W] or [B,H,W]，
-        K_even_src: torch.Tensor | None = None, # [B,C,H,W]
+        x: torch.Tensor,                        # [B,C,H,W] -- used for Value (odd)
+        mask: torch.Tensor | None = None,       # [B,1,H,W] or [B,H,W], optional
+        K_even_src: torch.Tensor | None = None, # [B,C,H,W], external even features (e.g. 8-rotation averaged)
     ) -> torch.Tensor:
         B, C, H, W = x.shape
         N = H * W
 
         # --- tokens & query ---
-        V_odd  = x.view(B, C, N).permute(0, 2, 1).contiguous()   # [B,N,C]
+        V_odd  = x.view(B, C, N).permute(0, 2, 1).contiguous()   # [B,N,C] (odd)
         Q      = self.q.expand(B, 1, C)                          # [B,1,C]
 
-        
+        # --- source of the "even part" of the Key ---
         if K_even_src is None:
-            K_even_map = x**2                                  
+            K_even_map = x**2                                    # conventional approach: guarantees evenness in sign
         else:
-            K_even_map = K_even_src                              
+            K_even_map = K_even_src                              # your 8-rotation averaged features
         K_even = K_even_map.view(B, C, N).permute(0, 2, 1).contiguous()  # [B,N,C]
 
-        
+        # --- log-bias for continuous mask (optional) ---
         attn_mask = None
         if mask is not None:
             if mask.ndim == 3:
@@ -512,75 +519,3 @@ class OddMultiheadAttnPool(nn.Module):
         out, _ = self.mha(Q, K_even, V_odd, attn_mask=attn_mask, need_weights=False)  # [B,1,C]
         return out.squeeze(1)  # [B,C]
 
-class SingleQueryAttn_NoEmbed(nn.Module):
-    def __init__(self, C, num_heads=4, mask_zeros=True):
-        super().__init__()
-        self.mha = nn.MultiheadAttention(embed_dim=C, num_heads=num_heads, batch_first=True)
-        self.q = nn.Parameter(torch.randn(1, 1, C))
-        self.mask_zeros = mask_zeros
-
-    def forward(self, x):
-        # x: [B', C, H, W]
-        Bp, C, H, W = x.shape
-        N = H * W
-        tokens = x.view(Bp, C, N).permute(0, 2, 1).contiguous()  # [B', N, C]
-        Q = self.q.expand(Bp, -1, -1)                            # [B', 1, C]
-
-        key_padding_mask = None
-        if self.mask_zeros:
-            with torch.no_grad():
-                key_padding_mask = (x.abs().sum(dim=1) == 0).view(Bp, -1)  # [B', N]
-
-        out, _ = self.mha(Q, tokens, tokens, key_padding_mask=key_padding_mask, need_weights=False)
-        return out.squeeze(1)  # [B', C]
-
-def hann_window(H, W, margin, device, dtype):
-    if margin <= 0:
-        return torch.ones(1, 1, H, W, device=device, dtype=dtype)
-
-    def ramp(n):
-        v = torch.ones(n, device=device, dtype=dtype)
-        m = int(margin)
-        if m > 0:
-            t = torch.linspace(0, 1, m+1, device=device, dtype=dtype)
-            c = 0.5*(1 - torch.cos(torch.pi*t))
-            v[:m+1] = c
-            v[-(m+1):] = c.flip(0)
-        return v
-    wx = ramp(W); wy = ramp(H)
-    win = wy.view(H,1) * wx.view(1,W)
-    return win.view(1,1,H,W)
-
-def asinh_norm_torch(data: torch.Tensor, vmin=0, vmax=1, a: float = 0.1):
-    """
-    Apply asinh normalization similar to Astropy's AsinhStretch.
-
-    Args:
-        data:  torch.Tensor [H, W] or [B, C, H, W]
-        vmin, vmax: optional bounds; if None, use 1–99 percentile
-        a:     softening parameter for asinh stretch (default=0.1)
-    Returns:
-        normed: same shape tensor normalized to [0, 1]
-    """
-
-    # 1. remove NaN/Inf
-    finite_mask = torch.isfinite(data)
-    if not finite_mask.any():
-        return torch.zeros_like(data)
-
-    finite_data = data[finite_mask]
-
-    # 2. compute percentiles if not given
-    if vmin is None or vmax is None:
-        vmin_p, vmax_p = torch.quantile(finite_data, torch.tensor([0.01, 0.99], device=data.device))
-        vmin = float(vmin_p) if vmin is None else vmin
-        vmax = float(vmax_p) if vmax is None else vmax
-
-    # 3. scale to [0, 1]
-    scaled = (data - vmin) / (vmax - vmin + 1e-12)
-    #scaled = scaled.clamp(0, 1)
-
-    # 4. apply asinh stretch
-    stretched = torch.asinh(scaled / a) / torch.asinh(torch.tensor(1.0 / a, device=data.device))
-
-    return stretched

@@ -304,13 +304,6 @@ simulator = xlen_simulator('/work/hdd/bdsp/wenyinli/datasets/xlens_gauss_distrib
                             psf_e=psf_e,
                             has_shift=True, ori_seed=666)
 simulator(200_000)
-'''simulator = xlen_simulator('/work/nvme/bfmo/wenyinli/datasets/xlens_sims_test_px0.1/', 
-                            num_workers=64, mode='training',
-                            rotId=0, init_id=0,
-                            psf_e=0,
-                            pixel_scale=0.1,
-                            image_size=1100,
-                            has_shift=False, around_corner = True, ori_seed=999)
-simulator(10_000)'''
+
 
 

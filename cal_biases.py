@@ -9,9 +9,19 @@ from src.anacal.batch_calibration import get_biases
 import argparse, os, random, re
 import time
 
+# =====================================================================
+# Configuration (adjust for your own environment)
+# =====================================================================
+# Directory containing the shape-measurement results produced by
+# shape_measurement.py (i.e. the simulated xlens datasets).
+dir = ''
 
-dir = '/work/nvme/bfmo/wenyinli/datasets/xlens_shift'
-#dir = '/work/hdd/bdsp/wenyinli/datasets/xlens_fixed'
+# Root of the saved shape/Rana results
+data_dir = ''
+
+# Directory where the final calibration results are saved.
+cali_save_dir = ''
+
 
 def parse_shear_tasks(task_list):
     """Parse shear tasks like ['0_g1', '1_g2'] → [(0, 'g1'), (1, 'g2')]"""
@@ -50,7 +60,7 @@ def parse_info(fname, folder, cal_result):
     
     # ==== parse psf_fwhm ====
     # fname = "p85_f8_2e7_m253"
-    # 取 p85 -> 8.5 / 10 = 0.85
+    # take p85 -> 8.5 / 10 = 0.85
     psf_match = re.search(r"p(\d+)", fname)
     psf_fwhm = float(psf_match.group(1)) / 100.0 if psf_match else None
 
@@ -72,6 +82,14 @@ def get_calibration_biases(
         mag_cut = None,
         flux_name = 'fpfs_flux',
         ):
+    """
+    Estimate the multiplicative (m) and additive (c) calibration biases by
+    combining the +g/-g shape measurements with the shear response R.
+
+    Reads the per-galaxy shapes (g_all) and responses (R_all) that were saved
+    by shape_measurement.py, applies an optional magnitude selection cut
+    (selection_response), and runs a bootstrap to estimate the biases.
+    """
     zero_point = 30.0
     img_nB = img_nB_range[1]-img_nB_range[0]
     Nimg = imgBs*(img_nB_range[1]-img_nB_range[0])*grid_per_img
@@ -88,7 +106,7 @@ def get_calibration_biases(
                 (1, "g2"),
                 (0, "g2"),
             ]
-    dir_gr = f'/projects/bfmo/wenyinli/datasets/xlens_sims/{folder_name}/'
+    dir_gr = os.path.join(data_dir, folder_name, '')
     
     for i, (shear_mode, shear_comp) in enumerate(shear_tasks):
         if not os.path.isfile(f'{dir_gr}{shear_comp}_{shear_mode}/{fname}_shapes_{img_nB_range[1]-1}.npy'):
@@ -138,11 +156,12 @@ def get_calibration_biases(
     
     print(parse_info(fname, folder_name, cal_result))
 
-    save_name = f'/work/hdd/bfmo/wenyinli/datasets/xlens_cali_results/{folder_name}/'
+    # Save directory for final calibration results (replace with your own path)
+    save_name = os.path.join(cali_save_dir, folder_name)
     if not os.path.exists(save_name):
         os.makedirs(save_name)
-    np.save(save_name+f'{fname}_g_all.npy', g_all)
-    np.save(save_name+f'{fname}_R_all.npy', R_all)
+    np.save(os.path.join(save_name, f'{fname}_g_all.npy'), g_all)
+    np.save(os.path.join(save_name, f'{fname}_R_all.npy'), R_all)
     #all_cats.to_csv(save_name+f'{fname}_cats_all.csv')
     with open("./logs/calibration_result.csv","a") as f:
         if mag_cut is not None:

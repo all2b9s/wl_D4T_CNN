@@ -40,9 +40,7 @@ def flip_spin2(y):
 
 def rotate_spin2(y: torch.Tensor, k: int, inverse = True):
     """
-    y: [B, 2]  (e1,e2) or (g1,g2)
-    Rotation angle theta = k * 90°; spin-2 requires rotation by 2*theta.
-    inverse=True means rotating the output back to the original coordinate system (use -2*theta)
+    Rotate spin-2 quantities by k * 90°.
     """
     if k == 0:
         return y

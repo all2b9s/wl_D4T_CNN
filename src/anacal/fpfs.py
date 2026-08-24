@@ -138,7 +138,28 @@ def fpfs_measure(
     fname = 'fpfs',
     if_return = False,
     do_detection = False,
+    save_dir = None,        # output directory (override the hard-coded default below)
 ):
+    """
+    Batch FPFS shape & flux measurement (the baseline estimator compared in the paper).
+
+    Args:
+        dir          : directory holding the simulated cutouts (see build_dataset).
+        imgBs        : number of galaxies per .npy batch.
+        img_nB_range : [start, stop) batch indices to process.
+        noise_level  : Gaussian noise sigma in ADU ('adaptive' -> per-galaxy noise).
+        n_workers    : multiprocessing pool size.
+        mag_zero     : magnitude zero point.
+        center       : (y, x) detection position within each cutout.
+        pixel_scale  : arcsec per pixel.
+        shear_task   : (shear_mode, shear_comp) tuple, e.g. (2, 'g1').
+        fname        : output filename prefix.
+        save_dir     : output directory. Defaults to a hard-coded cluster path
+                       (see below) — override it for your own environment.
+
+    Saves per batch: {fname}_e_fpfs.npy (shapes), {fname}_R_fpfs.npy (responses),
+    {fname}_m00.npy (flux) and {fname}_Rm00.npy (flux responses).
+    """
     print(f"Measuring shape and magnitude with FPFS for {str(dir)}, under noise_level={noise_level}")
     nBs = img_nB_range[1] - img_nB_range[0]
     shear_mode, shear_comp = shear_task

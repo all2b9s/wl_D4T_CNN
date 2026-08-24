@@ -153,7 +153,7 @@ def _bs_worker(bs_ind):
     return (m / shear - 1.0, c)         # normalize m here to reduce post work
 
 def _bootstrap(N, bs_size, rng=None, dtype=np.int32):
-    """Draw one bootstrap sample; wrapped as a helper for reuse."""
+    """Single bootstrap sampling, wrapped as a function for easy reuse."""
     if rng is None:
         rng = np.random.default_rng()
     return rng.integers(0, N, size=bs_size, dtype=dtype)
@@ -181,8 +181,8 @@ def get_biases(
     n_factor=1.0,
     is_twin=False,
     n_jobs=4,
-    chunk_bs=10,         
-    base_seed=12345,     
+    chunk_bs=10,          # how many bootstrap samples per chunk, tunable
+    base_seed=12345,     # set for reproducibility
 ):
     """
     shapes: (N, 4, 2) numpy array 
@@ -206,6 +206,7 @@ def get_biases(
     if n_jobs is None:
         n_jobs = os.cpu_count() or 1
 
+    # full-sample estimate (no bootstrap)
     m_mean, c_mean = _calibration(shapes, Rs, mask=mask)
     m_mean = m_mean / shear_value - 1.0
 
@@ -270,6 +271,7 @@ def get_biases(
                         inds = np.concatenate([inds, inds + N_eff])
                     bs_inds.append(inds)
 
+                # run this small batch in parallel
                 results = list(ex.map(_bs_worker, bs_inds))
 
                 m_list.extend(r[0] for r in results)

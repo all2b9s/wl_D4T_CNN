@@ -11,7 +11,7 @@ import torchvision.transforms as T
 from torchvision.models.resnet import resnet18, ResNet18_Weights
 
 from src.architecture.CNN_toolkit import D4_eq_weight, center_crop_to, gaussian_weight_2d
-from src.architecture.CNN_module import  ConvGELU, BiasFreeMLP, BiasFreeMLP_2l, ConvGELU_Res, ConvReLU_Res, ConvGELU_layernorm, SingleQueryAttn_NoEmbed, OddMultiheadAttnPool
+from src.architecture.CNN_module import  ConvGELU, BiasFreeMLP, BiasFreeMLP_2l, ConvGELU_Res, ConvGELU_layernorm, OddMultiheadAttnPool
 
 # ----------------------------
 # Basic modules:

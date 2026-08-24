@@ -5,60 +5,7 @@ import matplotlib.pyplot as plt
 from typing import Tuple
 import torch.nn.functional as F
 from torch import nn
-import pandas as pd
 
-# Testing plotting and data loading
-
-def load_test_item(
-    images_path: str = "images.npy",
-    csv_path: str = "gt_info.csv",
-    index_range: list = None,   # e.g. [0, 10]
-    target: str = "e",          # "e" -> (e1, e2), "g" -> (g1, g2)
-    normalize: str = "none"     # or "per_image"
-):
-    if index_range is None or len(index_range) != 2:
-        raise ValueError("index_range must be a list like [start, end].")
-
-    # Load CSV and select test subset
-    df = pd.read_csv(csv_path)
-    df_test = df[df["split"] == "test"].sort_values("id").reset_index(drop=True)
-
-    idx_min, idx_max = index_range
-    if idx_min < 0 or idx_max > len(df_test):
-        raise IndexError("index_range is out of bounds for test dataset.")
-
-    # Load all images (mmap for memory efficiency)
-    imgs = np.load(images_path, mmap_mode="r")
-
-    img_list, y_list = [], []
-
-    for index in range(idx_min, idx_max):
-        row = df_test.iloc[index]
-        img_id = int(row["id"])
-
-        # read image
-        img = imgs[img_id].astype(np.float64, copy=True)
-
-        # normalization
-        if normalize == "per_image":
-            m, s = img.mean(), img.std()
-            img = (img - m) / s if s > 0 else (img - m)
-
-        # target
-        if target == "e":
-            y = np.array([row["e1"], row["e2"]], dtype=np.float64)
-        elif target == "g":
-            y = np.array([row["g1"], row["g2"]], dtype=np.float64)
-        else:
-            raise ValueError("target must be 'e' or 'g'")
-
-        img_list.append(img)
-        y_list.append(y)
-
-    imgs_out = np.stack(img_list)   # shape [N, H, W]
-    ys_out = np.stack(y_list)       # shape [N, 2]
-
-    return imgs_out, ys_out
 
 def plot_shape_bidirectional(
     img: np.ndarray,                 # [H, W]
@@ -68,12 +15,12 @@ def plot_shape_bidirectional(
     fixed_length: bool = False,      # True: ignore |e| and use fixed length (direction only)
     percent_clip: float = 99.5,      # contrast clipping percentile
     title = None,
-    fig_ax = None,     # pass (fig, ax) or create one automatically
+    fig_ax = None,     # optional (fig, ax); auto-created if not given
 ):
     """
-    - Treat (e1, e2) as a spin-2 shape: principal-axis angle φ = 0.5 * atan2(e2, e1) (π-periodic)
-    - Draw one arrow in each of the ±φ directions from the image center
-    - If y_pred is provided: blue=pred, orange=gt; with only y_gt, only gt is drawn
+    - Treat (e1,e2) as a spin-2 shape: principal-axis angle phi = 0.5 * atan2(e2, e1) (pi-periodic)
+    - Draw one arrow along each +/-phi direction at the image center
+    - If y_pred is provided: blue = pred, orange = gt; if only y_gt is given, draw gt only
     """
     assert img.ndim == 2, "img should be [H, W]"
     H, W = img.shape
@@ -206,7 +153,7 @@ def shape_pixel_gradients(
 
     B, H, W = x.shape
 
-    # ---- 2) Normalize (before requires_grad) ----
+    # ---- 2) normalization (in-place, before requires_grad) ----
     if normalize == "per_image":
         m = x.mean(dim=(-1, -2), keepdim=True)
         s = x.std(dim=(-1, -2), keepdim=True).clamp_min(eps)
@@ -230,6 +177,7 @@ def shape_pixel_gradients(
             pred = model(x)[:, :2]          # [B,2]
 
             # e1 gradient
+            # e1 gradient
             go1 = torch.zeros_like(pred)
             go1[:, 0] = 1.0
             (gx1,) = torch.autograd.grad(
@@ -237,6 +185,7 @@ def shape_pixel_gradients(
                 retain_graph=True, create_graph=False, allow_unused=False
             )
 
+            # e2 gradient
             # e2 gradient
             go2 = torch.zeros_like(pred)
             go2[:, 1] = 1.0
@@ -315,29 +264,6 @@ def shape_pixel_gradients(
             pass
 
     return pred_np, grad_e1_np, grad_e2_np
-
-def draw_grad(model, img):
-    pred, grad_e1, grad_e2 = shape_pixel_gradients(model, img, normalize="none")
-
-    print("pred (e1,e2):", pred)
-    fig, axs = plt.subplots(1, 3, figsize=(10, 3))
-    im0 = axs[0].imshow(img, cmap="gray", origin="lower")
-    axs[0].set_title("input")
-    im1 = axs[1].imshow(grad_e1[0][0], cmap="bwr", origin="lower", vmax = np.abs(grad_e1).max(), vmin = -np.abs(grad_e1).max())
-    axs[1].set_title(r"$\partial e_1/\partial I$")
-    im2 = axs[2].imshow(grad_e2[0][0], cmap="bwr", origin="lower", vmax = np.abs(grad_e2).max(), vmin = -np.abs(grad_e2).max())
-    axs[2].set_title(r"$\partial e_2/\partial I$")
-
-    fig.colorbar(im0, ax=axs[0])
-    fig.colorbar(im1, ax=axs[1])
-    fig.colorbar(im2, ax=axs[2])
-
-    for ax in axs:
-        ax.set_xticks([])
-        ax.set_yticks([])
-    plt.tight_layout()
-    plt.show()
-    return pred, grad_e1, grad_e2
 
 # --------------------------
 # Utils: geometry & sizing
