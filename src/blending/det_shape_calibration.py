@@ -545,8 +545,17 @@ def get_det_calibration_biases(
                 if len(m00_concat[i]) == 0:
                     continue
                 try:
+                    # Selection response uses the raw FPFS monopole moment m00
+                    # as the flux proxy (m00_to_flux would only add a constant
+                    # magnitude zero-point shift and move the effective cut
+                    # away from mag_cut).  flux is clamped to a tiny positive
+                    # value so log10 cannot NaN for non-positive m00 -- those
+                    # galaxies then fail every mag<cut mask, i.e. only flux>0
+                    # galaxies enter the selection.  R_flux (=dm00) is passed
+                    # UNCLAMPED so the sign of the flux response is preserved.
                     r = selection_response(
-                        flux=m00_concat[i], R_flux=dm00_concat[i],
+                        flux=np.maximum(m00_concat[i]*2*np.pi*0.45**2, 1e-30),
+                        R_flux=dm00_concat[i]*2*np.pi*0.45**2,
                         shapes=g_concat[i], zero_point=30.0, mag_cut=mag_cut)
                     if np.all(np.isfinite(r)):
                         R_sel_sum += r; n_valid += 1
@@ -562,7 +571,11 @@ def get_det_calibration_biases(
                     continue
                 R_concat[i][:, 0, 0] += R_sel[0]
                 R_concat[i][:, 1, 1] += R_sel[1]
-                mag_i = 30.0 - 2.5 * np.log10(np.maximum(m00_concat[i], 1e-30))
+                # Same flux convention as the selection response above:
+                # magnitude from the raw m00 (clamped positive for log10), so
+                # the mag<mag_cut mask is consistent with the selection
+                # response and the cut lands at the intended AB magnitude.
+                mag_i = 30.0 - 2.5 * np.log10(np.maximum(m00_concat[i]*2*np.pi*0.45**2, 1e-30))
                 mask_list.append(mag_i < mag_cut)
                 n_pass_i = np.sum(mask_list[-1])
                 print(f"  cond {i}: {n_pass_i}/{len(mag_i)} pass mag<{mag_cut}")

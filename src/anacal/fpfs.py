@@ -226,8 +226,11 @@ def fpfs_measure(
         results_arr = np.array(results)           # (n_gal, 11)
         shapes = results_arr[:, 0:2]
         R_ana = results_arr[:, 2:4]
-        flux = results_arr[:, 4:5] *4*np.pi*(sigma_shapelets1**2)/2
-        Rflux = results_arr[:, 5:7] *4*np.pi*(sigma_shapelets1**2)/2
+        # m00 -> flux conversion using anacal's authoritative m00_to_flux
+        # (= m00 * 2*pi*sigma_shapelets1^2), numerically identical to the
+        # old 4*pi*sigma^2/2 factor but tied to the library definition.
+        flux = anacal.fpfs.m00_to_flux(results_arr[:, 4:5], sigma_shapelets1)
+        Rflux = anacal.fpfs.m00_to_flux(results_arr[:, 5:7], sigma_shapelets1)
 
         if if_return:
             shapes_all.append(shapes)

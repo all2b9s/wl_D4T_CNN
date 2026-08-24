@@ -244,7 +244,7 @@ def _build_task_from_fpfs_config(
     mag_zero: float = 30.0,
     pixel_scale: float = 0.2,
     sigma_arcsec: float = 0.40,
-    snr_peak_min: float = 10.0,
+    snr_peak_min: float = 5.0,
     omega_f: Optional[float] = None,
     omega_v: Optional[float] = None,
     fpfs_c0: float = 30.0,
@@ -597,6 +597,10 @@ def _merge_detection_and_fpfs(
     det_names = list(det_cat.dtype.names)
     fpfs_names = list(fpfs_out.dtype.names) if fpfs_out is not None else []
 
+    # Consistency guard: never silently mix task-kernel columns with the
+    # forced fpfs1_* columns (measured at a different shapelet scale).
+    _check_task_fpfs_columns(det_names)
+
     # Build a clean structured array (unchanged schema)
     dtype = np.dtype([
         ("det_id", np.int32),
@@ -633,46 +637,62 @@ def _merge_detection_and_fpfs(
     # The production FPFS estimator is the Task's task-kernel measurement
     # (fpfs_e{1,2} / fpfs_de{1,2}_dg{1,2} / fpfs_m0), the same kernel that
     # wsel/dwsel come from (see example_fpfs_blended.ipynb).  The forced
-    # fpfs1_* columns are only a fallback.
-    merged["fpfs_e1"] = _fill_nan(
-        _extract_preferred(det_cat, det_names, fpfs_out, fpfs_names,
-                           ["fpfs_e1", "e1"],
-                           ["fpfs1_e1", "fpfs_e1", "e1"]), n_det
-    )
-    merged["fpfs_e2"] = _fill_nan(
-        _extract_preferred(det_cat, det_names, fpfs_out, fpfs_names,
-                           ["fpfs_e2", "e2"],
-                           ["fpfs1_e2", "fpfs_e2", "e2"]), n_det
-    )
-    merged["fpfs_R11"] = _fill_nan(
-        _extract_preferred(det_cat, det_names, fpfs_out, fpfs_names,
-                           ["fpfs_de1_dg1", "de1_dg1", "R11"],
-                           ["fpfs1_de1_dg1", "fpfs_de1_dg1", "de1_dg1", "R11"]), n_det
-    )
-    merged["fpfs_R22"] = _fill_nan(
-        _extract_preferred(det_cat, det_names, fpfs_out, fpfs_names,
-                           ["fpfs_de2_dg2", "de2_dg2", "R22"],
-                           ["fpfs1_de2_dg2", "fpfs_de2_dg2", "de2_dg2", "R22"]), n_det
-    )
+    # fpfs1_* columns are only a defensive fallback; the consistency guard
+    # _check_task_fpfs_columns guarantees they are never actually used.
+    provenance = {}
+
+    col, src = _extract_preferred(
+        det_cat, det_names, fpfs_out, fpfs_names,
+        ["fpfs_e1", "e1"],
+        ["fpfs1_e1", "fpfs_e1", "e1"])
+    merged["fpfs_e1"] = _fill_nan(col, n_det)
+    provenance["fpfs_e1"] = src
+
+    col, src = _extract_preferred(
+        det_cat, det_names, fpfs_out, fpfs_names,
+        ["fpfs_e2", "e2"],
+        ["fpfs1_e2", "fpfs_e2", "e2"])
+    merged["fpfs_e2"] = _fill_nan(col, n_det)
+    provenance["fpfs_e2"] = src
+
+    col, src = _extract_preferred(
+        det_cat, det_names, fpfs_out, fpfs_names,
+        ["fpfs_de1_dg1", "de1_dg1", "R11"],
+        ["fpfs1_de1_dg1", "fpfs_de1_dg1", "de1_dg1", "R11"])
+    merged["fpfs_R11"] = _fill_nan(col, n_det)
+    provenance["fpfs_R11"] = src
+
+    col, src = _extract_preferred(
+        det_cat, det_names, fpfs_out, fpfs_names,
+        ["fpfs_de2_dg2", "de2_dg2", "R22"],
+        ["fpfs1_de2_dg2", "fpfs_de2_dg2", "de2_dg2", "R22"])
+    merged["fpfs_R22"] = _fill_nan(col, n_det)
+    provenance["fpfs_R22"] = src
 
     # --- FPFS flux (task kernel) ---
-    merged["fpfs_m00"] = _fill_nan(
-        _extract_preferred(det_cat, det_names, fpfs_out, fpfs_names,
-                           ["fpfs_m0", "m00", "flux_gauss0"],
-                           ["fpfs1_m00", "fpfs_m00", "m00", "flux_gauss0"]), n_det
-    )
-    merged["fpfs_dm00_dg1"] = _fill_nan(
-        _extract_preferred(det_cat, det_names, fpfs_out, fpfs_names,
-                           ["fpfs_dm0_dg1", "dm00_dg1", "dflux_gauss0_dg1"],
-                           ["fpfs1_dm00_dg1", "fpfs_dm00_dg1", "dm00_dg1",
-                            "dflux_gauss0_dg1"]), n_det
-    )
-    merged["fpfs_dm00_dg2"] = _fill_nan(
-        _extract_preferred(det_cat, det_names, fpfs_out, fpfs_names,
-                           ["fpfs_dm0_dg2", "dm00_dg2", "dflux_gauss0_dg2"],
-                           ["fpfs1_dm00_dg2", "fpfs_dm00_dg2", "dm00_dg2",
-                            "dflux_gauss0_dg2"]), n_det
-    )
+    col, src = _extract_preferred(
+        det_cat, det_names, fpfs_out, fpfs_names,
+        ["fpfs_m0", "m00", "flux_gauss0"],
+        ["fpfs1_m00", "fpfs_m00", "m00", "flux_gauss0"])
+    merged["fpfs_m00"] = _fill_nan(col, n_det)
+    provenance["fpfs_m00"] = src
+
+    col, src = _extract_preferred(
+        det_cat, det_names, fpfs_out, fpfs_names,
+        ["fpfs_dm0_dg1", "dm00_dg1", "dflux_gauss0_dg1"],
+        ["fpfs1_dm00_dg1", "fpfs_dm00_dg1", "dm00_dg1", "dflux_gauss0_dg1"])
+    merged["fpfs_dm00_dg1"] = _fill_nan(col, n_det)
+    provenance["fpfs_dm00_dg1"] = src
+
+    col, src = _extract_preferred(
+        det_cat, det_names, fpfs_out, fpfs_names,
+        ["fpfs_dm0_dg2", "dm00_dg2", "dflux_gauss0_dg2"],
+        ["fpfs1_dm00_dg2", "fpfs_dm00_dg2", "dm00_dg2", "dflux_gauss0_dg2"])
+    merged["fpfs_dm00_dg2"] = _fill_nan(col, n_det)
+    provenance["fpfs_dm00_dg2"] = src
+
+    # ---- Concise measurement log: which source each FPFS column came from ----
+    _log_fpfs_provenance(provenance, n_det)
 
     return merged
 
@@ -684,19 +704,51 @@ def _fill_nan(col: Optional[np.ndarray], n: int) -> np.ndarray:
     return np.asarray(col, dtype=np.float64)
 
 
+def _column_1d(col: np.ndarray) -> np.ndarray:
+    """Return a structured-array column as a 1-D float64 array."""
+    if col.ndim > 1:
+        col = col.reshape(col.shape[0], -1)
+        if col.shape[1] == 1:
+            col = col[:, 0]
+    return np.asarray(col, dtype=np.float64)
+
+
 def _extract_column(
     out: np.ndarray, available_names: list, candidates: list
 ) -> Optional[np.ndarray]:
     """Try to extract a column by checking multiple possible names."""
     for name in candidates:
         if name in available_names:
-            col = out[name]
-            if col.ndim > 1:
-                col = col.reshape(col.shape[0], -1)
-                if col.shape[1] == 1:
-                    col = col[:, 0]
-            return np.asarray(col, dtype=np.float64)
+            return _column_1d(out[name])
     return None
+
+
+def _check_task_fpfs_columns(det_names: list) -> None:
+    """Fail fast if the Task's task-kernel FPFS columns are missing.
+
+    The production FPFS estimator (``fpfs_e{1,2}`` / ``fpfs_de{1,2}_dg{1,2}`` /
+    ``fpfs_m0`` / ``wsel``) is measured by the Task's kernel at
+    ``sigma_arcsec``; the forced ``fpfs1_*`` columns are measured at a
+    DIFFERENT shapelet scale (``fpfs_config.sigma_shapelets1``).  Silently
+    substituting them would produce an inconsistent catalog (e.g. shapes at
+    sigma=0.45 with a selection weight at sigma=0.40), so raise here instead
+    of falling back when the Task columns are absent (anacal schema change,
+    ``do_measure``/``do_fpfs`` turned off, ...).
+    """
+    required = [
+        "fpfs_e1", "fpfs_e2",
+        "fpfs_de1_dg1", "fpfs_de2_dg2",
+        "fpfs_m0", "fpfs_dm0_dg1", "fpfs_dm0_dg2",
+        "wsel", "dwsel_dg1", "dwsel_dg2",
+    ]
+    missing = [n for n in required if n not in det_names]
+    if missing:
+        raise RuntimeError(
+            "[fpfs] Task output is missing task-kernel FPFS columns: "
+            f"{missing}. Available columns: {sorted(det_names)}. Refusing to "
+            "fall back to fpfs1_* (different shapelet scale, inconsistent "
+            "with wsel)."
+        )
 
 
 def _extract_preferred(
@@ -706,20 +758,55 @@ def _extract_preferred(
     fpfs_names: list,
     det_candidates: list,
     fpfs_candidates: list,
-) -> Optional[np.ndarray]:
+) -> Tuple[Optional[np.ndarray], Tuple[Optional[str], Optional[str]]]:
     """Extract a column, preferring the Task's task-kernel FPFS measurement.
 
     The production FPFS estimator -- the one that is self-consistent with
     the selection weight ``wsel``/``dwsel`` (see example_fpfs_blended.ipynb)
     -- is the task-kernel measurement carried in ``det_cat``
     (``fpfs_e1``/``fpfs_de1_dg1``/``fpfs_m0`` ...).  The forced ``fpfs1_*``
-    columns in ``fpfs_out`` are only a fallback when the task columns are
-    absent.
+    columns in ``fpfs_out`` are only a defensive fallback; the consistency
+    guard ``_check_task_fpfs_columns`` raises before it can be reached.
+
+    Returns
+    -------
+    col : ndarray or None
+        The extracted column, or ``None`` if not found in either catalog.
+    source : (str, str) or (None, None)
+        ``("task", actual_name)`` when taken from ``det_cat``,
+        ``("fpfs1", actual_name)`` when fallen back to ``fpfs_out``, or
+        ``(None, None)`` when the column was not found anywhere.
     """
-    col = _extract_column(det_cat, det_names, det_candidates)
-    if col is None:
-        col = _extract_column(fpfs_out, fpfs_names, fpfs_candidates)
-    return col
+    for name in det_candidates:
+        if name in det_names:
+            return _column_1d(det_cat[name]), ("task", name)
+    for name in fpfs_candidates:
+        if name in fpfs_names:
+            return _column_1d(fpfs_out[name]), ("fpfs1", name)
+    return None, (None, None)
+
+
+def _log_fpfs_provenance(provenance: dict, n_det: int) -> None:
+    """Print, once per measurement, the source of each FPFS column.
+
+    One concise line of ``field<-source.column`` entries, e.g.
+    ``fpfs_e1<-task.fpfs_e1``.  Warns if any column had to fall back to the
+    forced ``fpfs1_*`` measurement (a different shapelet scale than the task
+    kernel).
+    """
+    tags = []
+    for field, (source, name) in provenance.items():
+        if source is None:
+            tags.append(f"{field}<-MISSING")
+        else:
+            tags.append(f"{field}<-{source}.{name}")
+    print(f"[fpfs] n={n_det} sources: " + " ".join(tags))
+    if any(source == "fpfs1" for source, _ in provenance.values()):
+        print(
+            "[fpfs] WARNING: some columns fell back to fpfs1_* (measured at "
+            "sigma_shapelets1, a different scale than the task kernel at "
+            "sigma_arcsec) -- inconsistent with wsel/dwsel."
+        )
 
 
 def _empty_det_cat() -> np.ndarray:
@@ -753,7 +840,6 @@ def cut_stamps_from_large(
     stamps_out: Optional[np.ndarray] = None,
     yy_buf: Optional[np.ndarray] = None,
     xx_buf: Optional[np.ndarray] = None,
-    parity_centering: bool = False,
 ) -> Tuple[np.ndarray, np.ndarray]:
     """
     Cut postage stamps from the large image at each detection position.
@@ -776,14 +862,6 @@ def cut_stamps_from_large(
     yy_buf, xx_buf : ndarray or None
         Optional pre-allocated index buffers of shape (N_det, stamp_size, stamp_size).
         Pass the **same** buffers for signal + noise calls to reuse them.
-    parity_centering : bool
-        If True, place the detection peak at stamp pixel ``stamp_size//2`` for
-        even detection positions, or ``stamp_size//2 - 1`` for odd ones
-        (instead of always ``stamp_size//2``).  For even-sized stamps (e.g.
-        64×64) this makes the galaxy distribution symmetric around the
-        geometric centre (31.5 for 64×64), removing the systematic 0.5-pixel
-        offset from always centering the peak on pixel 32.  Default False
-        (legacy behaviour).
 
     Returns
     -------
@@ -792,9 +870,7 @@ def cut_stamps_from_large(
     offsets : ndarray (N_det, 2)
         Subpixel offsets (dy, dx) = (y - floor(y+0.5), x - floor(x+0.5)),
         i.e. the galaxy's subpixel phase relative to the rounded detection
-        pixel.  (With ``parity_centering`` the stamp centre pixel is no longer
-        always ``floor(y+0.5)``; the offsets keep the detection-relative
-        meaning.)
+        pixel.
     """
     half = stamp_size // 2
     n_det = len(det_cat)
@@ -810,18 +886,6 @@ def cut_stamps_from_large(
     # Top-left corner of each stamp
     y1 = yc - half  # (N_det,)
     x1 = xc - half  # (N_det,)
-
-    if parity_centering:
-        # Even detection positions → peak at stamp pixel `half` (e.g. 32).
-        # Odd  detection positions → peak at stamp pixel `half - 1` (e.g. 31).
-        # `yc % 2` is 0 (even) / 1 (odd); shifting the top-left corner by the
-        # parity moves the detection peak from pixel 32 to pixel 31 for odd
-        # positions.  Since parity is independent of the galaxy's subpixel
-        # offset δ ∈ (-0.5, 0.5], the combined galaxy distribution becomes
-        # symmetric around the geometric centre (31.5 for 64×64) instead of
-        # being biased toward pixel 32.
-        y1 = y1 + (yc % 2)
-        x1 = x1 + (xc % 2)
 
     # Build index grids using pre-allocated buffers or pre-computed aranges
     # (avoids repeated np.arange + np.clip allocations per call)

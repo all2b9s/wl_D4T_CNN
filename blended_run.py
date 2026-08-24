@@ -17,6 +17,10 @@ Usage:
         --cat_ref_path /projects/bdsp/wenyinli/codes/data/catsim-v4/OneDegSq.fits \
         --range 0 100
 
+    # Calibration is a SEPARATE job — see blended_calibration.py:
+    # python blended_calibration.py --fname blended_det_fpfs_truth_s4 \
+    #     --range 0 10000 --shape_mode ml --bs_times 100
+
 References:
     - blended_test.ipynb  (FITS loading reference)
     - src/anacal/detection_ml_pipeline.py  (Phase 2-4 functions)
@@ -276,7 +280,7 @@ class _CpuPreparationConfig:
     stamp_size: int
     skip_detection: bool
     mag_cut: float | None
-    parity_centering: bool
+    snr_cut: float
     center_on_truth: bool
     match_threshold: float
 
@@ -334,17 +338,16 @@ def _cut_signal_and_noise_stamps(
     noise_canvas: np.ndarray,
     det_cat: np.ndarray,
     stamp_size: int,
-    parity_centering: bool,
 ) -> tuple[np.ndarray, np.ndarray]:
     """Cut matched science and renoise stamps, including the empty case."""
     if len(det_cat) == 0:
         return _empty_stamps(stamp_size)
 
     stamps, _ = cut_stamps_from_large(
-        large_img, det_cat, stamp_size=stamp_size, parity_centering=parity_centering,
+        large_img, det_cat, stamp_size=stamp_size,
     )
     noise_stamps, _ = cut_stamps_from_large(
-        noise_canvas, det_cat, stamp_size=stamp_size, parity_centering=parity_centering,
+        noise_canvas, det_cat, stamp_size=stamp_size,
     )
     return stamps, noise_stamps
 
@@ -376,7 +379,7 @@ def _process_one_exposure(
     if config.skip_detection:
         det_cat = _build_truth_detection_catalog(truth_df, config.mag_cut)
         stamps, noise_stamps = _cut_signal_and_noise_stamps(
-            large_img, noise_canvas, det_cat, config.stamp_size, False,
+            large_img, noise_canvas, det_cat, config.stamp_size,
         )
         t4 = time.perf_counter()
         timings = {
@@ -386,13 +389,17 @@ def _process_one_exposure(
             "noise_sigma": noise_sigma, "test_mode": True,
         }
     else:
-        task = _build_task_from_fpfs_config(mag_zero=config.mag_zero, pixel_scale=config.pixel_scale)
+        task = _build_task_from_fpfs_config(
+            mag_zero=config.mag_zero, pixel_scale=config.pixel_scale,
+            snr_peak_min=config.snr_cut,
+        )
         cells = _build_cell_list(*large_img.shape, pixel_scale=config.pixel_scale)
         t4 = time.perf_counter()
         det_cat = run_detection_and_fpfs(
             large_image=large_img, psf_image=config.psf_image, fpfs_config=FPFS_CONFIG,
             mag_zero=config.mag_zero, pixel_scale=config.pixel_scale,
             noise_variance=noise_variance, noise_array=noise_canvas, task=task, cells=cells,
+            snr_peak_min=config.snr_cut,
         )
         t5 = time.perf_counter()
         n_before = len(det_cat)
@@ -410,7 +417,7 @@ def _process_one_exposure(
             det_cat = _recenter_on_truth(det_cat, positions, config.match_threshold)
         t6 = time.perf_counter()
         stamps, noise_stamps = _cut_signal_and_noise_stamps(
-            large_img, noise_canvas, det_cat, config.stamp_size, config.parity_centering,
+            large_img, noise_canvas, det_cat, config.stamp_size,
         )
         t7 = time.perf_counter()
         timings = {
@@ -490,7 +497,7 @@ def run_detection_ml_pipeline(
     dtype: str = "float32",
     skip_detection: bool = False,
     mag_cut: float = None,
-    parity_centering: bool = False,
+    snr_cut: float = 5.0,
     center_on_truth: bool = False,
 ):
     if sim_modes is None:
@@ -540,7 +547,7 @@ def run_detection_ml_pipeline(
     print(f"[pipeline] Weight threshold: fpfs_w >= {WEIGHT_THRESHOLD}")
     print(f"[pipeline] Test mode: skip_detection={skip_detection}"
           + (f"  mag_cut={mag_cut}" if mag_cut is not None else "  (no magnitude cut)"))
-    print(f"[pipeline] Parity centering (detection only): {parity_centering}")
+    print(f"[pipeline] Detection SNR cut (anacal snr_peak_min): {snr_cut}")
     print(f"[pipeline] Center stamps on matched truth (crossmatch test): {center_on_truth}"
           + (f"  (match_threshold={match_threshold} px)" if center_on_truth else ""))
 
@@ -563,7 +570,7 @@ def run_detection_ml_pipeline(
         stamp_size=stamp_size,
         skip_detection=skip_detection,
         mag_cut=mag_cut,
-        parity_centering=parity_centering,
+        snr_cut=snr_cut,
         center_on_truth=center_on_truth,
         match_threshold=match_threshold,
     )
@@ -807,11 +814,6 @@ if __name__ == "__main__":
                    help="Skip NPZ output")
     p.add_argument("--skip_detection", action="store_true",
                    help="Skip FPFS detection; use truth positions directly as cutout centers")
-    p.add_argument("--parity_centering", action="store_true",
-                   help="Place odd-parity detection peaks at stamp pixel 31 "
-                        "(even at 32) to restore symmetry around the geometric "
-                        "centre for even-sized stamps. Detection mode only; "
-                        "ignored with --skip_detection.")
     p.add_argument("--center_on_truth", action="store_true",
                    help="Crossmatch detections to the truth catalog and cut "
                         "postage stamps centered on the matched TRUTH positions "
@@ -823,6 +825,9 @@ if __name__ == "__main__":
     p.add_argument("--mag_cut", type=float, default=None,
                    help="When --skip_detection is set, only use truth objects with i_ab < mag_cut "
                         "(e.g. 24.5). Has no effect in normal detection mode.")
+    p.add_argument("--snr_cut", type=float, default=5.0,
+                   help="Minimum peak SNR for FPFS detection (anacal Task snr_peak_min, "
+                        "default 5.0). Has no effect with --skip_detection.")
 
     args = p.parse_args()
 
@@ -845,7 +850,7 @@ if __name__ == "__main__":
         save_csv=not args.no_csv,
         skip_detection=args.skip_detection,
         mag_cut=args.mag_cut,
-        parity_centering=args.parity_centering,
+        snr_cut=args.snr_cut,
         center_on_truth=args.center_on_truth,
     )
 
