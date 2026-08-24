@@ -1,5 +1,4 @@
 import os
-import math
 import galsim
 import numpy as np
 import pandas as pd
@@ -138,7 +137,6 @@ class single_gal_simulator():
         return sim_outputs, meta
 
 # ---------------- dataset builder ----------------
-import os  # Add this import at the top
 
 def build_galsim_dataset(
     out_images_npy="images.npy",

@@ -1,10 +1,5 @@
-import pandas as pd
 import numpy as np
-import matplotlib.pyplot as plt
 import galsim
-import torch
-import fitsio
-import os
 
 def get_ellipticity(a,b,theta):
     """Convert from (a,b,theta) to (e1,e2)"""

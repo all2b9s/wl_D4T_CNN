@@ -1,17 +1,10 @@
-import os
-import math
-import numpy as np
-import pandas as pd
-from typing import Literal, Tuple
-
 import torch
 from torch import nn
 import torch.nn.functional as F
 import torchvision.transforms as T
-from torchvision.models.resnet import resnet18, ResNet18_Weights
 
-from src.architecture.CNN_toolkit import D4_eq_weight, center_crop_to, gaussian_weight_2d
-from src.architecture.CNN_module import  ConvGELU, BiasFreeMLP, BiasFreeMLP_2l, ConvGELU_Res, ConvGELU_layernorm, OddMultiheadAttnPool
+from src.architecture.CNN_toolkit import gaussian_weight_2d
+from src.architecture.CNN_module import ConvGELU, BiasFreeMLP, BiasFreeMLP_2l, ConvGELU_Res, ConvGELU_layernorm
 
 # ----------------------------
 # Basic modules:
@@ -554,82 +547,6 @@ class SmoothCNN_GeLU_mocked(Forward8_base):
 
         return e
     
-class Forward8_attnW_CNN(Forward8_base):
-    def __init__(
-        self,
-        in_dim=1,
-        base_channels=32,
-        head_hidden=128,
-        out_dim=2,
-        num_layers=5,
-        res_factor=1,
-    ):
-        super().__init__()
-        C = base_channels
-        self.blocks = nn.ModuleList(
-            [ConvGELU_Res(in_dim, C, res_factor)] +
-            [ConvGELU_Res(C, C, res_factor) for _ in range(max(0, num_layers - 1))]
-        )
-
-        # --- Shared Attention Pool ---
-        self.attn_pool_e1 = OddMultiheadAttnPool(C, num_heads=1)
-        self.attn_pool_e2 = OddMultiheadAttnPool(C, num_heads=1)
-
-        # --- Heads ---
-        self.head_e1 = BiasFreeMLP_2l(C, hidden=head_hidden)
-        self.head_e2 = BiasFreeMLP_2l(C, hidden=head_hidden)
-        self._w_cache = {}
-
-
-    def _get_cached_weight(self, hw, sigma, device, dtype):
-        key = (hw[0], hw[1], sigma, device.type, str(dtype))
-        w = self._w_cache.get(key)
-        if w is None:
-            w = gaussian_weight_2d(hw, sigma).to(device=device, dtype=dtype)  # [H,W]
-            w = w.unsqueeze(0).unsqueeze(0)  # [1,1,H,W] for cheap broadcast
-            self._w_cache[key] = w
-        return self._w_cache[key]
-
-    def forward(self, x):
-        # --- normalize ---
-        w = self._get_cached_weight(x.shape[-2:], sigma=16, device=x.device, dtype=x.dtype)
-        m = (x * w).sum(dim=(1,2,3), keepdim=True)*100
-        norm = 1 + F.softplus(m - 1, beta=10.0, threshold=20)
-        x = x / norm
-
-        # --- D4 orbit and inverse aggregation ---
-        xs = self._d4_orbit_stack(x)              # [8,B,C,H,W]
-        B = x.size(0)
-        x8 = xs.view(-1, xs.size(2), xs.size(3), xs.size(4))  # [8B,C,H,W]
-
-        # 2) Single trunk pass
-        f8 = self._trunk_feature(x8)              # [8B,C,Hf,Wf]
-        f8 = f8.view(8, B, f8.size(1), f8.size(2), f8.size(3))  # [8,B,C,Hf,Wf]
-
-        # 3) Bulk inverse back to canonical frame
-        self.feats = self._d4_inverse_stack(f8)        # [8,B,C,Hf,Wf]
-
-        # --- Sign-weighted mean for e1/e2 --- 
-        s1 = self.signs_e1.view(8, 1, 1, 1, 1).to(self.feats) 
-        s2 = self.signs_e2.view(8, 1, 1, 1, 1).to(self.feats)
-        # --- Sign-weighted mean for e1/e2 ---
-        self.f_mean_e1 = (self.feats * s1).mean(dim=0)  # [B,C,Hf,Wf]
-        self.f_mean_e2 = (self.feats * s2).mean(dim=0)  # [B,C,Hf,Wf]
-        f_inv = self.feats.mean(dim=0)                       # [B,C,Hf,Wf]
-
-        # --- Align weight map to feature map size (center crop) ---
-        Hf, Wf = self.f_mean_e1.shape[-2:]
-        w_f = self._get_cached_weight((Hf, Wf), sigma=6, device=self.f_mean_e1.device, dtype=self.f_mean_e1.dtype) # [Hf,Wf]
-        w_f = w_f.expand(B, -1, -1, -1)
-
-        v1 = self.attn_pool_e1(self.f_mean_e1, w_f,K_even_src=f_inv)  # [B,C]
-        v2 = self.attn_pool_e2(self.f_mean_e2, w_f,K_even_src=f_inv)
-
-        # --- heads ---
-        e1 = self.head_e1(v1)
-        e2 = self.head_e2(v2)
-        return torch.cat([e1, e2], dim=-1)       # [B,2]
-
 class Forward8_RELU_CNN(Forward8_base):
     """
     D4-equivariant CNN model with ReLU activation (instead of GeLU).
@@ -785,4 +702,3 @@ class NonEq_CNN(Forward8_base):
         #v = feat.mean(dim=(-2, -1))  # simple global average pool
         e = self.head(v)
         return e
-

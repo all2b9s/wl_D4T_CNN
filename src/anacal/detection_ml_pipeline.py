@@ -18,7 +18,7 @@ Reuses heavily from:
 
 import numpy as np
 import os
-from typing import List, Tuple, Optional, Any
+from typing import Tuple, Optional, Any
 
 try:
     import pandas as pd

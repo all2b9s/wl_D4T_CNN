@@ -1,5 +1,4 @@
 import anacal
-import numpy as np
 
 def anacal_pix_r(img, psf, center=None, 
                  sigma_arcsec=0.85/2.355, 
@@ -46,4 +45,3 @@ def anacal_pix_r(img, psf, center=None,
     q_img_np[1] = q_img_np[1] #- (dx * q_img_np[3] - dy * q_img_np[4])*scale_arcsec_per_pix
     q_img_np[2] = q_img_np[2] #- (dy * q_img_np[3] + dx * q_img_np[4])*scale_arcsec_per_pix
     return q_img_np
-

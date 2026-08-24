@@ -1,7 +1,6 @@
 import numpy as np
 from lsst.afw.image import ExposureF
 from lsst.geom import Point2D
-from xlens.utils.image import resize_array
 import matplotlib.pyplot as plt
 
 # 1) Read the exposure FITS off disk.

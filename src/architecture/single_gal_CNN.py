@@ -1,17 +1,10 @@
-import os
-import math
-import numpy as np
-import pandas as pd
-from typing import Literal, Tuple
-
 import torch
 from torch import nn
 import torch.nn.functional as F
 import torchvision.transforms as T
-from torchvision.models.resnet import resnet18, ResNet18_Weights
 
-from src.architecture.CNN_toolkit import D4_eq_weight, center_crop_to, quad_gaussian_2d, gaussian_weight_2d
-from src.architecture.CNN_module import R180Inv_Conv2d, D4Inv_Conv2d, ConvGELU, BiasFreeMLP, ResConvBNGELU, ConvGELU_Res
+from src.architecture.CNN_toolkit import center_crop_to, quad_gaussian_2d
+from src.architecture.CNN_module import R180Inv_Conv2d, D4Inv_Conv2d, ConvGELU, BiasFreeMLP
 #######################################################################################################
 # CNN models:
 #######################################################################################################
@@ -242,7 +235,6 @@ class D4T_CNN_GeLU(nn.Module):
 
         out = torch.cat([shape0, shape1], dim=-1)  # [B, 2]
         return out
-
 
 
 

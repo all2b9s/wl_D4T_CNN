@@ -1,13 +1,9 @@
-import os
 import csv
-import math
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 from typing import Literal, Optional, Tuple
 from tqdm.auto import tqdm
 from src.datasets.single_gal_dataset import make_loaders
-from src.architecture.single_gal_CNN import D4T_CNN_GeLU
 
 
 @torch.no_grad()

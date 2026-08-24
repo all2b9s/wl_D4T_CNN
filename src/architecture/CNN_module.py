@@ -1,64 +1,7 @@
-import os
-import math
-import numpy as np
-import pandas as pd
-from typing import Literal, Tuple
-
 import torch
 from torch import nn
 import torch.nn.functional as F
 
-
-# Basic Modules
-
-def flip_image_y(x):
-    """
-    Reflect across the y-axis (horizontal flip).
-    x: [B, C, H, W]
-    """
-    return torch.flip(x, dims=(-1,))  # flip width
-
-def flip_image_x(x):
-    """
-    Reflect across the x-axis (vertical flip).
-    x: [B, C, H, W]
-    """
-    return torch.flip(x, dims=(-2,))  # flip height
-
-def flip_spin2(y):
-    """
-    Spin-2 conjugation: (e1, e2) -> (e1, -e2).
-    y: [..., 2]
-    """
-    y = y.clone()
-    y[..., 1] = -y[..., 1]
-    return y
-
-def rotate_spin2(y: torch.Tensor, k: int, inverse = True):
-    """
-    y: [B, 2]  (e1,e2) or (g1,g2)
-    Rotation angle theta = k * 90°; spin-2 requires rotation by 2*theta.
-    inverse=True means rotating the output back to the original coordinate system (use -2*theta)
-    """
-    if k == 0:
-        return y
-    theta = k * (math.pi/2.0) * 2.0
-    if inverse:
-        theta = -theta
-    c, s = math.cos(theta), math.sin(theta)
-    e1, e2 = y[..., 0], y[..., 1]
-    y1 = c*e1 - s*e2
-    y2 = s*e1 + c*e2
-    return torch.stack([y1, y2], dim=-1)
-
-def rotate_image_90(img: torch.Tensor, k: int) -> torch.Tensor:
-    # img: [1,H,W] or [H,W]
-    if k == 0:
-        return img
-    # torch.rot90 works on [*, H, W]
-    if img.ndim == 2:
-        return torch.rot90(img, k, dims=(0,1))
-    return torch.rot90(img, k, dims=(-2,-1))
 
 class ChannelLayerNorm2d(nn.Module):
     def __init__(self, num_channels, eps=1e-5, affine=True):
@@ -80,72 +23,6 @@ class ChannelLayerNorm2d(nn.Module):
         return y
 
 
-
-# ----------------------------
-# Related modules:
-# ----------------------------
-
-class Rot90EquivariantWrapper(nn.Module):
-    """
-    Hard-code 90 rotation into the model
-    """
-    def __init__(self, base_model: nn.Module, mode: str = "equal"):
-        super().__init__()
-        assert mode in ("equal", "precision")
-        self.base = base_model
-        self.mode = mode
-
-    def _forward_one(self, x, k, flipped):
-        """
-        Apply: optional flip, then k*90° rotation -> base -> undo rotation -> undo flip on spin-2.
-        """
-        # 1) flip (if any) then rotate input
-        x_tf = flip_image_y(x) if flipped else x
-        x_tf = rotate_image_90(x_tf, k)  # your helper; torch.rot90 under the hood
-
-        # 2) predict
-        y = self.base(x_tf)  # [B,2] or [B,3]
-
-        if self.mode == "precision":
-            mean = y[..., :2]
-            logvar = y[..., 2:3]  # [B,1], isotropic predictive variance
-        else:
-            mean = y
-
-        # 3) map predictions back to the original frame
-        #    Inverse order: undo rotation first, then undo mirror via conjugation.
-        y_back = rotate_spin2(mean, k, inverse=True)
-        if flipped:
-            y_back = flip_spin2(y_back)
-
-        if self.mode == "precision":
-            # Scalar logvar is invariant to rotation/conjugation for isotropic case
-            return y_back, logvar
-        else:
-            return y_back, None
-
-    def forward(self, x):
-        preds = []
-        vars_ = []  # only used in precision mode
-
-        for flipped in (False, True):      # no flip, mirror
-            for k in range(2):             # 0, 90 deg
-                yk, lv = self._forward_one(x, k, flipped)
-                preds.append(yk)
-                if self.mode == "precision":
-                    vars_.append(lv)
-
-        Y = torch.stack(preds, dim=0)      # [8, B, 2]
-
-        if self.mode == "equal":
-            return Y.mean(dim=0)           # [B,2]
-
-        # precision-weighted averaging (scalar precision per transform)
-        LOGVAR = torch.stack(vars_, dim=0)     # [8, B, 1]
-        W = torch.exp(-LOGVAR)                 # [8, B, 1] precisions
-        W2 = W.expand(-1, -1, 2)               # match [8,B,2]
-        out = (W2 * Y).sum(dim=0) / (W2.sum(dim=0) + 1e-12)   # [B,2]
-        return out
 
 class R180Inv_Conv2d(nn.Module):
     """
@@ -466,56 +343,4 @@ class ResConvBNGELU(nn.Module):
         out = out + self.proj(identity)
         out = self.act(out)
         return out
-
-# ----------------------------
-# Attention Modules
-# ----------------------------
-
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
-
-class OddMultiheadAttnPool(nn.Module):
-    """
-    Multihead Attention Pooling with optional external-even Key source.
-    """
-    def __init__(self, C, num_heads=4, eps: float = 1e-6):
-        super().__init__()
-        self.num_heads = num_heads
-        self.C = C
-        self.eps = eps
-        self.q = nn.Parameter(torch.randn(1, 1, C))
-        self.mha = nn.MultiheadAttention(C, num_heads, batch_first=True)
-
-    def forward( 
-        self,
-        x: torch.Tensor,                        # [B,C,H,W] -- used for Value (odd)
-        mask: torch.Tensor | None = None,       # [B,1,H,W] or [B,H,W], optional
-        K_even_src: torch.Tensor | None = None, # [B,C,H,W], external even features (e.g. 8-rotation averaged)
-    ) -> torch.Tensor:
-        B, C, H, W = x.shape
-        N = H * W
-
-        # --- tokens & query ---
-        V_odd  = x.view(B, C, N).permute(0, 2, 1).contiguous()   # [B,N,C] (odd)
-        Q      = self.q.expand(B, 1, C)                          # [B,1,C]
-
-        # --- source of the "even part" of the Key ---
-        if K_even_src is None:
-            K_even_map = x**2                                    # conventional approach: guarantees evenness in sign
-        else:
-            K_even_map = K_even_src                              # your 8-rotation averaged features
-        K_even = K_even_map.view(B, C, N).permute(0, 2, 1).contiguous()  # [B,N,C]
-
-        # --- log-bias for continuous mask (optional) ---
-        attn_mask = None
-        if mask is not None:
-            if mask.ndim == 3:
-                mask = mask.unsqueeze(1)                         # [B,1,H,W]
-            mask_bias = torch.log(mask.view(B, 1, N) + self.eps) # [B,1,N]
-            attn_mask = mask_bias.repeat_interleave(self.num_heads, dim=0)  # [B*heads,1,N]
-
-        # --- MHA（Q,K_even,V_odd） ---
-        out, _ = self.mha(Q, K_even, V_odd, attn_mask=attn_mask, need_weights=False)  # [B,1,C]
-        return out.squeeze(1)  # [B,C]
 

@@ -2,9 +2,51 @@ import math
 import torch
 import numpy as np
 import matplotlib.pyplot as plt
+import pandas as pd
 from typing import Tuple
 import torch.nn.functional as F
-from torch import nn
+
+
+def load_test_item(
+    images_path: str = "images.npy",
+    csv_path: str = "gt_info.csv",
+    index_range: list = None,
+    target: str = "e",
+    normalize: str = "none",
+):
+    if index_range is None or len(index_range) != 2:
+        raise ValueError("index_range must be a list like [start, end].")
+
+    df = pd.read_csv(csv_path)
+    df_test = df[df["split"] == "test"].sort_values("id").reset_index(drop=True)
+
+    idx_min, idx_max = index_range
+    if idx_min < 0 or idx_max > len(df_test):
+        raise IndexError("index_range is out of bounds for test dataset.")
+
+    imgs = np.load(images_path, mmap_mode="r")
+    img_list, y_list = [], []
+
+    for index in range(idx_min, idx_max):
+        row = df_test.iloc[index]
+        img_id = int(row["id"])
+        img = imgs[img_id].astype(np.float64, copy=True)
+
+        if normalize == "per_image":
+            m, s = img.mean(), img.std()
+            img = (img - m) / s if s > 0 else (img - m)
+
+        if target == "e":
+            y = np.array([row["e1"], row["e2"]], dtype=np.float64)
+        elif target == "g":
+            y = np.array([row["g1"], row["g2"]], dtype=np.float64)
+        else:
+            raise ValueError("target must be 'e' or 'g'")
+
+        img_list.append(img)
+        y_list.append(y)
+
+    return np.stack(img_list), np.stack(y_list)
 
 
 def plot_shape_bidirectional(
@@ -269,18 +311,6 @@ def shape_pixel_gradients(
 # Utils: geometry & sizing
 # --------------------------
 
-def d4_variants(x: torch.Tensor) -> torch.Tensor:
-    """
-    Given x: [B, 1, H, W], return 8 variants along a new dim V:
-      V=0..3: rotations by k*90
-      V=4..7: mirrored versions (horizontal flip) of those four
-    Output: [B, 8, 1, H, W]
-    """
-    rots = [torch.rot90(x, k=k, dims=(-2, -1)) for k in range(4)]
-    flips = [torch.flip(r, dims=(-1,)) for r in rots]  # horizontal mirror
-    v = torch.stack(rots + flips, dim=1)
-    return v
-
 def center_crop_to(x: torch.Tensor, target_hw: Tuple[int, int]) -> torch.Tensor:
     """
     Center-crop tensor x: [B, C, H, W] to (target_H, target_W).
@@ -291,17 +321,6 @@ def center_crop_to(x: torch.Tensor, target_hw: Tuple[int, int]) -> torch.Tensor:
     top = (H - tH) // 2
     left = (W - tW) // 2
     return x[:, :, top:top + tH, left:left + tW]
-
-# --------------------------
-# Gaussian blur (depthwise)
-# --------------------------
-def gaussian_kernel2d(ks: int, sigma: float, device=None, dtype=None):
-    ax = torch.arange(ks, device=device, dtype=dtype) - (ks - 1) / 2
-    g1d = torch.exp(-0.5 * (ax / sigma) ** 2)
-    g1d = g1d / g1d.sum()
-    g2d = torch.outer(g1d, g1d)
-    g2d = g2d / g2d.sum()
-    return g2d  # [ks, ks]
 
 def gaussian_weight_2d(size: int | tuple[int, int], std: float = 16, device=None, normalize=True, dtype=torch.float32):
     """
@@ -380,17 +399,6 @@ def quad_gaussian_2d(
     return out
 
 
-def gaussian_blur(x: torch.Tensor, ks: int = 3, sigma: float = 1.0) -> torch.Tensor:
-    """
-    x: [B, 1, H, W] or [B, C, H, W]; applies same kernel to all channels.
-    """
-    B, C, H, W = x.shape
-    k = gaussian_kernel2d(ks, sigma, device=x.device, dtype=x.dtype)
-    k = k.view(1, 1, ks, ks)
-    k = k.repeat(C, 1, 1, 1)  # depthwise
-    padding = ks // 2
-    return F.conv2d(x, k, bias=None, stride=1, padding=padding, groups=C)
-
 def predictor(model, img, normalize = "none"):
     if normalize == "per_image":
         m = img.mean()
@@ -410,36 +418,3 @@ def predictor(model, img, normalize = "none"):
         y_pred_t = model(img_t)          # [1,2]
     y_pred = y_pred_t.squeeze(0).cpu().numpy() 
     return y_pred
-
-
-
-class PairedShearWrapper(nn.Module):
-    """
-    Wrap a base shape model:
-    - Base model: input [N, H, W] -> output [N, 2]
-    - Wrapped model: input [N, 2, H, W] (two sheared images per sample)
-        -> output (shape1, shape2), each with shape [N, 2]
-    """
-    def __init__(self, base_model: nn.Module):
-        super().__init__()
-        self.base_model = base_model
-
-    def forward(self, imgs_pair: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        """
-        imgs_pair: [N, 2, H, W]
-            imgs_pair[:, 0, ...] is the first shear image
-            imgs_pair[:, 1, ...] is the second shear image
-
-        Returns:
-            shape1: [N, 2]
-            shape2: [N, 2]
-        """
-        img_p = imgs_pair[:,0]
-        img_n = imgs_pair[:,1]
-        
-        shape_p = self.base_model(img_p)   # [N, 2]
-        shape_n = self.base_model(img_n)   # [N, 2]
-        
-        e_mean = 0.5 * (shape_p + shape_n)
-        delta_e = 0.5 * (shape_p - shape_n)
-        return e_mean, delta_e

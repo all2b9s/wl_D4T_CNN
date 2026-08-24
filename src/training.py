@@ -1,9 +1,8 @@
 import argparse, os, random
 import torch
 from torch import nn
-import torch.nn.functional as F
 import random
-from typing import Callable, Literal, Optional
+from typing import Literal, Optional
 import optuna
 from src.datasets.single_gal_dataset import make_loaders
 from src.architecture.single_gal_CNN import D4T_CNN_GeLU

@@ -1,16 +1,11 @@
 import os
-import math
 # Must be set BEFORE importing numpy / scipy / anacal etc.
 os.environ["OPENBLAS_NUM_THREADS"] = "1"
 os.environ["OMP_NUM_THREADS"] = "1"
 os.environ["MKL_NUM_THREADS"] = "1"
 os.environ["NUMEXPR_NUM_THREADS"] = "1"
 import numpy as np
-import pandas as pd
-import matplotlib.pyplot as plt
-import fitsio
-from src.anacal.batch_calibration import prepare_q_images
-from src.anacal.cal_toolkit import build_dataset
+from src.anacal.cal_toolkit import build_dataset, format_number
 import anacal
 import multiprocessing as mp
 
@@ -28,12 +23,6 @@ fpfs_config = anacal.fpfs.FpfsConfig(
     sigma_shapelets1=0.45,  # The second measurement scale
     sigma_shapelets2=0.55,  # The second measurement scale
 )
-
-def format_number(x: float) -> str:
-    s = f"{x:.3f}".rstrip('0').rstrip('.')  # keep up to 3 decimal places, trim trailing zeros
-    s = s.replace('.', '')                  # remove the decimal point
-    return f"n{s}"
-
 
 # ---- Globals for workers ----
 _FPFS_GLOBALS = {
@@ -286,6 +275,5 @@ def fpfs_measure(
             dw_all = np.concatenate(dw_all, axis=0)
             return shapes_all, R_ana_all, flux_all, Rflux_all, w_all, dw_all
         return shapes_all, R_ana_all, flux_all, Rflux_all
-
 
 

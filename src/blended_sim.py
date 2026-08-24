@@ -17,7 +17,6 @@ import multiprocessing as mp
 import fitsio
 from tqdm import tqdm
 
-import anacal.psf
 
 from lsst.skymap.discreteSkyMap import DiscreteSkyMap, DiscreteSkyMapConfig
 from xlens.simulator.catalog import CatalogShearTask, CatalogShearTaskConfig

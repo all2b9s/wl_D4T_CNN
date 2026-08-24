@@ -23,7 +23,6 @@ Or programmatic::
 import datetime
 import numpy as np
 import os
-import re
 import time
 import argparse
 from tqdm import tqdm

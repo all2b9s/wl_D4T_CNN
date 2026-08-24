@@ -8,8 +8,6 @@
 
 # --- 重新放行（! 表示不忽略）---
 
-# 保留 .gitignore 自身
-!.gitignore
 
 # 保留 src 目录及其全部内容
 !src/
@@ -17,5 +15,5 @@
 
 # 保留 blended 相关文件
 !blended_run.py
-!blended_run.sh
 !blended_*.ipynb
+

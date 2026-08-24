@@ -6,10 +6,7 @@ from typing import Literal, Tuple, Optional
 
 import torch
 from torch.utils.data import get_worker_info
-from torch import nn
 from torch.utils.data import Dataset, DataLoader
-from torchvision.models import resnet18, ResNet18_Weights
-from torchvision.transforms import GaussianBlur
 
 # ----------------------------
 # Dataset (memmap + CSV)

@@ -1,17 +1,34 @@
-import anacal
 import numpy as np
-import matplotlib.pylab as plt
-import numbers
-from numpy.lib import recfunctions as rfn
-from astropy.visualization import simple_norm
-import os
 import pandas as pd
 from tqdm import tqdm
-from multiprocessing import Pool, cpu_count
 from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor
 from functools import partial
 import time
-from numpy.random import SeedSequence, default_rng
+from numpy.random import SeedSequence
+
+
+def bootstrap_e_std(e_fpfs, R_fpfs, n_boot=20, rng=None):
+    """
+    e_fpfs : (N,2) array
+    R_fpfs : (N,2) array
+    """
+
+    if rng is None:
+        rng = np.random.default_rng()
+
+    N = e_fpfs.shape[0]
+    boots = []
+
+    for _ in range(n_boot):
+        idx = rng.integers(0, N, N)       # bootstrap index
+        e_std = e_fpfs[idx].std(axis=0) / R_fpfs[idx].mean(axis=0)
+        boots.append(e_std)
+
+    boots = np.vstack(boots)             # (n_boot, 2)
+    mean = boots.mean(axis=0)
+    err  = boots.std(axis=0, ddof=1)     # error bar = std of bootstraps
+
+    return mean, err, boots
 
 
 def robust_load_npy(path, retries=5, delay=0.05):

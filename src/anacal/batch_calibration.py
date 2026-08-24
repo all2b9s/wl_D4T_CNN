@@ -1,11 +1,9 @@
-from typing import Any
 import numpy as np
 import torch
 from src.anacal.pixel_response import anacal_pix_r
-from src.architecture.CNN_toolkit import shape_pixel_gradients, predictor, plot_shape_bidirectional, D4_eq_weight
+from src.architecture.CNN_toolkit import shape_pixel_gradients, predictor
 from concurrent.futures import ProcessPoolExecutor
 from concurrent.futures.process import BrokenProcessPool
-from functools import partial
 from tqdm import tqdm
 import os
 
@@ -432,6 +430,5 @@ def _single_gal_response(q_img, grad_e1, grad_e2):
 
 
     return np.array([anacal_R])
-
 
 

@@ -110,49 +110,6 @@ class QuadGauss(nn.Module):
         return f"sigma={self.sigma}, eps={self.eps}"
 
 
-class QuadGauss_Rot90(nn.Module):
-    """Rotation-averaged QuadGauss for spin-2 consistency.
-
-    Averages the QuadGauss measurement over the four 90° rotations of the
-    input image, explicitly enforcing spin-2 transformation:
-
-        e1 →  e1  (rot 0°, 180°),   e1 → -e1  (rot 90°, 270°)
-        e2 →  e2  (rot 0°, 180°),   e2 → -e2  (rot 90°, 270°)
-
-    This removes any parity-odd leakage from the estimator and makes it
-    directly comparable to the D4-equivariant CNN models.
-
-    Parameters
-    ----------
-    sigma : float
-        Gaussian weight width in pixels.
-    eps : float
-        Denominator stabiliser.
-    """
-
-    def __init__(self, sigma: float = 4.0, eps: float = 1e-8):
-        super().__init__()
-        self.base = QuadGauss(sigma=sigma, eps=eps)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """
-        Args:
-            x:  ``[B, 1, H, W]``
-
-        Returns:
-            ``[B, 2]``  rotation-averaged (e1, e2).
-        """
-        r0 = self.base(x)
-        r90 = self.base(torch.rot90(x, k=1, dims=(-2, -1)))
-        r180 = self.base(torch.rot90(x, k=2, dims=(-2, -1)))
-        r270 = self.base(torch.rot90(x, k=3, dims=(-2, -1)))
-
-        # spin-2 sign pattern:  [+,+]  [-,-]  [+,+]  [-,-]
-        s = torch.tensor([1.0, 1.0], device=x.device, dtype=x.dtype)
-        e = (r0 * s - r90 * s + r180 * s - r270 * s) / 4.0
-        return e
-
-
 # ------------------------------------------------------------------
 # Quick test (runs when executed directly)
 # ------------------------------------------------------------------

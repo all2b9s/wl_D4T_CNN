@@ -2,14 +2,12 @@ import anacal
 import numpy as np
 import matplotlib.pylab as plt
 import lsst.geom as geom
-from lsst.afw.geom import makeSkyWcs
 import fitsio
 import os
 # LSST task to define DC2-like skymap 
 from lsst.skymap.discreteSkyMap import (
     DiscreteSkyMapConfig, DiscreteSkyMap,
 )
-from lsst.pipe.tasks.coaddBase import makeSkyInfo
 
 from xlens.simulator.catalog import (
     CatalogShearTask,
@@ -19,33 +17,10 @@ from xlens.simulator.sim import (
     MultibandSimConfig, MultibandSimTask
 )
 
-# Detection Task: Detect, shape measurement
-from xlens.process_pipe.anacal_detect import (
-    AnacalDetectPipeConfig, 
-    AnacalDetectPipe,
-)
-
-# Force color measurement Task: 
-# flux measurement on the other bands
-from xlens.process_pipe.anacal_force import (
-    AnacalForcePipe,
-    AnacalForcePipeConfig,
-)
-
-# Match Task: match to input catalog
-from xlens.process_pipe.match import (
-    matchPipe,
-    matchPipeConfig,
-)
-
-from astropy.visualization import ZScaleInterval
-
-from numpy.lib import recfunctions as rfn
 from astropy.visualization import simple_norm
-import sys
 import pandas as pd
 from tqdm import tqdm
-from multiprocessing import Pool, cpu_count
+from multiprocessing import Pool
 from dataset_toolkit import get_weighted_e
 
 cat_ref,h = fitsio.read(
@@ -304,6 +279,5 @@ simulator = xlen_simulator('/work/hdd/bdsp/wenyinli/datasets/xlens_gauss_distrib
                             psf_e=psf_e,
                             has_shift=True, ori_seed=666)
 simulator(200_000)
-
 
 
