@@ -13,7 +13,7 @@ import time
 # Configuration (adjust for your own environment)
 # =====================================================================
 # Directory containing the shape-measurement results produced by
-# shape_measurement.py (i.e. the simulated xlens datasets).
+# src/shape_measurement.py (i.e. the simulated xlens datasets).
 dir = ''
 
 # Root of the saved shape/Rana results
@@ -87,7 +87,7 @@ def get_calibration_biases(
     combining the +g/-g shape measurements with the shear response R.
 
     Reads the per-galaxy shapes (g_all) and responses (R_all) that were saved
-    by shape_measurement.py, applies an optional magnitude selection cut
+    by src/shape_measurement.py, applies an optional magnitude selection cut
     (selection_response), and runs a bootstrap to estimate the biases.
     """
     zero_point = 30.0

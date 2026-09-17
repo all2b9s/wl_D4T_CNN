@@ -24,7 +24,7 @@ from xlens.simulator.sim import MultibandSimConfig, MultibandSimTask
 
 
 #OUTPUT_ROOT = "/taiga/illinois/las/astro/xinliuxl/DC1_sim_blended/noiseless_sim"
-OUTPUT_ROOT = "/work/hdd/bfcn/wenyinli/noiseless_sim"
+OUTPUT_ROOT = "/work/hdd/bfcn/wenyinli/blended_shapenoise_fullIMG"
 
 def make_skymap():
     cfg = DiscreteSkyMapConfig()
@@ -54,25 +54,36 @@ def make_catalog_task(args):
     return CatalogShearTask(config=cfg)
 
 
-def make_sim_task():
+def make_sim_task(args):
     cfg = MultibandSimConfig()
     cfg.survey_name = "lsst"
-    cfg.draw_image_noise = False
+    # xlens (upstream) has no noise_variance config field, so the noise
+    # level cannot be set here: whenever draw_image_noise is True, xlens
+    # draws noise at its fixed per-band default variance
+    # (noise_variance_defaults[band][survey], e.g. ~0.354 for lsst/i).
+    # --noise-level is therefore a pure on/off switch: 0 -> noiseless,
+    # >0 -> draw noise at xlens's default variance.
+    cfg.draw_image_noise = args.noise_level > 0
     return MultibandSimTask(config=cfg)
 
 
 def run_seed(args_seed):
-    args, seed = args_seed
+    args, seed, index = args_seed
 
-    print(f"[PID {os.getpid()}] START {seed}", flush=True)
+    print(f"[PID {os.getpid()}] START index={index} seed={seed}", flush=True)
 
     skymap = make_skymap()
     cat_task = make_catalog_task(args)
-    sim_task = make_sim_task()
+    sim_task = make_sim_task(args)
+
+    noise_tag = ""
+    if args.noise_level > 0:
+        s = f"{args.noise_level:.3f}".rstrip("0").rstrip(".")
+        noise_tag = "_n" + s.replace(".", "")
 
     outdir = os.path.join(
         OUTPUT_ROOT,
-        f"sim_mode{args.mode}",
+        f"sim_mode{args.mode}{noise_tag}",
     )
     os.makedirs(outdir, exist_ok=True)
 
@@ -90,17 +101,19 @@ def run_seed(args_seed):
 
     
     print(
-        f"[PID {os.getpid()}] after catalog seed={seed}, N={len(truth)}",
+        f"[PID {os.getpid()}] after catalog index={index} seed={seed}, N={len(truth)}",
         flush=True,
     )
+    # Output files are keyed by the running index (same convention the
+    # measurement side uses); the RNG seed is ori_seed + index.
     fitsio.write(
-        os.path.join(outdir, f"truth-{seed:05d}.fits"),
+        os.path.join(outdir, f"truth-{index:05d}.fits"),
         truth,
         clobber=True,
     )
     print(
-    f"[PID {os.getpid()}] after truth write seed={seed}",
-    flush=True,
+        f"[PID {os.getpid()}] after truth write index={index} seed={seed}",
+        flush=True,
     )
 
     for band in args.bands:
@@ -118,26 +131,25 @@ def run_seed(args_seed):
         ).simExposure
 
         print(
-        f"[PID {os.getpid()}] after sim seed={seed} band={band}",
+        f"[PID {os.getpid()}] after sim index={index} seed={seed} band={band}",
         flush=True,
         )
 
         exp.writeFits(
             os.path.join(
                 outdir,
-                f"exp-{band}-{seed:05d}.fits",
+                f"exp-{band}-{index:05d}.fits",
             )
         )
 
         print(
-            f"[PID {os.getpid()}] after write seed={seed} band={band}",
-            flush=True,
+        f"[PID {os.getpid()}] after write index={index} seed={seed} band={band}",
         )
 
     del truth
     gc.collect()
 
-    print(f"[PID {os.getpid()}] DONE {seed}", flush=True)
+    print(f"[PID {os.getpid()}] DONE index={index} seed={seed}", flush=True)
     return seed
 
 
@@ -153,24 +165,43 @@ def main():
     parser.add_argument("--start", type=int, default=0)
     parser.add_argument("--end", type=int, default=10)
     parser.add_argument("--workers", type=int, default=1)
+    parser.add_argument(
+        "--ori_seed",
+        type=int,
+        default=0,
+        help="base seed: exposure at running index i is simulated with seed = "
+        "ori_seed + i. Output files stay keyed to i (e.g. truth-00000.fits), "
+        "so the measurement side is unaffected. Default 0 reproduces the "
+        "original seed == index behavior. Default: %(default)s",
+    )
+    parser.add_argument(
+        "--noise-level",
+        type=float,
+        default=0.0,
+        help="pure on/off switch for noise: 0 -> noiseless; >0 -> draw "
+        "noise at xlens's fixed per-band default variance (the numeric "
+        "value is not used). Default: %(default)s",
+    )
 
     args = parser.parse_args()
     args.bands = [x.strip() for x in args.band.split(",") if x.strip()]
 
-    seeds = list(range(args.start, args.end))
+    # Running index i in [start, end) is the output filename key; the RNG
+    # seed passed to xlens is ori_seed + i.
+    jobs = [(args, args.ori_seed + i, i) for i in range(args.start, args.end)]
 
     if args.workers == 1:
-        for seed in tqdm(seeds):
-            run_seed((args, seed))
+        for job in tqdm(jobs):
+            run_seed(job)
     else:
         with mp.Pool(args.workers) as pool:
             for _ in tqdm(
                 pool.imap_unordered(
                     run_seed,
-                    [(args, s) for s in seeds],
+                    jobs,
                     chunksize=1,
                 ),
-                total=len(seeds),
+                total=len(jobs),
             ):
                 pass
 

@@ -34,17 +34,21 @@ Then open `example.ipynb` and follow the cells:
 2. **Predict** the shape of a simulated galaxy
 3. Compute the **pixel response** and **shear response matrix** for calibration
 
-For large-scale shape measurement, see `shape_measurement.py` and `cal_biases.py`.
+For large-scale shape measurement, see `src/shape_measurement.py` and `src/cal_biases.py`.
 
 ## Repository Structure
 
 ```
 .
-├── shape_measurement.py   # Batch shear measurement with AnaCal-style calibration
-├── cal_biases.py          # Multiplicative/additive bias estimation
 ├── example.ipynb          # End-to-end tutorial (training + inference + response)
 ├── models/                # Pretrained weights (.pth)
 ├── src/
+│   ├── blended_run.py           # Entry point: FPFS detect + ML measure (blended FITS)
+│   ├── blended_calibration.py   # Entry point: single-shear (g1) calibration
+│   ├── fpfsdet_MLshape_run.py   # Entry point: FPFS detect + ML measure (xlens cutouts)
+│   ├── anacal_shape.py          # Entry point: FPFS measurement (isolated / legacy)
+│   ├── shape_measurement.py     # Batch shear measurement with AnaCal-style calibration
+│   ├── cal_biases.py            # Multiplicative/additive bias estimation
 │   ├── architecture/      # CNN model definitions (D4-equivariant, non-eq, ...)
 │   ├── anacal/            # AnaCal pixel response & calibration utilities
 │   ├── datasets/          # Data loaders & galaxy image simulators

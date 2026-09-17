@@ -19,12 +19,14 @@ def train_model(
     wd: float = 1e-4,
     device: str = None,
     pt_path: str = None,
+    shape_path: str = None,
 ):
     device = device or ("cuda" if torch.cuda.is_available() else "cpu")
     model = model.to(device)
 
     train_loader, val_loader, test_loader = make_loaders(
-        images_path, csv_path, batch_size, num_workers, target=target, augment=True
+        images_path, csv_path, batch_size, num_workers, target=target, augment=True,
+        shape_path=shape_path,
     )
 
     opt = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=wd)
@@ -99,6 +101,7 @@ class OptunaTrainer:
         device: Optional[str] = None,
         seed: int = 42,
         save_dir: str = "checkpoints",
+        shape_path: Optional[str] = None,
     ):
         """
         Optuna hyperparameter tuner for PyTorch models.
@@ -125,6 +128,7 @@ class OptunaTrainer:
             torch.cuda.set_device(dev_index)
 
         self.seed = seed
+        self.shape_path = shape_path
 
         self._set_seed(seed)
         self.save_dir = save_dir
@@ -157,6 +161,7 @@ class OptunaTrainer:
             self.num_workers,
             target=self.target,
             augment=True,
+            shape_path=self.shape_path,
         )
 
         # Model / optimizer / scheduler
@@ -282,6 +287,8 @@ def main():
     p.add_argument("--images", type=str, required=True)
     p.add_argument("--csv", type=str, required=True)
     p.add_argument("--target", type=str, default="e", choices=["e", "g"])
+    p.add_argument("--shape-path", type=str, default=None,
+                   help="Optional .npy/.csv target override; e.g. RDSM labels keyed by dense id")
     p.add_argument("--epochs", type=int, default=200)
     p.add_argument("--num-workers", type=int, default=8)
     p.add_argument("--study-name", type=str, default="D4T_cnn_tuning")
@@ -304,6 +311,7 @@ def main():
         device=device,
         seed=args.seed,
         save_dir=args.storage+"D4T_xlens_noiseless/",
+        shape_path=args.shape_path,
     )
     tuner.run(
         n_trials=args.n_trials,

@@ -59,6 +59,7 @@ def xlens_gal_sim(
         pixel_scale = 0.2,
         has_shift = True,
         around_corner = False,
+        galaxy_profile = 1,
     ):
     tract_id = 0
     patch_id = 0
@@ -109,21 +110,26 @@ def xlens_gal_sim(
         tract_info=skymap[tract_id],
         seed=seed,
     ).truthCatalog
-    for item in truthCatalog:
-        item[2] += rotId * np.pi / 2 # fix all galaxies' angle to 180 degree
-        if around_corner:
-            item[10] -= 0.5
-            item[11] -= 0.5
-            item[12] -= 0.5
-            item[13] -= 0.5
-    
+    # rotate intrinsic angles (xlens stores angles in radians)
+    truthCatalog["angles"] += rotId * np.pi / 2
+    if around_corner:
+        # place each galaxy half a pixel off the pixel centre
+        wcs_tmp = skymap[tract_id].getWcs()
+        for col_ra, col_dec in (("ra", "dec"), ("prelensed_ra", "prelensed_dec")):
+            ix, iy = wcs_tmp.skyToPixelArray(
+                truthCatalog[col_ra], truthCatalog[col_dec], degrees=True,
+            )
+            truthCatalog[col_ra], truthCatalog[col_dec] = wcs_tmp.pixelToSkyArray(
+                ix - 0.5, iy - 0.5, degrees=True,
+            )
+
     config = MultibandSimConfig()
     config.survey_name = (
         "lsst"  # The scale parameter needs to be consistent with scale
     )
     config.draw_image_noise = False
     config.truncate_stamp_size = 65
-    config.force_galaxy_profile = 1 # profile (1: gaussian, 2: exponential); 0 keeps the catalog's native
+    config.force_galaxy_profile = galaxy_profile # profile (1: gaussian, 2: exponential); 0 keeps the catalog's native
     #config.rotId = rotId
     config.psf_e1 = psf_e
     config.psf_e2 = -psf_e
@@ -166,7 +172,27 @@ def xlens_gal_sim(
     ("prelensed_image_x", "f8"), ("prelensed_image_y", "f8"),
     ("has_finite_shear", "bool"), ('hlr', '<f8')
 ]
-    gal_cat = np.array(truthCatalog, dtype=cat_dtype)
+    # The current xlens truth catalog only carries positions as (ra, dec) and
+    # (prelensed_ra, prelensed_dec) in degrees. Recover the pixel positions
+    # with the same WCS the simulator uses to place galaxies, then copy the
+    # shared fields by name (the field lists no longer align 1-to-1).
+    wcs = skymap[tract_id].getWcs()
+    image_x, image_y = wcs.skyToPixelArray(
+        truthCatalog["ra"], truthCatalog["dec"], degrees=True,
+    )
+    prelensed_image_x, prelensed_image_y = wcs.skyToPixelArray(
+        truthCatalog["prelensed_ra"], truthCatalog["prelensed_dec"], degrees=True,
+    )
+
+    gal_cat = np.zeros(len(truthCatalog), dtype=cat_dtype)
+    for col in cat_dtype:
+        name = col[0]
+        if name in truthCatalog.dtype.names:
+            gal_cat[name] = truthCatalog[name]
+    gal_cat["image_x"] = image_x
+    gal_cat["image_y"] = image_y
+    gal_cat["prelensed_image_x"] = prelensed_image_x
+    gal_cat["prelensed_image_y"] = prelensed_image_y
     gal_cat = pd.DataFrame(gal_cat)
 
 
@@ -203,6 +229,7 @@ class xlen_simulator():
                  init_id=0,
                  psf_e = 0.0,
                  rotId=0,
+                 galaxy_profile=1,
                  mode = 'calibration'):
         self.seed = ori_seed
         self.output_dir = output_dir
@@ -215,10 +242,11 @@ class xlen_simulator():
         self.init_id = init_id
         self.rotId = rotId
         self.psf_e = psf_e
+        self.galaxy_profile = galaxy_profile
         self.mode = mode
 
     def __call__(self, num_sims: int):
-        print(f"Starting xlens simulations: mode={self.mode}, num_sims={num_sims}, has_shift={self.has_shift}, rotId={self.rotId}")
+        print(f"Starting xlens simulations: mode={self.mode}, num_sims={num_sims}, has_shift={self.has_shift}, rotId={self.rotId}, galaxy_profile={self.galaxy_profile}")
         print(f"Saving at {self.output_dir}")
         if self.mode == 'calibration':
             shear_tasks = [
@@ -263,21 +291,64 @@ class xlen_simulator():
             psf_e=self.psf_e,
             has_shift=self.has_shift,
             around_corner = self.around_corner,
+            galaxy_profile = self.galaxy_profile,
         )
 
-psf_e = 0
-print(f'psf_e: {psf_e}')
-'''simulator = xlen_simulator('/work/nvme/bfmo/wenyinli/datasets/xlens_shift/', 
-                            num_workers=128, mode='training', 
-                            rotId=0,
-                            psf_e=psf_e,
-                            has_shift=True, ori_seed=666)
-simulator(200_000)'''
-simulator = xlen_simulator('/work/hdd/bdsp/wenyinli/datasets/xlens_gauss_distribution/', 
-                            num_workers=128, mode='calibration',
-                            rotId=1, init_id=200_000,
-                            psf_e=psf_e,
-                            has_shift=True, ori_seed=666)
-simulator(200_000)
+def main():
+    import argparse
+
+    parser = argparse.ArgumentParser(
+        description="Single-galaxy xlens simulation wrapper"
+    )
+    parser.add_argument(
+        "--output_dir",
+        default="/work/hdd/bdsp/wenyinli/datasets/xlens_gauss_distribution/",
+    )
+    parser.add_argument(
+        "--mode",
+        default="calibration",
+        choices=["calibration", "training"],
+    )
+    parser.add_argument("--abs_shear", type=float, default=0.02)
+    parser.add_argument("--ori_seed", type=int, default=666)
+    parser.add_argument("--image_size", type=int, default=1000)
+    parser.add_argument("--pixel_scale", type=float, default=0.2)
+    parser.add_argument("--num_workers", type=int, default=128)
+    parser.add_argument("--has_shift", type=int, default=1)
+    parser.add_argument("--around_corner", type=int, default=0)
+    parser.add_argument("--init_id", type=int, default=0)
+    parser.add_argument("--psf_e", type=float, default=0.0)
+    parser.add_argument("--rotId", type=int, default=0)
+    parser.add_argument(
+        "--galaxy_profile",
+        type=int,
+        default=1,
+        choices=[0, 1, 2],
+        help="galaxy light profile (1: gaussian, 2: exponential); 0 keeps the catalog's native",
+    )
+    parser.add_argument("--num_sims", type=int, default=200_000)
+
+    args = parser.parse_args()
+
+    simulator = xlen_simulator(
+        args.output_dir,
+        abs_shear=args.abs_shear,
+        ori_seed=args.ori_seed,
+        image_size=args.image_size,
+        pixel_scale=args.pixel_scale,
+        num_workers=args.num_workers,
+        has_shift=bool(args.has_shift),
+        around_corner=bool(args.around_corner),
+        init_id=args.init_id,
+        psf_e=args.psf_e,
+        rotId=args.rotId,
+        galaxy_profile=args.galaxy_profile,
+        mode=args.mode,
+    )
+    simulator(args.num_sims)
+
+
+if __name__ == "__main__":
+    main()
 
 

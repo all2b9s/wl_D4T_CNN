@@ -10,13 +10,16 @@ from src.architecture.single_gal_CNN import R180Inv_CNN_GeLU, D4T_CNN_GeLU,Smoot
 from src.architecture.forward8_CNN import Forward8_fixW_CNN, SmoothCNN_GeLU_mocked,Forward8_fixW_nores_CNN, Forward8_simp_CNN
 import argparse, os, random,re
 import time
+from pathlib import Path
 
 # =====================================================================
 # Configuration (adjust for your own environment)
 # =====================================================================
 # Path to the pretrained model checkpoint. Pick one that exists in ./models/,
 # e.g. './models/forward8_CNN_nada_50ep.pth' or './models/F8_fpfs_l5c32r01_50ep.pth'.
-model_path = './models/forward8_CNN_nada_50ep.pth'
+# Anchored to the repository root (parent of src/) so it is CWD-independent.
+_REPO_ROOT = Path(__file__).resolve().parents[1]
+model_path = str(_REPO_ROOT / "models" / "forward8_CNN_nada_50ep.pth")
 
 # Directory containing the simulated datasets (produced by build_dataset).
 # Replace this with the path to your own simulated cutouts.

@@ -4,28 +4,29 @@
 # ===========================================================================
 
 # ---- Config ----
-JOB_NAME="blended_det_fpfs_noiseless_s4"
+JOB_NAME="blended_det_rdsm1_sntest_s16"
 MODEL_TYPE="cnn"           # "cnn" or "gauss"
-GAUSS_SIGMA=4.0                 # only used when MODEL_TYPE=gauss
-MODEL_PATH="./models/F8_fpfs_l5c32r01_50ep.pth"   # only used when MODEL_TYPE=cnn
+GAUSS_SIGMA=16.0                 # only used when MODEL_TYPE=gauss
+MODEL_PATH="./models/blended_rdsm_t0120r03/best.pth"   # only used when MODEL_TYPE=cnn
 PSF_PATH="./logs/blended_test_psf.npy"
 CAT_REF_PATH="/projects/bdsp/wenyinli/codes/data/catsim-v4/OneDegSq.fits"
-BLENDED_DIR="/taiga/illinois/las/astro/xinliuxl/DC1_sim_blended"
-#BLENDED_DIR="/work/hdd/bfcn/wenyinli/noiseless_sim"
+BLENDED_DIR="/work/hdd/bfcn/wenyinli/blended_shapenoise_fullIMG"
+#BLENDED_DIR="/taiga/illinois/las/astro/xinliuxl/DC1_sim_blended/"
+#BLENDED_DIR="/work/hdd/bfcn/wenyinli/blended_training_fullIMG/"
 OUTPUT_ROOT="/work/hdd/bfmo/wenyinli/measurement/blended_sims"
 BASE_OUT="/projects/bdsp/wenyinli/datasets/xlens_sims/n0594/${JOB_NAME}"
 
 IO_CHUNK=5
 ML_BATCH=600
-NOISE_LEVEL="0"                 # e.g. 0.06 for 6% noise; empty = from variance map
+NOISE_LEVEL=""                 # e.g. 0.06 for 6% noise; empty = from variance map
 SNR_CUT=5.0                    # minimum peak SNR for FPFS detection (anacal snr_peak_min)
-SIM_MODES=("sim_mode0" "sim_mode40")
+SIM_MODES=("sim_mode80")
 # EXP_RANGE: first exposure index, last+1 exposure index
 EXP_START=0
-EXP_END=10000
+EXP_END=1000
 
 # ---- Calibration (standalone job, run after all measurement jobs) ----
-RUN_CALIBRATION="true"         # submit a dedicated calibration job
+RUN_CALIBRATION="false"         # submit a dedicated calibration job
 CAL_SHAPE_MODE="ml"            # "fpfs", "ml", or "both"
 CAL_MAG_CUT=""                 # e.g. 24.5 for selection response; empty = no cut
 CAL_BS_TIMES=100
@@ -38,8 +39,9 @@ JOB_IDS=()
 for SIM_MODE in "${SIM_MODES[@]}"; do
   # Map sim_mode to output label
   case "$SIM_MODE" in
-    sim_mode0) MODE_LABEL="g1_0" ;;
+    sim_mode0)  MODE_LABEL="g1_0" ;;
     sim_mode40) MODE_LABEL="g1_1" ;;
+    sim_mode80) MODE_LABEL="g1_2" ;;
     *) MODE_LABEL="$SIM_MODE" ;;
   esac
 
@@ -87,7 +89,7 @@ for SIM_MODE in "${SIM_MODES[@]}"; do
 #SBATCH --gpu-bind=closest
 #SBATCH --account=bfmo-dtai-gh
 #SBATCH --no-requeue
-#SBATCH -t 12:00:00
+#SBATCH -t 3:00:00
 #SBATCH --output=${BASE_OUT}/%x.%j.out
 #SBATCH --error=${BASE_OUT}/%x.%j.err
 
@@ -109,7 +111,7 @@ echo "IO chunk: ${IO_CHUNK} exposures  |  ML batch: ${ML_BATCH}"
 
 cd /projects/bdsp/wenyinli/codes/single_galaxies
 
-python -u blended_run.py ${PYTHON_ARGS}
+python -u src/blended_run.py ${PYTHON_ARGS}
 EOF
 
   echo "Submitting: ${JOB_NAME_I}  (${SIM_MODE})"
@@ -174,7 +176,7 @@ echo "note: needs g1_0 & g1_1 measurement outputs (dependency on pipeline jobs)"
 
 cd /projects/bdsp/wenyinli/codes/single_galaxies
 
-python -u blended_calibration.py ${CAL_ARGS}
+python -u src/blended_calibration.py ${CAL_ARGS}
 EOF
 
   echo "Submitting: ${CAL_JOB_NAME}  (calibration, dep=${DEP_ARGS:-none})"

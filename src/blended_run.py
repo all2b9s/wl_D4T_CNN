@@ -12,13 +12,14 @@ End-to-end batch processing for DC1 blended simulation FITS exposures:
 
 Output structure compatible with ``get_det_calibration_biases()``.
 
-Usage:
-    python blended_run.py --psf_path ./logs/blended_test_psf.npy \
+Usage (run from the repository root so that ``src`` is importable)::
+
+    python src/blended_run.py --psf_path ./logs/blended_test_psf.npy \
         --cat_ref_path /projects/bdsp/wenyinli/codes/data/catsim-v4/OneDegSq.fits \
         --range 0 100
 
-    # Calibration is a SEPARATE job — see blended_calibration.py:
-    # python blended_calibration.py --fname blended_det_fpfs_truth_s4 \
+    # Calibration is a SEPARATE job — see src/blended_calibration.py:
+    # python src/blended_calibration.py --fname blended_det_fpfs_truth_s4 \
     #     --range 0 10000 --shape_mode ml --bs_times 100
 
 References:
@@ -42,6 +43,7 @@ import argparse
 import time
 import threading
 import subprocess
+from pathlib import Path
 from dataclasses import dataclass
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
@@ -71,18 +73,25 @@ FPFS_CONFIG = anacal.fpfs.FpfsConfig(
     sigma_shapelets2=0.55,
 )
 
+# Repository root = parent of ``src/``.  Relative defaults are anchored here so
+# the script behaves the same no matter which directory it is launched from
+# (the launchers ``cd`` to the repo root, but interactive runs may not).
+REPO_ROOT = Path(__file__).resolve().parents[1]
+
 BLENDED_DIR = "/taiga/illinois/las/astro/xinliuxl/DC1_sim_blended"
 OUTPUT_ROOT = "/work/hdd/bfmo/wenyinli/measurement/blended_sims"
-MODEL_PATH = "./models/F8_fpfs_l5c32r01_50ep.pth"
-PSF_PATH = "./logs/blended_test_psf.npy"
+MODEL_PATH = str(REPO_ROOT / "models" / "F8_fpfs_l5c32r01_50ep.pth")
+PSF_PATH = str(REPO_ROOT / "logs" / "blended_test_psf.npy")
 CAT_REF_PATH = "/projects/bdsp/wenyinli/codes/data/catsim-v4/OneDegSq.fits"
 
 # sim_mode → (shear_comp, shear_mode) for calibration-compatible output paths
 # sim_mode0: g1 = -0.02  →  g1_0
 # sim_mode40: g1 = +0.02  →  g1_1
+# sim_mode80            →  g1_2  (label matches blended_run.sh MODE_LABEL)
 SIM_MODE_MAP = {
     "sim_mode0": ("g1", 0),
     "sim_mode40": ("g1", 1),
+    "sim_mode80": ("g1", 2),
 }
 
 PIXEL_SCALE = 0.2

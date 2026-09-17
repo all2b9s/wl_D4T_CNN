@@ -58,7 +58,7 @@ def _resolve_det_npz_path(base_dir, shear_comp, shear_mode, fname, index):
 
     Tries several directory layouts to accommodate different run
     configurations of ``detection_ml_pipeline`` and
-    ``fpfsdet_MLshape_run.py`` (which saves as ``catalog_{index}.npz``).
+    ``src/fpfsdet_MLshape_run.py`` (which saves as ``catalog_{index}.npz``).
 
     Parameters
     ----------

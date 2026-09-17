@@ -560,6 +560,14 @@ def run_detection_and_fpfs(
     return _merge_detection_and_fpfs(det_cat_raw, fpfs_out, pixel_scale)
 
 
+#: Shape columns that prefer the forced FPFS1 measurement
+#: (``anacal.fpfs.process_image`` at ``fpfs_config.sigma_shapelets1``, 0.45")
+#: over the Task's task-kernel shapes (``sigma_arcsec``, 0.40").
+#: The flux columns (``fpfs_m00`` / ``fpfs_dm00_dg{1,2}``) and the selection
+#: weight are deliberately NOT listed here: they stay on the Task kernel.
+FPFS1_PREFERRED_FIELDS = ("fpfs_e1", "fpfs_e2", "fpfs_R11", "fpfs_R22")
+
+
 def _merge_detection_and_fpfs(
     det_cat: np.ndarray,
     fpfs_out: np.ndarray,
@@ -570,11 +578,13 @@ def _merge_detection_and_fpfs(
 
     Detector output provides positions (``x1_det``, ``x2_det`` in arcsec),
     the full differentiable selection weight (``wsel``, ``dwsel_dg1``,
-    ``dwsel_dg2`` — detection weight refined by the FPFS flux/size cut)
-    and the task-kernel FPFS shapes/flux (``fpfs_e{1,2}``,
-    ``fpfs_de{1,2}_dg{1,2}``, ``fpfs_m0``).  The task-kernel quantities are
-    the production estimator and are used directly; the forced ``fpfs1_*``
-    columns in ``fpfs_out`` are only a fallback.
+    ``dwsel_dg2`` — detection weight refined by the FPFS flux/size cut), the
+    task-kernel flux (``flux_gauss0`` / ``dflux_gauss0_dg{1,2}``) and the
+    task-kernel shapes.
+
+    The SHAPE columns (``fpfs_e{1,2}`` / ``fpfs_R{11,22}``) prefer the forced
+    FPFS1 measurement -- see :data:`FPFS1_PREFERRED_FIELDS`.  The flux columns
+    and the selection weight keep the Task's task-kernel values.
 
     Parameters
     ----------
@@ -633,61 +643,65 @@ def _merge_detection_and_fpfs(
         _extract_column(det_cat, det_names, ["dwsel_dg2", "dwdet_dg2", "dw_dg2"]), n_det
     )
 
-    # --- FPFS shapes (task kernel, self-consistent with wsel/dwsel) ---
-    # The production FPFS estimator is the Task's task-kernel measurement
-    # (fpfs_e{1,2} / fpfs_de{1,2}_dg{1,2} / fpfs_m0), the same kernel that
-    # wsel/dwsel come from (see example_fpfs_blended.ipynb).  The forced
-    # fpfs1_* columns are only a defensive fallback; the consistency guard
-    # _check_task_fpfs_columns guarantees they are never actually used.
+    # --- FPFS shapes: prefer the forced FPFS1 measurement ---
+    # FPFS1 is measured with the shapelet kernel fpfs_config.sigma_shapelets1
+    # (0.45"), the same kernel src/anacal_shape.py stores for the isolated
+    # measurements, so blended and isolated shapes use one estimator.  The
+    # Task's task-kernel shapes (sigma_arcsec = 0.40") stay as the fallback.
+    # The flux columns below deliberately keep the task kernel.
     provenance = {}
 
     col, src = _extract_preferred(
         det_cat, det_names, fpfs_out, fpfs_names,
         ["fpfs_e1", "e1"],
-        ["fpfs1_e1", "fpfs_e1", "e1"])
+        ["fpfs1_e1", "fpfs_e1", "e1"],
+        prefer="fpfs1")
     merged["fpfs_e1"] = _fill_nan(col, n_det)
     provenance["fpfs_e1"] = src
 
     col, src = _extract_preferred(
         det_cat, det_names, fpfs_out, fpfs_names,
         ["fpfs_e2", "e2"],
-        ["fpfs1_e2", "fpfs_e2", "e2"])
+        ["fpfs1_e2", "fpfs_e2", "e2"],
+        prefer="fpfs1")
     merged["fpfs_e2"] = _fill_nan(col, n_det)
     provenance["fpfs_e2"] = src
 
     col, src = _extract_preferred(
         det_cat, det_names, fpfs_out, fpfs_names,
         ["fpfs_de1_dg1", "de1_dg1", "R11"],
-        ["fpfs1_de1_dg1", "fpfs_de1_dg1", "de1_dg1", "R11"])
+        ["fpfs1_de1_dg1", "fpfs_de1_dg1", "de1_dg1", "R11"],
+        prefer="fpfs1")
     merged["fpfs_R11"] = _fill_nan(col, n_det)
     provenance["fpfs_R11"] = src
 
     col, src = _extract_preferred(
         det_cat, det_names, fpfs_out, fpfs_names,
         ["fpfs_de2_dg2", "de2_dg2", "R22"],
-        ["fpfs1_de2_dg2", "fpfs_de2_dg2", "de2_dg2", "R22"])
+        ["fpfs1_de2_dg2", "fpfs_de2_dg2", "de2_dg2", "R22"],
+        prefer="fpfs1")
     merged["fpfs_R22"] = _fill_nan(col, n_det)
     provenance["fpfs_R22"] = src
 
     # --- FPFS flux (task kernel) ---
     col, src = _extract_preferred(
         det_cat, det_names, fpfs_out, fpfs_names,
-        ["fpfs_m0", "m00", "flux_gauss0"],
-        ["fpfs1_m00", "fpfs_m00", "m00", "flux_gauss0"])
+        ["flux_gauss0", "fpfs_m0", "m00"],
+        ["flux_gauss0", "fpfs1_m00", "fpfs_m00", "m00"])
     merged["fpfs_m00"] = _fill_nan(col, n_det)
     provenance["fpfs_m00"] = src
 
     col, src = _extract_preferred(
         det_cat, det_names, fpfs_out, fpfs_names,
-        ["fpfs_dm0_dg1", "dm00_dg1", "dflux_gauss0_dg1"],
-        ["fpfs1_dm00_dg1", "fpfs_dm00_dg1", "dm00_dg1", "dflux_gauss0_dg1"])
+        ["dflux_gauss0_dg1", "fpfs_dm0_dg1", "dm00_dg1"],
+        ["dflux_gauss0_dg1", "fpfs1_dm00_dg1", "fpfs_dm00_dg1", "dm00_dg1"])
     merged["fpfs_dm00_dg1"] = _fill_nan(col, n_det)
     provenance["fpfs_dm00_dg1"] = src
 
     col, src = _extract_preferred(
         det_cat, det_names, fpfs_out, fpfs_names,
-        ["fpfs_dm0_dg2", "dm00_dg2", "dflux_gauss0_dg2"],
-        ["fpfs1_dm00_dg2", "fpfs_dm00_dg2", "dm00_dg2", "dflux_gauss0_dg2"])
+        ["dflux_gauss0_dg2", "fpfs_dm0_dg2", "dm00_dg2"],
+        ["dflux_gauss0_dg2", "fpfs1_dm00_dg2", "fpfs_dm00_dg2", "dm00_dg2"])
     merged["fpfs_dm00_dg2"] = _fill_nan(col, n_det)
     provenance["fpfs_dm00_dg2"] = src
 
@@ -758,15 +772,15 @@ def _extract_preferred(
     fpfs_names: list,
     det_candidates: list,
     fpfs_candidates: list,
+    prefer: str = "task",
 ) -> Tuple[Optional[np.ndarray], Tuple[Optional[str], Optional[str]]]:
-    """Extract a column, preferring the Task's task-kernel FPFS measurement.
+    """Extract a column, preferring one of the two measurement kernels.
 
-    The production FPFS estimator -- the one that is self-consistent with
-    the selection weight ``wsel``/``dwsel`` (see example_fpfs_blended.ipynb)
-    -- is the task-kernel measurement carried in ``det_cat``
-    (``fpfs_e1``/``fpfs_de1_dg1``/``fpfs_m0`` ...).  The forced ``fpfs1_*``
-    columns in ``fpfs_out`` are only a defensive fallback; the consistency
-    guard ``_check_task_fpfs_columns`` raises before it can be reached.
+    ``det_candidates`` are task-kernel names (from ``det_cat``) and
+    ``fpfs_candidates`` are forced-measurement names (from ``fpfs_out``).
+    ``prefer`` selects which kernel is searched first; the other one is the
+    fallback.  Shape columns pass ``prefer="fpfs1"`` (see
+    :data:`FPFS1_PREFERRED_FIELDS`), everything else keeps the task kernel.
 
     Returns
     -------
@@ -774,15 +788,24 @@ def _extract_preferred(
         The extracted column, or ``None`` if not found in either catalog.
     source : (str, str) or (None, None)
         ``("task", actual_name)`` when taken from ``det_cat``,
-        ``("fpfs1", actual_name)`` when fallen back to ``fpfs_out``, or
+        ``("fpfs1", actual_name)`` when taken from ``fpfs_out``, or
         ``(None, None)`` when the column was not found anywhere.
     """
-    for name in det_candidates:
-        if name in det_names:
-            return _column_1d(det_cat[name]), ("task", name)
-    for name in fpfs_candidates:
-        if name in fpfs_names:
-            return _column_1d(fpfs_out[name]), ("fpfs1", name)
+    if prefer not in ("task", "fpfs1"):
+        raise ValueError(f"prefer must be 'task' or 'fpfs1', got {prefer!r}")
+    ordered = (
+        [(det_cat, det_names, "task", det_candidates),
+         (fpfs_out, fpfs_names, "fpfs1", fpfs_candidates)]
+        if prefer == "task" else
+        [(fpfs_out, fpfs_names, "fpfs1", fpfs_candidates),
+         (det_cat, det_names, "task", det_candidates)]
+    )
+    for catalog, names, source, candidates in ordered:
+        if catalog is None:
+            continue
+        for name in candidates:
+            if name in names:
+                return _column_1d(catalog[name]), (source, name)
     return None, (None, None)
 
 
@@ -790,9 +813,10 @@ def _log_fpfs_provenance(provenance: dict, n_det: int) -> None:
     """Print, once per measurement, the source of each FPFS column.
 
     One concise line of ``field<-source.column`` entries, e.g.
-    ``fpfs_e1<-task.fpfs_e1``.  Warns if any column had to fall back to the
-    forced ``fpfs1_*`` measurement (a different shapelet scale than the task
-    kernel).
+    ``fpfs_e1<-fpfs1.fpfs1_e1``.  Warns when a column did not use its expected
+    kernel: ``fpfs1`` for the shape fields in :data:`FPFS1_PREFERRED_FIELDS`,
+    ``task`` for the flux fields.  A mismatch means the preferred kernel was
+    unavailable and the other scale was substituted.
     """
     tags = []
     for field, (source, name) in provenance.items():
@@ -801,12 +825,20 @@ def _log_fpfs_provenance(provenance: dict, n_det: int) -> None:
         else:
             tags.append(f"{field}<-{source}.{name}")
     print(f"[fpfs] n={n_det} sources: " + " ".join(tags))
-    if any(source == "fpfs1" for source, _ in provenance.values()):
-        print(
-            "[fpfs] WARNING: some columns fell back to fpfs1_* (measured at "
-            "sigma_shapelets1, a different scale than the task kernel at "
-            "sigma_arcsec) -- inconsistent with wsel/dwsel."
-        )
+
+    def expected_source(field: str) -> str:
+        return "fpfs1" if field in FPFS1_PREFERRED_FIELDS else "task"
+
+    unexpected = {field: source for field, (source, _) in provenance.items()
+                  if source is not None and source != expected_source(field)}
+    missing = [field for field, (source, _) in provenance.items() if source is None]
+    if unexpected:
+        print(f"[fpfs] WARNING: {unexpected} did not use the expected kernel "
+              "(shape columns prefer fpfs1 at sigma_shapelets1, flux columns "
+              "stay on the task kernel at sigma_arcsec) -- different "
+              "measurement scale.")
+    if missing:
+        print(f"[fpfs] WARNING: {missing} found in neither kernel; saved as NaN.")
 
 
 def _empty_det_cat() -> np.ndarray:
