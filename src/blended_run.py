@@ -40,6 +40,7 @@ import pandas as pd
 import torch
 import anacal
 import argparse
+import json
 import time
 import threading
 import subprocess
@@ -60,7 +61,7 @@ from src.anacal.detection_ml_pipeline import (
     match_detections_to_truth,
 )
 from src.blending.ml_shape_measurement import ml_shape_measure
-from src.architecture.forward8_CNN import Forward8_fixW_CNN
+from src.architecture.forward8_CNN import Forward8_fixW_CNN, Forward8_AttnW_CNN
 from src.architecture.quad_Gauss import QuadGauss
 from src.datasets.dataset_toolkit import get_weighted_e
 
@@ -499,6 +500,7 @@ def run_detection_ml_pipeline(
     fname: str = "det_ml",
     model_path: str = MODEL_PATH,
     model_type: str = "cnn",
+    architecture: str = "Forward8_fixW_CNN",
     gauss_sigma: float = 4.0,
     save_npz: bool = True,
     save_csv: bool = True,
@@ -524,11 +526,25 @@ def run_detection_ml_pipeline(
         model.eval()
         print(f"[pipeline] QuadGauss model created (sigma={gauss_sigma}, no checkpoint needed)")
     elif model_type == "cnn":
-        model = Forward8_fixW_CNN(num_layers=5, base_channels=32, res_factor=0.1,
-                                  nl_sigma=4, gw_sigma=4).to(device)
-        model.load_state_dict(torch.load(model_path, map_location="cpu"))
+        classes = {"Forward8_fixW_CNN": Forward8_fixW_CNN,
+                   "Forward8_AttnW_CNN": Forward8_AttnW_CNN}
+        config_path = Path(model_path).with_name("config.json")
+        if config_path.is_file():
+            config = json.loads(config_path.read_text())
+            recorded_class = config.get("model_class", "Forward8_fixW_CNN")
+            if recorded_class != architecture:
+                raise ValueError(f"{config_path}: model_class={recorded_class} does not match "
+                                 f"--architecture={architecture}")
+            model_kwargs = config["model"]
+        elif architecture == "Forward8_fixW_CNN":
+            model_kwargs = dict(num_layers=5, base_channels=32, res_factor=0.1,
+                                nl_sigma=4, gw_sigma=4)
+        else:
+            raise FileNotFoundError(f"{architecture} requires {config_path} to restore training parameters")
+        model = classes[architecture](**model_kwargs).to(device)
+        model.load_state_dict(torch.load(model_path, map_location="cpu", weights_only=True))
         model.eval()
-        print(f"[pipeline] CNN model loaded from {model_path}")
+        print(f"[pipeline] {architecture} model loaded from {model_path}")
     else:
         raise ValueError(f"Unknown model_type: {model_type}. Choose 'cnn' or 'gauss'.")
 
@@ -809,6 +825,9 @@ if __name__ == "__main__":
                    help="Path to trained ML model .pth (ignored when --model_type=gauss)")
     p.add_argument("--model_type", type=str, default="cnn", choices=["cnn", "gauss"],
                    help="Model type: 'cnn' (Forward8_fixW_CNN) or 'gauss' (QuadGauss)")
+    p.add_argument("--architecture", type=str, default="Forward8_fixW_CNN",
+                   choices=["Forward8_fixW_CNN", "Forward8_AttnW_CNN"],
+                   help="CNN architecture; checked against config.json when present")
     p.add_argument("--gauss_sigma", type=float, default=4.0,
                    help="Gaussian weight sigma in pixels (only for --model_type=gauss)")
     p.add_argument("--workers", type=int, default=32,
@@ -854,6 +873,7 @@ if __name__ == "__main__":
         fname=args.fname,
         model_path=args.model,
         model_type=args.model_type,
+        architecture=args.architecture,
         gauss_sigma=args.gauss_sigma,
         save_npz=not args.no_npz,
         save_csv=not args.no_csv,

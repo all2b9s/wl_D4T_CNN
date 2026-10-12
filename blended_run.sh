@@ -4,14 +4,15 @@
 # ===========================================================================
 
 # ---- Config ----
-JOB_NAME="blended_det_rdsm1_sntest_s16"
+JOB_NAME="blended_det_rdsm_AttnW"
 MODEL_TYPE="cnn"           # "cnn" or "gauss"
+ARCHITECTURE="Forward8_AttnW_CNN"  # CNN class recorded in checkpoint config.json
 GAUSS_SIGMA=16.0                 # only used when MODEL_TYPE=gauss
-MODEL_PATH="./models/blended_rdsm_t0120r03/best.pth"   # only used when MODEL_TYPE=cnn
+MODEL_PATH="./models/blended_rdsm_runs/renoised_q_n0594_330k_3m/attnw/best.pth"   # only used when MODEL_TYPE=cnn
 PSF_PATH="./logs/blended_test_psf.npy"
 CAT_REF_PATH="/projects/bdsp/wenyinli/codes/data/catsim-v4/OneDegSq.fits"
-BLENDED_DIR="/work/hdd/bfcn/wenyinli/blended_shapenoise_fullIMG"
-#BLENDED_DIR="/taiga/illinois/las/astro/xinliuxl/DC1_sim_blended/"
+#BLENDED_DIR="/work/hdd/bfcn/wenyinli/blended_shapenoise_fullIMG"
+BLENDED_DIR="/taiga/illinois/las/astro/xinliuxl/DC1_sim_blended/"
 #BLENDED_DIR="/work/hdd/bfcn/wenyinli/blended_training_fullIMG/"
 OUTPUT_ROOT="/work/hdd/bfmo/wenyinli/measurement/blended_sims"
 BASE_OUT="/projects/bdsp/wenyinli/datasets/xlens_sims/n0594/${JOB_NAME}"
@@ -20,13 +21,13 @@ IO_CHUNK=5
 ML_BATCH=600
 NOISE_LEVEL=""                 # e.g. 0.06 for 6% noise; empty = from variance map
 SNR_CUT=5.0                    # minimum peak SNR for FPFS detection (anacal snr_peak_min)
-SIM_MODES=("sim_mode80")
+SIM_MODES=("sim_mode0" "sim_mode40")
 # EXP_RANGE: first exposure index, last+1 exposure index
 EXP_START=0
-EXP_END=1000
+EXP_END=10000
 
 # ---- Calibration (standalone job, run after all measurement jobs) ----
-RUN_CALIBRATION="false"         # submit a dedicated calibration job
+RUN_CALIBRATION="true"          # submit a dedicated calibration job
 CAL_SHAPE_MODE="ml"            # "fpfs", "ml", or "both"
 CAL_MAG_CUT=""                 # e.g. 24.5 for selection response; empty = no cut
 CAL_BS_TIMES=100
@@ -61,6 +62,7 @@ for SIM_MODE in "${SIM_MODES[@]}"; do
   PYTHON_ARGS+=" --gauss_sigma ${GAUSS_SIGMA}"
   if [ "$MODEL_TYPE" = "cnn" ]; then
     PYTHON_ARGS+=" --model ${MODEL_PATH}"
+    PYTHON_ARGS+=" --architecture ${ARCHITECTURE}"
   fi
   if [ -n "$NOISE_LEVEL" ]; then
     PYTHON_ARGS+=" --noise ${NOISE_LEVEL}"
@@ -87,9 +89,9 @@ for SIM_MODE in "${SIM_MODES[@]}"; do
 #SBATCH --cpus-per-task=128
 #SBATCH --gpus-per-node=1
 #SBATCH --gpu-bind=closest
-#SBATCH --account=bfmo-dtai-gh
+#SBATCH --account=bdsp-dtai-gh
 #SBATCH --no-requeue
-#SBATCH -t 3:00:00
+#SBATCH -t 5:00:00
 #SBATCH --output=${BASE_OUT}/%x.%j.out
 #SBATCH --error=${BASE_OUT}/%x.%j.err
 
@@ -97,6 +99,7 @@ set -euo pipefail
 
 source /projects/bfcn/wenyinli/miniconda3/etc/profile.d/conda.sh
 conda activate /u/wenyinli/.conda/envs/anacal_clone
+unset PYTHONPATH
 
 echo "=== Blended Image FPFS Detection + ML Shape Measurement ==="
 echo "BLENDED_DIR:${BLENDED_DIR}"
@@ -104,6 +107,7 @@ echo "Sim mode: ${SIM_MODE}  →  ${MODE_LABEL}"
 echo "Range: ${EXP_START}-${EXP_END}  |  Model type: ${MODEL_TYPE}"
 if [ "$MODEL_TYPE" = "cnn" ]; then
   echo "Checkpoint: ${MODEL_PATH}"
+  echo "Architecture: ${ARCHITECTURE}"
 else
   echo "Gauss sigma: ${GAUSS_SIGMA}  (no checkpoint)"
 fi
@@ -111,7 +115,7 @@ echo "IO chunk: ${IO_CHUNK} exposures  |  ML batch: ${ML_BATCH}"
 
 cd /projects/bdsp/wenyinli/codes/single_galaxies
 
-python -u src/blended_run.py ${PYTHON_ARGS}
+python -u -m src.blended_run ${PYTHON_ARGS}
 EOF
 
   echo "Submitting: ${JOB_NAME_I}  (${SIM_MODE})"
@@ -167,6 +171,7 @@ set -euo pipefail
 
 source /projects/bfcn/wenyinli/miniconda3/etc/profile.d/conda.sh
 conda activate /u/wenyinli/.conda/envs/anacal_clone
+unset PYTHONPATH
 
 echo "=== Blended Calibration (single-shear g1) ==="
 echo "output_root: ${OUTPUT_ROOT}  |  fname: ${JOB_NAME}"
@@ -176,7 +181,7 @@ echo "note: needs g1_0 & g1_1 measurement outputs (dependency on pipeline jobs)"
 
 cd /projects/bdsp/wenyinli/codes/single_galaxies
 
-python -u src/blended_calibration.py ${CAL_ARGS}
+python -u -m src.blended_calibration ${CAL_ARGS}
 EOF
 
   echo "Submitting: ${CAL_JOB_NAME}  (calibration, dep=${DEP_ARGS:-none})"
