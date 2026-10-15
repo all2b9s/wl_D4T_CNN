@@ -322,7 +322,8 @@ def center_crop_to(x: torch.Tensor, target_hw: Tuple[int, int]) -> torch.Tensor:
     left = (W - tW) // 2
     return x[:, :, top:top + tH, left:left + tW]
 
-def gaussian_weight_2d(size: int | tuple[int, int], std: float = 16, device=None, normalize=True, dtype=torch.float32):
+def gaussian_weight_2d(size: int | tuple[int, int], std: float = 16, device=None, normalize=True, dtype=torch.float32,
+                       suppress: bool = True, r_cut: float = 24.0, suppress_order: int = 8):
     """
     Generate a 2D Gaussian weight image centered in the middle.
 
@@ -331,6 +332,12 @@ def gaussian_weight_2d(size: int | tuple[int, int], std: float = 16, device=None
         std: standard deviation (in pixels)
         device: torch device (cpu / cuda)
         normalize: if True, normalize so that sum = 1
+        suppress: if True, multiply by a smooth radial super-Gaussian taper
+            T(r) = exp(-(r^2 / r_cut^2)^(suppress_order/2)), which is ~1 inside
+            r_cut and strongly suppresses r > r_cut regardless of std.
+            (T(r_cut) = e^-1; for order 8: T(0.5 r_cut) ~ 0.996, T(1.33 r_cut) ~ 3e-4)
+        r_cut: taper radius (in pixels)
+        suppress_order: even integer; larger -> sharper edge, flatter inside
 
     Returns:
         Tensor of shape [H, W] with dtype=float32
@@ -346,6 +353,9 @@ def gaussian_weight_2d(size: int | tuple[int, int], std: float = 16, device=None
     
     
     g = torch.exp(-0.5 * (xx**2 + yy**2) / (std**2))/(2*np.pi*std**2)
+    if suppress:
+        # smooth (C-inf, written in r^2 so no cusp at r=0), isotropic outer taper
+        g = g * torch.exp(-((xx**2 + yy**2) / r_cut**2) ** (suppress_order / 2))
     g = (g + g.flip([0, 1]) + g.flip([0]) + g.flip([1]))/4 # make sure center is max
     #if normalize:
     #    g /= g.sum()

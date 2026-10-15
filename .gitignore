@@ -17,6 +17,11 @@
 # 注：脚本本体（blended_run.py / anacal_shape.py 等）已移到 src/，由上面的 !src/** 覆盖
 !blended_*.ipynb
 
+# 保留 ml_wl 流程代码与 yaml 配置（rounds/ 是运行输出，不跟踪）
+!ml_wl/
+!ml_wl/**
+ml_wl/rounds/
+
 # 缓存文件一律忽略（放在最后，确保 src/ 里面也生效）
 __pycache__/
 *.pyc

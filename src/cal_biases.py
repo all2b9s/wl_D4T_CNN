@@ -17,10 +17,10 @@ import time
 dir = ''
 
 # Root of the saved shape/Rana results
-data_dir = ''
+data_dir = '/work/hdd/bfmo/wenyinli/measurement/'
 
 # Directory where the final calibration results are saved.
-cali_save_dir = ''
+cali_save_dir = '/work/hdd/bfmo/wenyinli/measurement/calibration/'
 
 
 def parse_shear_tasks(task_list):
@@ -97,6 +97,7 @@ def get_calibration_biases(
 
     g_all = np.zeros([grid_per_img*imgBs*img_nB, 5, 2])
     R_all = np.zeros([grid_per_img*imgBs*img_nB, 4, 2, 2])
+    mask = None
     if mag_cut is not None:
         flux_all = np.zeros([grid_per_img*imgBs*img_nB,5,1])
         Rflux_all = np.zeros([grid_per_img*imgBs*img_nB,1,2])

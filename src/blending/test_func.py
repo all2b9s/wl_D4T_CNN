@@ -82,7 +82,7 @@ SWEEP_JOB_PREFIX = "blended_det_rdsm_sweep_s"
 
 #: ``config.json`` keys forwarded to ``Forward8_fixW_CNN``.
 MODEL_KWARG_KEYS = ("in_dim", "base_channels", "head_hidden", "out_dim",
-                    "num_layers", "res_factor", "nl_sigma", "gw_sigma")
+                    "num_layers", "res_factor", "nl_sigma", "gw_sigma", "shared_head")
 #: Keys that must be present, otherwise the architecture cannot be verified.
 REQUIRED_MODEL_KEYS = ("nl_sigma", "gw_sigma")
 
@@ -133,14 +133,33 @@ def model_kwargs_from_config(config: Mapping, source: str = "config.json") -> di
     model = config.get("model")
     if not isinstance(model, Mapping):
         raise ValueError(f"{source}: missing 'model' block")
-    missing = [key for key in REQUIRED_MODEL_KEYS if key not in model]
+    model_class = config.get("model_class", "Forward8_fixW_CNN")
+    if model_class not in ("Forward8_fixW_CNN", "Forward8_poolmix_CNN",
+                            "Forward8_AdaSigma_CNN", "Forward8_AttnW_CNN"):
+        raise ValueError(f"Unsupported model class: {model_class}")
+    poolmix = model_class == "Forward8_poolmix_CNN"
+    adaptive_keys = {
+        "Forward8_AdaSigma_CNN": ("sigma_init", "sigma_hidden"),
+        "Forward8_AttnW_CNN": ("attn_grid_size", "attn_dim", "attn_heads"),
+    }
+    required = (("nl_sigma", "suppress", "r_cut", "suppress_order") + adaptive_keys[model_class]
+                if model_class in adaptive_keys else
+                ("nl_sigma", "pool_sigmas") if poolmix else REQUIRED_MODEL_KEYS)
+    missing = [key for key in required if key not in model]
     if missing:
         raise ValueError(
             f"{source} does not record {missing}; the trained architecture cannot be "
             "verified. Retrain with src/train_blended_rdsm.py --nl-sigma/--gw-sigma, "
             "which writes both sigmas into config.json."
         )
-    return {key: model[key] for key in MODEL_KWARG_KEYS if key in model}
+    keys = tuple(k for k in MODEL_KWARG_KEYS if k != "gw_sigma") + ("pool_sigmas", "suppress", "r_cut", "suppress_order", "adaptive_pool", "pool_gate_hidden") if poolmix else MODEL_KWARG_KEYS
+    if model_class in adaptive_keys:
+        keys = tuple(k for k in MODEL_KWARG_KEYS if k != "gw_sigma") + required
+    if model_class == "Forward8_fixW_CNN":
+        keys = tuple(keys) + ("suppress",)
+    if model_class == 'Forward8_AttnW_CNN':
+        keys = tuple(keys) + ('head_num_hidden_layers',)
+    return {key: model[key] for key in keys if key in model}
 
 
 def build_cnn_from_run_dir(
@@ -156,7 +175,8 @@ def build_cnn_from_run_dir(
     ensure_code_dir_on_path()
     import torch
 
-    from src.architecture.forward8_CNN import Forward8_fixW_CNN
+    from src.architecture.forward8_CNN import (Forward8_fixW_CNN, Forward8_poolmix_CNN,
+                                                Forward8_AdaSigma_CNN, Forward8_AttnW_CNN)
 
     run_dir = Path(run_dir)
     config = read_run_config(run_dir)
@@ -165,7 +185,10 @@ def build_cnn_from_run_dir(
     if not checkpoint.is_file():
         raise FileNotFoundError(f"Checkpoint not found: {checkpoint}")
 
-    model = Forward8_fixW_CNN(**model_kwargs)
+    classes = {cls.__name__: cls for cls in (Forward8_fixW_CNN, Forward8_poolmix_CNN,
+                                            Forward8_AdaSigma_CNN, Forward8_AttnW_CNN)}
+    model_class = classes[config.get("model_class", "Forward8_fixW_CNN")]
+    model = model_class(**model_kwargs)
     model.load_state_dict(torch.load(checkpoint, map_location="cpu", weights_only=True))
     if device is None:
         device = "cuda" if torch.cuda.is_available() else "cpu"

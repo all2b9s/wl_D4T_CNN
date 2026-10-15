@@ -45,6 +45,8 @@ def parse_args():
     parser.add_argument('--num-samples', '--num_samples', type=positive_int, default=100_000,
                         help='Exact number of usable training objects (default: 100000).')
     parser.add_argument('--num-epoch', '--num_epoch', '--epochs', type=positive_int, default=10)
+    parser.add_argument('--save-epochs', type=positive_int, nargs='*', default=[],
+                        help='Also save epoch_NNN.pth after these epochs; does not change training.')
     parser.add_argument('--batch-size', '--batch_size', type=positive_int, default=750)
     parser.add_argument('--val-exposures', type=positive_int, default=5)
     parser.add_argument('--seed', type=int, default=42)
@@ -52,7 +54,7 @@ def parse_args():
     parser.add_argument('--weight-decay', type=float, default=1e-4)
     parser.add_argument('--device', default='auto', help='auto, cpu, cuda, or cuda:N')
     parser.add_argument('--blended-dir', type=Path,
-                        default=Path('/work/hdd/bfcn/wenyinli/blended_training_stamp'))
+                        default=Path('/work/hdd/bfcn/wenyinli/blended_training_q_n0594'))
     parser.add_argument('--label-path', type=Path,
                         default=PROJECT_ROOT / 'codes/opt_e/datasets/isolated_rdsm_best_m002/rdsm_catalog.npz')
     parser.add_argument('--e1-column', default='rdsm_e1',
@@ -75,6 +77,8 @@ def parse_args():
         parser.error('--lr must be finite and positive')
     if not math.isfinite(args.weight_decay) or args.weight_decay < 0:
         parser.error('--weight-decay must be finite and nonnegative')
+    if any(epoch > args.num_epoch for epoch in args.save_epochs):
+        parser.error('--save-epochs cannot exceed --num-epoch')
     return args
 
 
@@ -99,6 +103,8 @@ def main():
     from src.datasets.single_gal_dataset import rotate_image_90, rotate_spin2, flip_spin2
 
     BLENDED_DIR = args.blended_dir.resolve()
+    from scripts.prepare_blended_q import validate_dataset, read_q_images
+    preprocessing = validate_dataset(BLENDED_DIR)
     LABEL_PATH = args.label_path.resolve()
     RUN_DIR = args.run_dir.resolve()
     SEED, EPOCHS, BATCH_SIZE = args.seed, args.num_epoch, args.batch_size
@@ -216,7 +222,7 @@ def main():
                     for key in ('exp_id', 'det_id', 'catsim_index'):
                         if not np.array_equal(saved[key], aligned[key].to_numpy()):
                             raise ValueError(f'{exposure}: {key} mismatch')
-                    images = np.asarray(saved['blended_stamps'], dtype=np.float32)
+                    images = read_q_images(saved, preprocessing)
                 if images.shape != (len(sid), 64, 64) or not np.isfinite(images).all():
                     raise ValueError(f'{exposure}: invalid blended images')
                 targets = aligned[['e1', 'e2']].to_numpy(dtype=np.float32)
@@ -255,7 +261,8 @@ def main():
                   weight_decay=WEIGHT_DECAY, model=MODEL_KWARGS, labels=str(LABEL_PATH),
                   teacher_checkpoint=teacher_checkpoint, teacher_norm=teacher_norm,
                   target_columns=[args.e1_column, args.e2_column], image_normalization='model internal',
-                  blended_dir=str(BLENDED_DIR))
+                  blended_dir=str(BLENDED_DIR), image_preprocessing=preprocessing)
+    config['save_epochs'] = sorted(set(args.save_epochs))
     (RUN_DIR / 'config.json').write_text(json.dumps(config, indent=2))
     np.savez(RUN_DIR / 'split_exposures.npz', **split_exposures)
     np.save(RUN_DIR / 'train_sample_ids.npy', train_sample_ids)
@@ -300,6 +307,8 @@ def main():
             best_val = val_mse
             torch.save(model.state_dict(), BEST_PATH)
         torch.save(model.state_dict(), LAST_PATH)
+        if epoch in args.save_epochs:
+            torch.save(model.state_dict(), RUN_DIR / f'epoch_{epoch:03d}.pth')
         pd.DataFrame(history).to_csv(RUN_DIR / 'history.csv', index=False)
         epoch_bar.set_postfix(train=f'{train_mse:.4g}', val=f'{val_mse:.4g}', lr=f'{lr:.3g}')
     epoch_bar.close()

@@ -119,8 +119,8 @@ class ConvGELU(nn.Module):
     
 class ConvGELU_Res(nn.Module):
     """
-    ReflectionPad2d + Conv2d(3×3) + LayerNorm(GroupNorm) + GeLU
-    + 0.1 * residual connection
+    Conv2d(3×3, zero padding=1) + channel LayerNorm + GeLU
+    + residual_scale * skip connection
 
     Residual path helps preserve input information and stabilize training,
     while LayerNorm (implemented via GroupNorm(1, C)) prevents batch
@@ -223,21 +223,19 @@ class ConvGELU_layernorm(nn.Module):
 
 class BiasFreeMLP(nn.Module):
     """
-    Bias-free MLP head (3 hidden layers + Tanh) used to predict a single
+    Bias-free MLP head (default: 3 hidden layers + Tanh) used to predict a single
     shape component from a pooled feature vector.
     """
-    def __init__(self, in_dim: int, hidden: int = 128, activation: Literal['tanh', 'relu'] = 'tanh'):
+    def __init__(self, in_dim: int, hidden: int = 128, activation: Literal['tanh', 'relu'] = 'tanh', num_hidden_layers: int = 3):
         super().__init__()
-        self.net = nn.Sequential(
-            nn.Flatten(),
-            nn.Linear(in_dim, hidden, bias=False),
-            nn.ReLU() if activation == 'relu' else nn.Tanh(),
-            nn.Linear(hidden, hidden, bias=False),
-            nn.ReLU() if activation == 'relu' else nn.Tanh(),
-            nn.Linear(hidden, hidden, bias=False),
-            nn.ReLU() if activation == 'relu' else nn.Tanh(),
-            nn.Linear(hidden, 1, bias=False)
-        )
+        if isinstance(num_hidden_layers, bool) or not isinstance(num_hidden_layers, int) or num_hidden_layers < 1:
+            raise ValueError("num_hidden_layers must be a positive integer")
+        layers = [nn.Flatten()]
+        for index in range(num_hidden_layers):
+            layers.extend((nn.Linear(in_dim if index == 0 else hidden, hidden, bias=False),
+                           nn.ReLU() if activation == 'relu' else nn.Tanh()))
+        layers.append(nn.Linear(hidden, 1, bias=False))
+        self.net = nn.Sequential(*layers)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.net(x)

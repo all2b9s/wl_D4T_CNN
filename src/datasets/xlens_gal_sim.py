@@ -4,6 +4,7 @@ import matplotlib.pylab as plt
 import lsst.geom as geom
 import fitsio
 import os
+import re
 # LSST task to define DC2-like skymap 
 from lsst.skymap.discreteSkyMap import (
     DiscreteSkyMapConfig, DiscreteSkyMap,
@@ -230,7 +231,8 @@ class xlen_simulator():
                  psf_e = 0.0,
                  rotId=0,
                  galaxy_profile=1,
-                 mode = 'calibration'):
+                 mode = 'calibration',
+                 rot_ids = None):
         self.seed = ori_seed
         self.output_dir = output_dir
         self.abs_shear = abs_shear
@@ -244,6 +246,7 @@ class xlen_simulator():
         self.psf_e = psf_e
         self.galaxy_profile = galaxy_profile
         self.mode = mode
+        self.rot_ids = rot_ids
 
     def __call__(self, num_sims: int):
         print(f"Starting xlens simulations: mode={self.mode}, num_sims={num_sims}, has_shift={self.has_shift}, rotId={self.rotId}, galaxy_profile={self.galaxy_profile}")
@@ -261,29 +264,60 @@ class xlen_simulator():
             shear_tasks = [
                 (2, "g1"),
             ]
+        else:
+            # explicit task combo(s), e.g. "(g2,1)" or "(g2,1),(g1,0)"
+            shear_tasks = [
+                (int(shear_mode), shear_comp.lower())
+                for shear_comp, shear_mode in re.findall(
+                    r"\(?\s*([gG][12])\s*,\s*(\d+)\s*\)?", str(self.mode)
+                )
+            ]
+            if not shear_tasks:
+                raise ValueError(
+                    f"Unrecognized mode {self.mode!r}: use 'calibration', "
+                    "'training' or a task combo like '(g2,1)'"
+                )
+        # non-training runs produce both rotation halves (same seeds, the
+        # images differ only by the 90 deg rotation):
+        #   rotId=0 -> img_{init_id+i},  rotId=1 -> img_{init_id+num_sims+i}
+        # --rot_ids overrides this (e.g. one segment per job: '0' or '1')
+        if self.rot_ids is not None:
+            rot_ids = [
+                int(tok)
+                for tok in re.split(r"[,\s]+", str(self.rot_ids).strip())
+                if tok
+            ]
+            if not rot_ids:
+                raise ValueError(f"Empty --rot_ids: {self.rot_ids!r}")
+        elif self.mode == 'training':
+            rot_ids = [self.rotId]
+        else:
+            rot_ids = [0, 1]
+        print(f"Shear tasks: {shear_tasks}, rotIds: {rot_ids}")
         seeds = np.random.default_rng(self.seed).integers(0, 1e8, size=num_sims)
         results = []
 
         for shear_mode, shear_comp in shear_tasks:
-            args = [(self, self._worker, i+self.init_id, seeds[i], shear_mode, shear_comp) for i in range(num_sims)]
-            with Pool(processes=self.num_workers) as pool:
-                res = list(tqdm(
-                    pool.imap_unordered(_worker_wrapper, args,chunksize=4),
-                    total=num_sims,
-                    desc=f"Mode {shear_mode}, Comp {shear_comp}"
-                ))
-                results.extend(res)
+            for rotId in rot_ids:
+                args = [(self, self._worker, self.init_id + rotId * num_sims + i, seeds[i], shear_mode, shear_comp, rotId) for i in range(num_sims)]
+                with Pool(processes=self.num_workers) as pool:
+                    res = list(tqdm(
+                        pool.imap_unordered(_worker_wrapper, args,chunksize=4),
+                        total=num_sims,
+                        desc=f"Mode {shear_mode}, Comp {shear_comp}, rotId {rotId}"
+                    ))
+                    results.extend(res)
         print("Simulation finished")
         return results
 
-    def _worker(self, index, seed, shear_mode, shear_comp):
+    def _worker(self, index, seed, shear_mode, shear_comp, rotId):
         output_dir = f'{self.output_dir}/{shear_comp}_{shear_mode}_val_{self.abs_shear:.3f}/img_{int(index)}/'
         xlens_gal_sim(
             output_dir = output_dir,
             shear_mode = shear_mode,
             shear_comp = shear_comp,
             shear_value = self.abs_shear,
-            rotId= self.rotId,
+            rotId= rotId,
             seed = seed,
             dim = self.image_size,
             pixel_scale = self.pixel_scale,
@@ -307,7 +341,7 @@ def main():
     parser.add_argument(
         "--mode",
         default="calibration",
-        choices=["calibration", "training"],
+        help="'calibration', 'training', or explicit task combo(s) like '(g2,1)'",
     )
     parser.add_argument("--abs_shear", type=float, default=0.02)
     parser.add_argument("--ori_seed", type=int, default=666)
@@ -327,6 +361,12 @@ def main():
         help="galaxy light profile (1: gaussian, 2: exponential); 0 keeps the catalog's native",
     )
     parser.add_argument("--num_sims", type=int, default=200_000)
+    parser.add_argument(
+        "--rot_ids",
+        default=None,
+        help="explicit rotId groups to run, e.g. '0' or '1' or '0,1'; "
+             "default: training -> --rotId, otherwise both 0 and 1",
+    )
 
     args = parser.parse_args()
 
@@ -344,6 +384,7 @@ def main():
         rotId=args.rotId,
         galaxy_profile=args.galaxy_profile,
         mode=args.mode,
+        rot_ids=args.rot_ids,
     )
     simulator(args.num_sims)
 

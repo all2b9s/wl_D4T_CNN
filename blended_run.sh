@@ -23,7 +23,7 @@ NOISE_LEVEL=""                 # e.g. 0.06 for 6% noise; empty = from variance m
 SNR_CUT=5.0                    # minimum peak SNR for FPFS detection (anacal snr_peak_min)
 SIM_MODES=("sim_mode0" "sim_mode40")
 # EXP_RANGE: first exposure index, last+1 exposure index
-EXP_START=0
+EXP_START=7500
 EXP_END=10000
 
 # ---- Calibration (standalone job, run after all measurement jobs) ----
@@ -91,7 +91,7 @@ for SIM_MODE in "${SIM_MODES[@]}"; do
 #SBATCH --gpu-bind=closest
 #SBATCH --account=bdsp-dtai-gh
 #SBATCH --no-requeue
-#SBATCH -t 5:00:00
+#SBATCH -t 2:00:00
 #SBATCH --output=${BASE_OUT}/%x.%j.out
 #SBATCH --error=${BASE_OUT}/%x.%j.err
 

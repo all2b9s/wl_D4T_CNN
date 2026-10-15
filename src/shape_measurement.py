@@ -15,25 +15,28 @@ from pathlib import Path
 # =====================================================================
 # Configuration (adjust for your own environment)
 # =====================================================================
-# Path to the pretrained model checkpoint. Pick one that exists in ./models/,
-# e.g. './models/forward8_CNN_nada_50ep.pth' or './models/F8_fpfs_l5c32r01_50ep.pth'.
+# Default pretrained model checkpoint (override with --model_path). Pick one that
+# exists in ./models/, e.g. './models/forward8_CNN_nada_50ep.pth' or
+# './models/F8_fpfs_l5c32r01_50ep.pth'.
 # Anchored to the repository root (parent of src/) so it is CWD-independent.
 _REPO_ROOT = Path(__file__).resolve().parents[1]
-model_path = str(_REPO_ROOT / "models" / "forward8_CNN_nada_50ep.pth")
+DEFAULT_MODEL_PATH = str(_REPO_ROOT / "models" / "forward8_CNN_nada_50ep.pth")
 
 # Directory containing the simulated datasets (produced by build_dataset).
 # Replace this with the path to your own simulated cutouts.
-dir = ''
+dir = '/work/nvme/bfmo/wenyinli/datasets/xlens_shift'
 
 # Output directory where shape-measurement results are saved.
-save_base = ''
+save_base = '/work/hdd/bfmo/wenyinli/measurement/'
 
 device = ("cuda" if torch.cuda.is_available() else "cpu")
-# model = Forward8_fixW_CNN(num_layers = 5, base_channels = 32, res_factor=0.1).to(device)
-model = Forward8_fixW_CNN(num_layers = 5, base_channels = 32, res_factor=0.1).to(device)
 
-model.load_state_dict(torch.load(model_path, map_location="cpu"))
-_ = model.eval()
+
+def load_model(path):
+    model = Forward8_fixW_CNN(num_layers = 5, base_channels = 32, res_factor=0.1).to(device)
+    model.load_state_dict(torch.load(path, map_location="cpu"))
+    model.eval()
+    return model
 
 shear_tasks = [
             (0, "g1"),
@@ -48,13 +51,13 @@ def format_number(x: float) -> str:
     return f"n{s}"
 
 def loop_shape_measurement(
+    calibrator: Calibrator,
     shear_tasks =[
             (0, "g1"),
             (1, "g1"),
             (0, "g2"),
             (1, "g2"),
         ],
-    calibrator = None,
     imgBs = 100,            # batch size for npy file
     img_nB_range = [0,100],           # number of npy batch
     noise_level = 0,
@@ -87,7 +90,7 @@ def loop_shape_measurement(
                     sigma_arcsec=psf_fwhm/2.355,
                     workers=32, flim=10
                 )
-            q_imgs = q_imgs[:,:,1:,1:]
+            #q_imgs = q_imgs[:,:,1:,1:]
 
             if dtype == 'float32':
                 q_imgs = q_imgs.astype(np.float32)
@@ -129,21 +132,31 @@ if __name__ == "__main__":
         default=["0_g1", "1_g1", "0_g2", "1_g2"],
         help="List of shear tasks like: 0_g1 1_g1 0_g2 1_g2"
     )
+    p.add_argument("--range", nargs=2, type=int, default=[2000, 4000], metavar=("START", "STOP"),
+                   help="[start, stop) npy batch index range (100 galaxies per batch)")
+    p.add_argument("--model_path", type=str, default=DEFAULT_MODEL_PATH,
+                   help="Path to the Forward8_fixW_CNN checkpoint (.pth)")
+    p.add_argument("--dir", type=str, default=dir,
+                   help="Dataset directory holding {g1,g2}_{mode}_val_*/img_*/")
+    p.add_argument("--save_base", type=str, default=save_base,
+                   help="Output root; results go to <save_base>/<noise_tag>/<comp>_<mode>/")
     args = p.parse_args()
+    dir, save_base = args.dir, args.save_base
 
     noise_level = args.noise
     fname = args.fname
     shear_tasks = parse_shear_tasks(args.shear_tasks)
     dtype = 'float32'
 
-    print(f"Path of the model dict: {model_path}")
-    cal_CNN = Calibrator(model, device, dtype=dtype)
+    print(f"Path of the model dict: {args.model_path}")
+    print(f"Batch range: {args.range}")
+    cal_CNN = Calibrator(load_model(args.model_path), device, dtype=dtype)
     # --- Run main processes ---
     loop_shape_measurement(
         shear_tasks=shear_tasks,
         calibrator=cal_CNN,
         imgBs=100,          # batch size per npy
-        img_nB_range=[2000,4000],         # number of npy batches
+        img_nB_range=args.range,         # [start, stop) npy batches
         noise_level=noise_level,
         psf_fwhm=0.85,
         fname=fname,
