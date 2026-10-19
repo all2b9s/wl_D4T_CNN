@@ -25,6 +25,10 @@ class Calibrator:
         self.workers = workers
         self.shear_value = shear_value
 
+        # Parameters never need grads here; only input pixel gradients do.
+        for p in self.model.parameters():
+            p.requires_grad_(False)
+
 
     # ---------------------------- shape_measure ----------------------------
     def shape_measure(self, q_imgs, batch_size=32):
@@ -33,22 +37,40 @@ class Calibrator:
         Returns:
             shapes: (N, 2) numpy array
             R_anacal_list: (N, 1, 2, 2) numpy array
+
+        R[i, j] = sum_pix (de_i/dI) * q_{j+1}, computed on device so only
+        shapes and R (not the pixel-gradient maps) are copied back.
         '''
         N = len(q_imgs)
         assert hasattr(q_imgs, "shape") and q_imgs.shape[1] == 5, \
             "q_imgs must be shape (N, 5, H, W)"
 
-        shapes, grad_e1, grad_e2 = \
-            self.get_resmoothed_shape(q_imgs, batch_size=batch_size, with_grad=True)
+        shapes, Rs = [], []
+        for i in range(0, N, batch_size):
+            q = torch.from_numpy(np.ascontiguousarray(q_imgs[i:i+batch_size, :3])).to(
+                device=self.device, dtype=self.torch_dtype
+            )                                       # (B, 3, H, W): [v, g1, g2]
 
-        # compute response per galaxy
-        res = [
-            _single_gal_response(q_imgs[i], grad_e1[i], grad_e2[i])
-            for i in range(N)
-        ]
+            x = q[:, 0:1].detach().requires_grad_(True)
+            with torch.enable_grad():
+                pred = self.model(x)[:, :2]
+                go = torch.zeros_like(pred)
+                go[:, 0] = 1.0
+                (gx1,) = torch.autograd.grad(pred, x, grad_outputs=go, retain_graph=True)
+                go = torch.zeros_like(pred)
+                go[:, 1] = 1.0
+                (gx2,) = torch.autograd.grad(pred, x, grad_outputs=go)
 
-        R_anacal_list = np.stack(res, axis=0).astype(self.np_dtype)
+            with torch.no_grad():
+                qg = q[:, 1:3]                      # (B, 2, H, W)
+                R = torch.stack([(gx1 * qg).sum(dim=(-2, -1)),
+                                 (gx2 * qg).sum(dim=(-2, -1))], dim=1)  # (B, 2[e_i], 2[g_j])
+                shapes.append(pred.detach().cpu().numpy())
+                Rs.append(R.cpu().numpy())
+            del q, x, pred, go, gx1, gx2, qg, R
 
+        shapes = np.concatenate(shapes, axis=0).astype(self.np_dtype)
+        R_anacal_list = np.concatenate(Rs, axis=0)[:, None].astype(self.np_dtype)
         return shapes, R_anacal_list
 
 

@@ -1083,7 +1083,7 @@ def merge_and_save_catalog(
         if "truth_e2_weighted" in truth_cat.columns:
             truth_e2_weighted[matched_mask] = truth_cat["truth_e2_weighted"].iloc[matched_tidx].values
 
-    # ML response: squeeze the (N,1,2,2) to extract diagonal elements
+    # ML response: preserve the full (N,2,2) matrix
     ml_R_squeezed = ml_R[:n_merged].reshape(n_merged, 2, 2)
     ml_R11 = ml_R_squeezed[:, 0, 0]
     ml_R22 = ml_R_squeezed[:, 1, 1]
@@ -1104,7 +1104,8 @@ def merge_and_save_catalog(
         ("fpfs_dm00_dg1", np.float64), ("fpfs_dm00_dg2", np.float64),
         # ML shape
         ("ml_e1", np.float64), ("ml_e2", np.float64),
-        ("ml_R11", np.float64), ("ml_R22", np.float64),
+        ("ml_R11", np.float64), ("ml_R12", np.float64),
+        ("ml_R21", np.float64), ("ml_R22", np.float64),
         # Truth (matched)
         ("truth_e1", np.float64), ("truth_e2", np.float64),
         ("truth_g1", np.float64), ("truth_g2", np.float64),
@@ -1132,6 +1133,8 @@ def merge_and_save_catalog(
     merged["ml_e2"] = ml_shapes[:n_merged, 1]
     merged["ml_R11"] = ml_R11
     merged["ml_R22"] = ml_R22
+    merged["ml_R12"] = ml_R_squeezed[:, 0, 1]
+    merged["ml_R21"] = ml_R_squeezed[:, 1, 0]
     merged["truth_e1"] = truth_e1
     merged["truth_e2"] = truth_e2
     merged["truth_g1"] = truth_g1
@@ -1156,6 +1159,7 @@ def merge_and_save_catalog(
             fpfs_dm00_dg1=merged["fpfs_dm00_dg1"], fpfs_dm00_dg2=merged["fpfs_dm00_dg2"],
             ml_e1=merged["ml_e1"], ml_e2=merged["ml_e2"],
             ml_R11=merged["ml_R11"], ml_R22=merged["ml_R22"],
+            ml_R12=merged["ml_R12"], ml_R21=merged["ml_R21"],
             truth_e1=merged["truth_e1"], truth_e2=merged["truth_e2"],
             truth_g1=merged["truth_g1"], truth_g2=merged["truth_g2"],
             truth_e1_weighted=merged["truth_e1_weighted"], truth_e2_weighted=merged["truth_e2_weighted"],

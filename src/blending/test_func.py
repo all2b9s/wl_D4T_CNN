@@ -236,6 +236,8 @@ def measure_catalogs_with_run(
     prefetch_workers: int = 4,
     progress_every: int = 25,
     verbose: bool = True,
+    exposure_ids: Optional[Sequence[int]] = None,
+    catalog_callback=None,
 ) -> dict:
     """Measure one trained run on a blended simulation, one exposure at a time.
 
@@ -327,9 +329,12 @@ def measure_catalogs_with_run(
     t_measure_total = 0.0
     t_wall_start = time.time()
 
-    todo = [idx for idx in range(start, stop)
+    requested = list(range(start, stop)) if exposure_ids is None else sorted(map(int, exposure_ids))
+    if len(set(requested)) != len(requested) or any(i < start or i >= stop for i in requested):
+        raise ValueError("exposure_ids must be unique and within index_range")
+    todo = [idx for idx in requested
             if not (resume and (out_dir / f"catalog_{idx}.npz").is_file())]
-    n_skipped = (stop - start) - len(todo)
+    n_skipped = len(requested) - len(todo)
     if verbose:
         print(f"[test_func] {len(todo)} exposures to measure "
               f"({n_skipped} already present), prefetch_workers={max(1, prefetch_workers)}")
@@ -401,6 +406,9 @@ def measure_catalogs_with_run(
             save_csv=save_csv,
             verbose=False,
         )
+
+        if catalog_callback is not None:
+            catalog_callback(exp_idx, out_dir / f"catalog_{exp_idx}.npz")
 
         n_new += 1
         n_stamps_total += n_det

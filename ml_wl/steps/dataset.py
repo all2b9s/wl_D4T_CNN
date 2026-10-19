@@ -1,9 +1,17 @@
 """Step 6: build the (images .npy, labels .csv) pair read by src.training.train_model.
 
 Takes train/val/test objects from the RDSM catalog, splitting by image directory (no directory is shared
-between splits). Images are either the clean cutouts (noise.mode=none) or, like
-src.shape_measurement feeds the CNN, adaptive-noise images resmoothed with a renoise map
-(noise.mode=adaptive; same recipe and seeds as scripts/make_renoised_10k_images_64.py), full 64x64.
+between splits). The sim cutouts are raw (PSF-convolved, no deconvolution, no renoise), so by default they go
+through the same preparation the teacher saw (src.anacal prepare_q_images: PSF-deconvolving resmoothing to a
+Gaussian of FWHM sim.psf_fwhm). dataset.noise.mode:
+  adaptive : adaptive noise added, renoise map used, then prepare_q_images   (matches noisy measurement;
+             same recipe and seeds as scripts/make_renoised_10k_images_64.py)
+  q_clean  : prepare_q_images on the noiseless cutout (what the teacher measured at noise 0)
+  none     : raw cutouts, NOT prepared -- only for experiments, does not match measurement-time inputs
+Galaxies: student_sim (if set) = galaxies different from the teacher's `sim`; the labels then come from the s_label
+step (eDSM of `sim` applied to the teacher shapes measured on them). dataset.image_sim only re-renders the SAME
+galaxies from another directory; every used row's catsim `indices` in <image dir>/img_k/gt_cat.csv must equal the
+label catalog's, otherwise the step aborts.
 
 Row i of images.npy == row i of catalog.csv (id = i). Label columns e1,e2 come from dataset.label:
 rdsm | truth (e_true) | teacher (measured teacher shape).
@@ -13,7 +21,6 @@ import numpy as np
 from ml_wl.config import step_dir
 from ml_wl.steps._common import d, load_job_args, sg_job
 
-SIGMA_ARCSEC_FWHM = 0.85
 FLIM = 10.0
 
 
@@ -51,19 +58,37 @@ def _select(img, usable, counts, seed):
 
 def _render(args):
     """One image dir -> (n,64,64) float32 model-input images and per-object noise sigma."""
-    sim, noise, img_id, cr = args
+    sim, noise, img_id, cr, expect = args
+    import pandas as pd
     from src.anacal.batch_calibration import prepare_q_images
     from src.anacal.cal_toolkit import load_img
-    if noise["mode"] == "none":
+    mode = noise["mode"]
+    if mode == "none":
+        cat = pd.read_csv(f"{sim['split_dir']}/img_{img_id}/gt_cat.csv")
+        _check_alignment(cat, cr, expect, sim, img_id)
         raw = np.load(f"{sim['split_dir']}/img_{img_id}/cutouts.npy")[cr]
         return raw.astype(np.float32), np.zeros(len(cr), np.float32)
+    kw = dict(noise_level=noise["level"], noise_mode="adaptive") if mode == "adaptive" else \
+        dict(noise_level=0.0, noise_mode="fixed")
     cut, psf, cat, nl = load_img(sim["comp"], sim["mode"], img_id, abs_shear_value=sim["abs_shear"],
-                                 noise_level=noise["level"], noise_mode=noise["mode"], directory=sim["dir"])
+                                 directory=sim["dir"], **kw)
+    _check_alignment(cat, cr, expect, sim, img_id)
     cat = cat.iloc[cr].reset_index(drop=True)
     cut, psf, nl = cut[cr], psf[cr], nl[cr]
-    renoise = np.random.default_rng(20020620 + img_id).standard_normal(cut.shape) * nl.reshape(-1, 1, 1)
-    q = prepare_q_images(cut, psf, renoise, cat, sigma_arcsec=SIGMA_ARCSEC_FWHM / 2.355, flim=FLIM, workers=1)
+    if mode == "adaptive":
+        renoise = np.random.default_rng(20020620 + img_id).standard_normal(cut.shape) * nl.reshape(-1, 1, 1)
+    else:
+        renoise = np.zeros_like(cut)
+    q = prepare_q_images(cut, psf, renoise, cat, sigma_arcsec=sim["psf_fwhm"] / 2.355, flim=FLIM, workers=1)
     return q[:, 0].astype(np.float32), nl.astype(np.float32)
+
+
+def _check_alignment(cat, cr, expect, sim, img_id):
+    got = cat["indices"].to_numpy()[cr]
+    if not np.array_equal(got, expect):
+        bad = int((got != expect).sum())
+        raise ValueError(f"{sim['split_dir']}/img_{img_id}: {bad}/{len(cr)} rows are different galaxies than the "
+                         "ones the RDSM labels were measured on (catsim index mismatch)")
 
 
 def main():
@@ -72,9 +97,11 @@ def main():
     import pandas as pd
 
     cfg, _ = load_job_args("dataset")
-    ds, sim = cfg["dataset"], cfg["sim"]
+    ds = cfg["dataset"]
+    sim = ds["sim"]
     out = d(cfg, "dataset")
-    with np.load(step_dir(cfg, "rdsm") / "rdsm_catalog.npz") as z:
+    label_step = "s_label" if cfg["student_sim"] is not None else "rdsm"
+    with np.load(step_dir(cfg, label_step) / "rdsm_catalog.npz") as z:
         npz = {k: z[k] for k in z.files}
     labels = _labels(npz, ds["label"])
     usable = np.isfinite(labels).all(1)
@@ -90,11 +117,12 @@ def main():
     order = {int(i): [] for i in dict.fromkeys(img_ids.tolist())}
     for pos, i in enumerate(img_ids.tolist()):
         order[i].append(pos)
-    tasks = [(sim, ds["noise"], i, npz["catalog_row"][rows[p]].astype(int)) for i, p in order.items()]
+    tasks = [(sim, ds["noise"], i, npz["catalog_row"][rows[p]].astype(int), npz["indices"][rows[p]])
+             for i, p in order.items()]
     images = np.lib.format.open_memmap(out / "images.npy", mode="w+", dtype=np.float32, shape=(len(rows), 64, 64))
     sigma = np.zeros(len(rows), np.float32)
     print(f"{len(rows)} objects from {len(tasks)} image dirs; split sizes "
-          f"{ {s: len(v) for s, v in sel.items()} }; noise={ds['noise']}", flush=True)
+          f"{ {s: len(v) for s, v in sel.items()} }; noise={ds['noise']}; images from {sim['split_dir']}", flush=True)
     with ProcessPoolExecutor(max_workers=ds["workers"], mp_context=mp.get_context("fork")) as ex:
         for k, ((i, pos), (im, nl)) in enumerate(zip(order.items(), ex.map(_render, tasks))):
             images[pos] = im

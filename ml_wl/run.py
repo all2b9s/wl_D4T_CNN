@@ -25,8 +25,7 @@ SBATCH_TMPL = """#!/bin/bash
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1
 #SBATCH --cpus-per-task={cpus}
-#SBATCH --gpus-per-node=1
-#SBATCH --gpu-bind=closest
+{gpu_directives}
 #SBATCH --no-requeue
 #SBATCH -t {time}
 #SBATCH --output={logs}/%x.%j.out
@@ -36,7 +35,7 @@ SBATCH_TMPL = """#!/bin/bash
 
 
 def step_module(step):
-    return importlib.import_module(f"ml_wl.steps.{step}")
+    return importlib.import_module(f"ml_wl.steps.{'blended' if step == 'evaluate' else step}")
 
 
 def done_file(cfg, step, i):
@@ -53,11 +52,15 @@ def step_state(cfg, step):
     return jobs, done
 
 
-def prepare_dirs(cfg):
+def prepare_dirs(cfg, steps=None):
     rd = C.round_dir(cfg)
     for sub in ("logs", "sbatch"):
         (rd / sub).mkdir(parents=True, exist_ok=True)
-    for step, (name, big) in C.STEP_DIRS.items():
+    steps = list(steps or selected_steps(cfg, None)) if cfg.get("blended") is not None else C.STEPS
+    if cfg.get("blended") is not None and "measure" in steps and "catalog" not in steps:
+        steps.append("catalog")
+    for step in steps:
+        name, big = C.STEP_DIRS[step]
         link = rd / name
         if big:
             real = C.big_dir(cfg, step)
@@ -82,6 +85,9 @@ def write_provenance(cfg):
              "single_galaxies": git_info(C.SG_DIR), "opt_e": git_info(cfg["paths"]["opt_e"]),
              "teacher_checkpoint": str(ck),
              "teacher_sha256": hashlib.sha256(ck.read_bytes()).hexdigest() if ck.exists() else None}
+    if cfg.get("blended") is not None:
+        entry["blended"] = cfg["blended"]
+        entry["input_transform"] = "detw_e"
     p = C.round_dir(cfg) / "provenance.json"
     hist = json.loads(p.read_text()) if p.exists() else []
     p.write_text(json.dumps(hist + [entry], indent=2) + "\n")
@@ -89,24 +95,33 @@ def write_provenance(cfg):
 
 def build_script(cfg, step, i, job, sbatch=True):
     s = cfg["slurm"]
+    resources = {**s, **s.get("resources", {}).get(step, {})}
+    gpus = int(resources.get("gpus", 1))
     cwd = C.SG_DIR if job["cwd"] == "sg" else Path(cfg["paths"]["opt_e"])
     head = ""
     if sbatch:
         head = SBATCH_TMPL.format(jobname=f"{cfg['name']}_{step}{i}", partition=s["partition"], account=s["account"],
-                                  mem=s["mem"], cpus=s["cpus"], time=s["time"][step], logs=C.round_dir(cfg) / "logs")
+                                  mem=resources["mem"], cpus=resources["cpus"], time=s["time"][step], logs=C.round_dir(cfg) / "logs",
+                                  gpu_directives=f"#SBATCH --gpus-per-node={gpus}\n#SBATCH --gpu-bind=closest" if gpus else "")
     env = (f"source {s['conda_sh']}\nconda activate {s['env']}\n" if sbatch else "")
-    body = [f"set -euo pipefail", env + "unset PYTHONPATH", f"JOB_INDEX={i}", 'echo "host: $(hostname)  start: $(date)"',
+    runtime_env = "export PYTHONDONTWRITEBYTECODE=1"
+    if cfg.get("blended") is not None:
+        runtime_env += " OMP_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 MKL_NUM_THREADS=1"
+    body = [f"set -euo pipefail", env + "unset PYTHONPATH", runtime_env, f"JOB_INDEX={i}", 'echo "host: $(hostname)  start: $(date)"',
             f"cd {cwd}", *job["lines"], f"touch {done_file(cfg, step, i)}", 'echo "end: $(date)"']
     return head + "\n".join(body) + "\n"
 
 
 def sbatch(path, deps):
-    cmd = ["sbatch", "--parsable"] + ([f"--dependency=afterok:{':'.join(deps)}"] if deps else []) + [str(path)]
-    return subprocess.run(cmd, capture_output=True, text=True, check=True).stdout.strip().split(";")[0]
+    cmd = ["sbatch", "--parsable", "--kill-on-invalid-dep=yes"] + ([f"--dependency=afterok:{':'.join(deps)}"] if deps else []) + [str(path)]
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    if result.returncode:
+        raise SystemExit(result.stderr.strip())
+    return result.stdout.strip().split(";")[0]
 
 
 def selected_steps(cfg, only):
-    steps = only or cfg["steps"] or C.STEPS
+    steps = only or cfg["steps"] or [s for s in C.STEPS if s != "evaluate"]
     bad = [s for s in steps if s not in C.STEPS]
     if bad:
         raise SystemExit(f"unknown steps {bad}; valid: {C.STEPS}")
@@ -145,7 +160,7 @@ def status(cfg):
     ids = json.loads(jp.read_text()) if jp.exists() else {}
     for step in C.STEPS:
         jobs, done = step_state(cfg, step)
-        line = f"{step:8s} {sum(done)}/{len(jobs)} done"
+        line = f"{step:9s} {sum(done)}/{len(jobs)} done"
         if step in ids and not all(done):
             out = subprocess.run(["sacct", "-j", ",".join(ids[step]), "-X", "-n", "-P", "--format=JobID,State"],
                                  capture_output=True, text=True).stdout.split()
@@ -169,7 +184,8 @@ def main():
     cfg = C.load(a.config, test=a.test)
     if a.status:
         return status(cfg)
-    prepare_dirs(cfg)
+    requested = [a.local] if a.local else selected_steps(cfg, a.only.split(",") if a.only else None)
+    prepare_dirs(cfg, requested)
     for spec in a.adopt:
         adopt(cfg, spec)
     for step in (a.force.split(",") if a.force else []):
@@ -190,20 +206,30 @@ def main():
     ids = json.loads(jp.read_text()) if jp.exists() else {}
     submitted = []
     print(f"round {cfg['name']}  ->  {C.round_dir(cfg)}")
+    # 1) write every sbatch first, so a config problem fails before anything is submitted
+    plan = []
     for step in selected_steps(cfg, a.only.split(",") if a.only else None):
         jobs, done = step_state(cfg, step)
         todo = [i for i, d in enumerate(done) if not d]
-        if not todo:
-            print(f"  {step:8s} done, skipped")
+        if not jobs:
+            print(f"  {step:9s} n/a (no standalone job)")
             continue
-        new = []
+        if not todo:
+            print(f"  {step:9s} done, skipped")
+            continue
+        files = []
         for i in todo:
             sb = C.round_dir(cfg) / "sbatch" / f"{list(C.STEPS).index(step) + 1}_{step}_{i}.sbatch"
             sb.write_text(build_script(cfg, step, i, jobs[i]))
-            new.append("DRYRUN" if a.dry_run else sbatch(sb, submitted))
-        print(f"  {step:8s} jobs {new}" + (f"  (after {submitted})" if submitted else ""))
+            files.append(sb)
+        plan.append((step, files))
+    # 2) submit, each step after everything submitted before it
+    for step, files in plan:
+        new = ["DRYRUN" if a.dry_run else sbatch(sb, submitted) for sb in files]
+        print(f"  {step:9s} jobs {new}" + (f"  (after {submitted})" if submitted else ""))
         if not a.dry_run:
             ids[step] = new
+            jp.write_text(json.dumps(ids, indent=2) + "\n")
             submitted += new
     if not a.dry_run:
         jp.write_text(json.dumps(ids, indent=2) + "\n")

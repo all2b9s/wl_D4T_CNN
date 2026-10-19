@@ -1,0 +1,47 @@
+# Round 1: teacher (F8_gauss_truth_final + eDSM) on gauss_distribution; student CNN on different galaxies (gauss_training).
+name: r1_F8gt
+
+sim:
+  dir: /taiga/illinois/las/astro/xinliuxl/DC1_sim_blended/xlens_gauss_distribution   # holds g1_2_val_0.020/img_*/
+  shear_task: 2_g1
+  n_batches: 100                      # 100 npy batches x 100 image dirs x 100 galaxies
+
+teacher_cnn:
+  checkpoint: /projects/bdsp/wenyinli/codes/single_galaxies/models/F8_gauss_truth_final.pth
+  arch: Forward8_fixW_CNN
+  kwargs: {num_layers: 5, base_channels: 32, res_factor: 0.1, nl_sigma: 16, gw_sigma: 16}   # sigmas are not in the checkpoint
+
+measure: {noise: 0, n_jobs: 1}
+# teacher galaxies = `sim` above (gauss_distribution): CNN shapes -> eDSM -> RDSM model. No FPFS measurement exists for them.
+# student galaxies = `student_sim` below (gauss_training): teacher CNN measures them too, the eDSM above is applied to
+# those shapes -> their RDSM labels; the student CNN trains on their images. Its FPFS m00 gives the magnitude column.
+student_sim:
+  dir: /taiga/illinois/las/astro/xinliuxl/DC1_sim_blended/xlens_gauss_training
+  shear_task: 2_g1
+  fpfs_dir: /work/hdd/bfmo/wenyinli/measurement/fpfs_gauss_train/n0/g1_2   # m00 (flux) -> magnitude column
+  fpfs_prefix: fpfs_gauss_train
+
+edsm:
+  dsm_sigma: 0.5
+  workers: 5
+  trials_per_worker: 25
+  study_name: DSMsigma0.5_optuna_cnn_gauss_training      # same name as the existing study, so it can be --adopt-ed
+
+retrain: {n_select: 10, n_repeats: 3, epochs: 20, bias_min: 1.0e-4, bias_max: 3.0e-3}   # epochs must equal optuna_eDSM's 20
+rdsm: {max_abs_m: 0.002, fallback: fail}
+
+dataset:
+  n_train: 10000
+  n_val: 1000
+  n_test: 1000
+  label: rdsm                                           # rdsm | truth | teacher
+  noise: {mode: adaptive, level: 0.594}                 # adaptive | q_clean | none (see README); images come from student_sim
+
+student_cnn:
+  arch: Forward8_fixW_CNN
+  kwargs: {num_layers: 5, base_channels: 32, res_factor: 0.1}
+  epochs: 50
+  batch_size: 500
+  lr: 1.0e-3
+  wd: 1.0e-4
+  export_as: F8_rdsm_cnnGauss_r1                        # copied to single_galaxies/models/ (never overwrites)

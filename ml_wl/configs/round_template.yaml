@@ -30,7 +30,10 @@ dataset:
   n_val: 1000
   n_test: 1000
   label: rdsm                                           # rdsm | truth | teacher
-  noise: {mode: adaptive, level: 0.594}                 # mode: adaptive | none
+  noise: {mode: adaptive, level: 0.594}                 # adaptive | q_clean | none  (see README; none = raw, unprepared)
+  # image_sim:                                          # optional: take the student images from another sim dir
+  #   dir: /taiga/.../another_sim                       # must hold the SAME galaxies (catsim indices are checked)
+  #   shear_task: 2_g1
 
 student_cnn:
   arch: Forward8_fixW_CNN

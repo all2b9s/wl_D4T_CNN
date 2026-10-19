@@ -10,8 +10,9 @@ import numpy as np
 from ml_wl.steps._common import d, load_job_args, sg_job
 
 
-def batch_ranges(cfg):
-    s, n, j = cfg["sim"]["batch_start"], cfg["sim"]["n_batches"], cfg["measure"]["n_jobs"]
+def batch_ranges(cfg, sim=None):
+    sim = sim or cfg["sim"]
+    s, n, j = sim["batch_start"], sim["n_batches"], cfg["measure"]["n_jobs"]
     per = -(-n // j)
     out = []
     for i in range(j):
@@ -22,19 +23,27 @@ def batch_ranges(cfg):
 
 
 def jobs(cfg):
+    if cfg.get("blended") is not None:
+        from ml_wl.steps.blended import job
+        return job(cfg, "measure")
     return [dict(lines=sg_job("measure", cfg), cwd="sg") for _ in batch_ranges(cfg)]
 
 
 def main():
+    cfg, job = load_job_args("measure")
+    run(cfg, job, "measure", cfg["sim"])
+
+
+def run(cfg, job, step, sim):
+    """Measure npy batches of one job on `sim` (teacher sim, or the student sim for step s_measure)."""
     import os
     import torch
     from src.anacal.batch_calibration import Calibrator, prepare_q_images
     from src.anacal.cal_toolkit import build_dataset
     from ml_wl.models import build_model
 
-    cfg, job = load_job_args("measure")
-    lo, hi = batch_ranges(cfg)[job]
-    out = d(cfg, "measure")
+    lo, hi = batch_ranges(cfg, sim)[job]
+    out = d(cfg, step)
     device = "cuda" if torch.cuda.is_available() else "cpu"
     t = cfg["teacher_cnn"]
     model = build_model(t["arch"], t["kwargs"]).to(device)
@@ -42,8 +51,7 @@ def main():
     model.eval()
     cal = Calibrator(model, device, dtype="float32")
     noise_level = float(cfg["measure"]["noise"])
-    sim = cfg["sim"]
-    print(f"measure batches [{lo},{hi}) noise={noise_level} model={t['checkpoint']}", flush=True)
+    print(f"{step} batches [{lo},{hi}) noise={noise_level} model={t['checkpoint']}", flush=True)
     for k in range(lo, hi):
         cut, psf, cat, nl = build_dataset(
             shear_comp=sim["comp"], shear_mode=sim["mode"], abs_shear_value=sim["abs_shear"],

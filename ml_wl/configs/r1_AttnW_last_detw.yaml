@@ -1,0 +1,47 @@
+name: r1_AttnW_last_detw
+teacher_cnn:
+  arch: Forward8_AttnW_CNN  # exact kwargs are read from the checkpoint run config.json
+  checkpoint: /projects/bdsp/wenyinli/codes/single_galaxies/models/blended_rdsm_runs/renoised_q_n0594_330k_3m/attnw/last.pth
+blended:
+  old_catalog: /work/hdd/bfmo/wenyinli/measurement/blended_sims/renoised_q_n0594_330k_3m/attnw/g1_2/attnw_n330k_last
+  checkpoint_sha256: e6b0617eafbf896b9fddd81a83462ffafac71f8fa76f66e6bd6a4ef8b9df7be7
+  index_range: [0, 5000]
+  seed: 42
+  sample_targets: {train: 1000000, val: 500000, test: 1000000}
+  discard_measurements: true
+  prepare_catalog_in_measure: true  # DeltaAI rejects CPU-only Slurm jobs
+  measurement:
+    blended_dir: /projects/bdsp/wenyinli/codes/single_galaxies/output/training_size_test/tract_variance_calibration/input
+    noise_level: 0.594
+    sim_mode: sim_mode80
+    psf_path: /projects/bdsp/wenyinli/codes/single_galaxies/logs/blended_test_psf.npy
+    cat_ref_path: /projects/bdsp/wenyinli/codes/data/catsim-v4/OneDegSq.fits
+    stamp_size: 64
+    pixel_scale: 0.2
+    psf_fwhm: 0.85
+    mag_zero: 30.0
+    snr_cut: 5.0
+    save_csv: false
+    n_workers: 32
+    prefetch_workers: 4
+edsm:
+  study_name: DSMsigma0.5_AttnW_last_detw_1M_25
+  dsm_sigma: 0.5
+  workers: 1
+  trials_per_worker: 25
+  tpe_startup_trials: 10
+  early_stop_patience: 4
+  min_epochs: 6
+  trial_timeout: 300
+  study_timeout: 4800
+retrain: {n_select: 3, n_repeats: 2, epochs: 20, bias_min: 1.0e-4, bias_max: 3.0e-3}
+rdsm: {max_abs_m: 0.002, fallback: fail}
+steps: [measure, catalog, edsm]
+slurm:
+  cpus: 8
+  mem: 32G
+  resources:
+    measure: {cpus: 32, mem: 48G, gpus: 1}
+    catalog: {cpus: 8, mem: 16G, gpus: 0}
+    evaluate: {cpus: 4, mem: 8G, gpus: 0}
+  time: {measure: '1:15:00', catalog: '0:15:00', edsm: '1:30:00', retrain: '0:30:00', rdsm: '0:10:00'}
