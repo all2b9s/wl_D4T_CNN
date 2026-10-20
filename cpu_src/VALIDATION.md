@@ -1,3 +1,53 @@
+# Native Delta x86 throughput update — 2026-10-20
+
+User-supplied native Milan results, T=2, median of three runs, all groups reported
+stable. These supersede the earlier statement that no native x86 timing exists.
+The user identifies exclusive node **cn126**, **2× AMD EPYC 7763**, 128 cores,
+job **23059395**, with an on-node rebuild of the current workspace using
+**g++ 14**. `auto` selects **AVX2**; Milan does not support AVX-512.
+No raw artifacts or exact source/binary hashes were supplied. No verification
+was rerun for this documentation update.
+
+| Cores / sources | s4 gal/s | AttnW gal/s |
+|---|---:|---:|
+| 1 core | 21.7 | 18.8 |
+| 72 / 512 | 1175 | 912 |
+| 128 / 512 | 1934 | 1474 |
+| 128 / 2304 | 1987 | 1563 |
+
+Grace round 3: 17.0/15.5 at one core and 1031/895 at 72 cores (s4/AttnW).
+At 128 cores, F2 s4 is 1532 vs F4 1934 (+26.2%); direct s4 is 245 and scalar
+about 144. One-core direct/scalar s4 are 2.2/1.4. Batches of 64 sources at
+128 cores give 1131/978; prefer 576 or automatic batches (1024 at 128 workers).
+
+Efficiency relative to the supplied one-core baseline is 69.6%/61.3% at 128
+cores with 512 sources, and 71.5%/65.0% with 2304. s4 64-core throughput is
+973, so 64-to-128 scaling is 1.99x. Eight NUMA domains are reported; this does
+not by itself identify the cause of sublinear scaling relative to one core.
+
+Native correctness, supplied by the user for the same Delta run:
+
+- C++ kernel tests, all 14 unittests, and FP64 golden (pointwise 1e-12) pass.
+- 512 real stamps against strict-FP32 GPU pass every e/R component-mean gate.
+- T=2/T=4 e/R are bit-identical; position derivatives pass.
+- F2/direct/scalar mean biases also pass, reported at order 1e-7.
+- Individual R values can exceed the older pointwise tolerance.
+
+| Model | Maximum absolute e mean bias | Maximum absolute R mean bias | Maximum absolute individual ΔR |
+|---|---:|---:|---:|
+| s4 | 5.8e-9 | 1.1e-7 | 6.9e-6 |
+| AttnW | 1.1e-8 | 1.1e-7 | 4.2e-6 |
+
+Mean acceptance is `abs(mean(CPU-strict_FP32_GPU)) < 1e-4` per component.
+The earlier Grace FP64 maxima (e/R 7.49e-16 / 7.11e-15, including primal traces)
+remain a separate historical result. Native x86 FP64 passes the same 1e-12
+tolerance, but exact maxima and FP64 throughput were not provided.
+The [README comparison](README.md#measured-cpu-throughput-and-numerical-validation-2026-10-20)
+combines native AVX2 results with Grace round 3 and previous emulation evidence.
+AVX-512 still lacks native execution evidence here.
+
+---
+
 # x86 port status — 2026-10-20
 
 AVX2/AVX512 now have F4 (default) and F2 transformed convolution, fused C32
@@ -14,8 +64,9 @@ real held-out stamps (16 stamps, s4 and AttnW, F4/F2/direct/scalar) agree with t
 strict-FP32 GPU reference (component-mean bias <= 3.7e-7, 1e-4 required) and with
 the NEON output (max |dR| 2.3e-6); T=2 and T=4 outputs are identical.
 **AVX-512 has been compiled and its assembly inspected, but never executed**
-(qemu has no AVX-512), and no x86 timing exists: validate and benchmark both
-on Delta/Candide. Commands and build prerequisites are in [README.md](README.md).
+(qemu has no AVX-512). Native Milan timing was subsequently supplied by the
+user along with native AVX2 numerical acceptance; see the update above.
+AVX-512 execution is still untested. Commands are in [README.md](README.md).
 
 ---
 

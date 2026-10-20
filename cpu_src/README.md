@@ -6,7 +6,7 @@ heads), matching the current PyTorch precision. Float64 is a validation mode.
 Both `Forward8_AttnW_CNN` and `Forward8_fixW_CNN` are supported. Existing `src/`
 and the AnaCal checkout are read/reused, never patched by this package.
 
-The current implementation includes NEON vector GELU/LayerNorm, C32 Winograd,
+The current implementation includes NEON/AVX2/AVX-512 vector GELU/LayerNorm, C32 Winograd,
 fused Winograd epilogues, persistent workers and reusable per-worker buffers.
 fixW pools each orbit directly. AttnW uses query tiles, vector QK/AV and directly
 accumulates low-resolution scalar tokens when the grid divides the image size.
@@ -263,11 +263,77 @@ approximates erf and exp locally; there is no global fast-math, FTZ/DAZ, externa
 vector-math ABI, BLAS, OpenMP, row-streaming or AnaCal Task modification.
 The result metadata records the selected convolution algorithm.
 
-The x86 F4/F2 and fused epilogues were ported on 2026-10-20. They have **not
-been compiled, numerically validated or benchmarked in this change**; validation
-will be performed by the user on Delta. The Grace numbers in VALIDATION.md do
-not establish x86 performance. Rebuild the extension on the target x86 machine;
-the checked-out aarch64 extension cannot be used there.
+### Measured CPU throughput and numerical validation (2026-10-20)
+
+Production inference uses FP32. The following T=2 rates are galaxies/s, medians
+of three runs after warmup. The user reports all Delta x86 timing groups stable;
+Grace results are from optimization round 3 in [VALIDATION.md](VALIDATION.md).
+The native Delta run used exclusive node **cn126**, **2× AMD EPYC 7763**,
+128 cores, job **23059395**. The current workspace was rebuilt on-node with
+**g++ 14**; `auto` selected **AVX2** (Milan does not support AVX-512).
+These are network/q-stamp inference rates, not full detection/exposure rates.
+
+| Platform / configuration | s4 | AttnW |
+|---|---:|---:|
+| Delta x86 (Milan), 1 core | 21.7 | 18.8 |
+| Delta x86, 72 cores, 512 sources | 1175 | 912 |
+| Delta x86, 128 cores, 512 sources | 1934 | 1474 |
+| Delta x86, 128 cores, 2304 sources | 1987 | 1563 |
+| Grace round 3, 1 core | 17.0 | 15.5 |
+| Grace round 3, 72 cores, 512 sources | 1031 | 895 |
+
+On these runs, x86 single-core throughput exceeds Grace by 27.6% / 21.3%
+(s4 / AttnW); at 72 cores the gains are 14.0% / 1.9%. This is a comparison of
+separate machine runs, not a controlled architecture-only speedup.
+Using `throughput(N)/(N*throughput(1))`, x86 parallel efficiency at 128 cores is
+69.6% / 61.3% for 512 sources and 71.5% / 65.0% for 2304 sources.
+The reported Milan node has eight NUMA domains. s4 rises from 973 at 64 cores
+to 1934 at 128 cores (1.99x); these two points alone do not show a scaling
+break above 64 cores or establish NUMA as the cause of lost efficiency.
+
+Practical choices from the supplied x86 measurements:
+
+- **Keep F4 as default.** s4 at 128 cores is 1934 with F4 versus 1532 with F2
+  (+26.2%). `D4CNN_CONV=winograd` selects F2; `winograd4` selects F4.
+- **Direct is a slow fallback on x86.** Reported s4 rates are 2.2 at one core
+  and 245 at 128 cores, versus 21.7 / 1934 for F4. Scalar is 1.4 / about 144.
+  Thus the measured direct path has substantial optimization headroom; setting
+  `D4CNN_CONV=direct` carries a large throughput cost.
+- **Use sufficiently large source batches.** At 128 cores, batches of only 64
+  sources give 1131 / 978. Use batches of 576 or automatic batching to expose
+  more source parallelism. The automatic source batch is `max(64,8*nthreads)`:
+  576 at 72 workers and 1024 at 128 workers. These source-API batching numbers
+  are a separate experiment from the 512-source q-stamp table.
+
+Numerical evidence has different scopes:
+
+| Check | Result / scope |
+|---|---|
+| FP64 golden, independent autograd and primal traces (previous Grace validation) | Pass at unchanged pointwise `atol=rtol=1e-12`; maximum e error 7.49e-16, R error 7.11e-15 |
+| Grace round-3 production FP32 vs strict-FP32 GPU | Component-mean bias <=2.3e-7, below the 1e-4 criterion; T=2/T=4 identical |
+| Prior AVX2 emulation on Grace | Kernel tests pass; 16 real stamps/model, F4/F2/direct/scalar: maximum component-mean bias <=3.7e-7; T=2/T=4 identical |
+| Native Delta AVX2, cn126 / job 23059395, g++ 14 | C++ kernel tests, all 14 unittests and FP64 golden at 1e-12 pass; 512 real stamps pass each e/R mean-bias criterion; T=2/T=4 e/R bit-identical; position derivatives pass |
+
+Native Delta FP32 comparison against the strict-FP32 GPU reference, 512 real
+stamps, user-reported absolute signed component-mean biases:
+
+| Model | Maximum e mean bias | Maximum R mean bias | Largest individual absolute ΔR |
+|---|---:|---:|---:|
+| s4 | 5.8e-9 | 1.1e-7 | 6.9e-6 |
+| AttnW | 1.1e-8 | 1.1e-7 | 4.2e-6 |
+
+Every e/R component passes `abs(mean(CPU-reference)) < 1e-4`; F2, direct and
+scalar paths also pass, with reported mean biases of order 1e-7. Some individual
+R values exceed the older pointwise diagnostic tolerance, as on Grace.
+The native x86 FP64 golden passes the unchanged 1e-12 pointwise tolerance;
+FP64 throughput and its exact maximum errors were not supplied. The 7.49e-16 /
+7.11e-15 maxima in the table belong to the earlier Grace FP64 check.
+AVX-512 evidence remains cross-compilation/assembly inspection; Milan executes
+AVX2. These native results are supplied by the user, not rerun in this
+README update; raw artifacts and an exact tested source/binary hash were not
+provided. Exposure-level m/c calibration remains separate.
+
+Rebuild on the target x86 machine; an aarch64 extension cannot be reused there.
 
 Inside a Delta interactive allocation, from the repository root (with an x86
 Python environment and GCC/Clang):
