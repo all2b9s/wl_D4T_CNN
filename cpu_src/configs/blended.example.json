@@ -1,0 +1,18 @@
+{
+  "model": "../runs/attnw.npz",
+  "blended_dir": "/path/to/blended/exposures",
+  "psf_path": "../../logs/blended_test_psf.npy",
+  "cat_ref_path": "/path/to/OneDegSq.fits",
+  "output_root": "../runs/blended_demo",
+  "fname": "det_ml_cpu",
+  "sim_modes": ["sim_mode0", "sim_mode40"],
+  "exp_range": [0, 1],
+  "precision": "float32",
+  "n_tangent": 2,
+  "nthreads": 1,
+  "batch_size": null,
+  "noise_level": 0.594,
+  "save_csv": false,
+  "bs_times": 100,
+  "calibration_workers": 1
+}
