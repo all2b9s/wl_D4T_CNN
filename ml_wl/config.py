@@ -25,9 +25,10 @@ STEP_DIRS = {
 }
 
 DEFAULTS = {
-    "rounds": str(ML_WL_DIR / "rounds"),
+    "rounds": "/work/hdd/bfmo/wenyinli/measurement/ml_wl",
     "round_dir": "${rounds}/${name}",
-    "data_root": "/work/hdd/bfmo/wenyinli/ml_wl/${name}",
+    "data_root": "${round_dir}",
+    "log_dir": str(SG_DIR / "output" / "ml_wl" / "${name}"),
     "paths": {"opt_e": "/projects/bdsp/wenyinli/codes/opt_e"},
     "sim": {"shear_task": "2_g1", "n_batches": 100, "batch_start": 0, "abs_shear": 0.02, "psf_fwhm": 0.85},
     "teacher_cnn": {"arch": "Forward8_fixW_CNN",

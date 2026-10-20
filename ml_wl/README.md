@@ -7,17 +7,19 @@
     python -m ml_wl.run ml_wl/configs/r1_F8gt.yaml --only dataset,train --force train   # rerun part of a round
     python -m ml_wl.run ml_wl/configs/r1_F8gt.yaml --dry-run     # write sbatch files, submit nothing
 
-Steps (outputs under `rounds/<name>/NN_step/`; 01/02/06 are symlinks into `data_root` on /work):
+Outputs and run metadata live under `/work/hdd/bfmo/wenyinli/measurement/ml_wl/<name>/`; Slurm logs live under `output/ml_wl/<name>/` in the single_galaxies repository. `ml_wl/` contains code and configuration only. Override `rounds`, `data_root`, or `log_dir` in YAML when needed.
+
+Steps:
 `measure` (teacher CNN shapes + R) → `catalog` → `edsm` (optuna) → `retrain` → `rdsm` (pick checkpoint + RDSM labels)
 → `dataset` (10k subset + renoised images + csv) → `train` (student CNN, optionally exported to `models/`).
 
 * Each job touches `DONE.<i>`; finished jobs are skipped on the next call. `--force STEP` clears them.
 * `--adopt STEP=PATH` (catalog | edsm | retrain | rdsm) reuses an existing output. `measure` cannot be adopted,
   so for a round that reuses old outputs run only the later steps: `--only dataset,train` (or `steps:` in the yaml).
-* Next round: copy the yaml, point `teacher_cnn.checkpoint` at `rounds/<prev>/07_cnn/best.pth`, change `name`.
+* Next round: copy the yaml, point `teacher_cnn.checkpoint` at `/work/hdd/bfmo/wenyinli/measurement/ml_wl/<prev>/10_cnn/best.pth`, change `name`.
 * `retrain.epochs` must equal the 20 epochs hard-coded in `opt_e/optuna_eDSM.py` (50 inflated |m| by 3-10x).
 * `single_galaxies/src` and `opt_e/src` are untouched. The opt_e steps call its CLI scripts (`paths.opt_e`); the two repos
-  stay separate, and `rounds/<name>/provenance.json` records both git HEADs per submission.
+  stay separate, and `<round_dir>/provenance.json` records both git HEADs per submission.
 * The `src` packages of the two repos share a name, so each step is its own job and never imports the other repo.
 
 ## Image preparation (teacher and student)

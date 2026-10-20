@@ -54,15 +54,15 @@ def step_state(cfg, step):
 
 def prepare_dirs(cfg, steps=None):
     rd = C.round_dir(cfg)
-    for sub in ("logs", "sbatch"):
-        (rd / sub).mkdir(parents=True, exist_ok=True)
+    (rd / "sbatch").mkdir(parents=True, exist_ok=True)
+    Path(cfg["log_dir"]).mkdir(parents=True, exist_ok=True)
     steps = list(steps or selected_steps(cfg, None)) if cfg.get("blended") is not None else C.STEPS
     if cfg.get("blended") is not None and "measure" in steps and "catalog" not in steps:
         steps.append("catalog")
     for step in steps:
         name, big = C.STEP_DIRS[step]
         link = rd / name
-        if big:
+        if big and C.big_dir(cfg, step) != link:
             real = C.big_dir(cfg, step)
             real.mkdir(parents=True, exist_ok=True)
             if not link.is_symlink() and not link.exists():
@@ -101,7 +101,7 @@ def build_script(cfg, step, i, job, sbatch=True):
     head = ""
     if sbatch:
         head = SBATCH_TMPL.format(jobname=f"{cfg['name']}_{step}{i}", partition=s["partition"], account=s["account"],
-                                  mem=resources["mem"], cpus=resources["cpus"], time=s["time"][step], logs=C.round_dir(cfg) / "logs",
+                                  mem=resources["mem"], cpus=resources["cpus"], time=s["time"][step], logs=cfg["log_dir"],
                                   gpu_directives=f"#SBATCH --gpus-per-node={gpus}\n#SBATCH --gpu-bind=closest" if gpus else "")
     env = (f"source {s['conda_sh']}\nconda activate {s['env']}\n" if sbatch else "")
     runtime_env = "export PYTHONDONTWRITEBYTECODE=1"

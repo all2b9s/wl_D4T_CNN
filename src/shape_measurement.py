@@ -51,12 +51,12 @@ def format_number(x: float) -> str:
     s = s.replace('.', '')                  # remove the decimal point
     return f"n{s}"
 
-def _prepare_cpu_batch(shear_comp, shear_mode, start, imgBs, noise_level, dtype, psf_fwhm):
+def _prepare_cpu_batch(shear_comp, shear_mode, start, imgBs, noise_level, dtype, psf_fwhm, shear_value=0.02):
     """CPU part of one iteration: load cutouts, draw noise, build q-images."""
     t0 = time.perf_counter()
     range_idx = [start*imgBs, (start+1)*imgBs]
     all_cutouts, all_psfs, all_cats, noise_levels = build_dataset(
-            shear_comp=shear_comp, shear_mode=shear_mode, abs_shear_value=0.02,
+            shear_comp=shear_comp, shear_mode=shear_mode, abs_shear_value=shear_value,
             noise_level=noise_level, index_range=range_idx, directory=dir, workers=32, use_threads=False
         )
 
@@ -92,6 +92,7 @@ def loop_shape_measurement(
     fname = 'p85',
     dtype = 'float32',
     psf_fwhm = 0.85,
+    shear_value = 0.02,
     batch_size = 800,       # GPU batch size for calibrator.shape_measure
     ):
     if noise_level == 'adaptive':
@@ -110,7 +111,7 @@ def loop_shape_measurement(
     # Prefetch the next iteration's CPU work while the GPU measures the current one.
     with ThreadPoolExecutor(max_workers=1) as prefetch:
         submit = lambda job: prefetch.submit(
-            _prepare_cpu_batch, job[1], job[0], job[2], imgBs, noise_level, dtype, psf_fwhm)
+            _prepare_cpu_batch, job[1], job[0], job[2], imgBs, noise_level, dtype, psf_fwhm, shear_value)
         future = submit(jobs[0]) if jobs else None
         for k, (shear_mode, shear_comp, start) in enumerate(jobs):
             print(f'Processing {shear_comp}_{shear_mode}, batch {start}')
@@ -168,6 +169,7 @@ if __name__ == "__main__":
     p.add_argument("--save_base", type=str, default=save_base,
                    help="Output root; results go to <save_base>/<noise_tag>/<comp>_<mode>/")
     p.add_argument("--batch_size", type=int, default=800, help="GPU batch size for shape_measure")
+    p.add_argument("--shear_value", type=float, default=0.02, help="Absolute simulated shear amplitude")
     args = p.parse_args()
     dir, save_base = args.dir, args.save_base
 
@@ -190,6 +192,7 @@ if __name__ == "__main__":
         fname=fname,
         dtype=dtype,
         batch_size=args.batch_size,
+        shear_value=args.shear_value,
     )
 
     end_time = time.time()
