@@ -28,7 +28,7 @@ class Measurement:
 class Model:
     def __init__(self, metadata, weights, precision="float32", isa="auto"):
         from . import _native
-        if getattr(_native, "api_version", 0) != 2:
+        if getattr(_native, "api_version", 0) != 3:
             raise RuntimeError("CPU native extension is out of date; rebuild cpu_src with build_local.sh using this Python interpreter")
         validate(metadata, weights)
         if precision not in ("float32", "float64"):

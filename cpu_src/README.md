@@ -276,15 +276,19 @@ Python environment and GCC/Clang):
 python -m cpu_src.build_direct
 # Standalone tests need no Python/NumPy/Torch or AnaCal at execution time.
 g++ -std=c++17 -O3 -pthread -I cpu_src/include \
-  cpu_src/tests/test_x86.cpp cpu_src/native/x86.cpp \
-  cpu_src/native/convolution.cpp cpu_src/native/kernels.cpp -o /tmp/d4cnn_test_x86
-/tmp/d4cnn_test_x86
+  cpu_src/tests/test_kernels.cpp cpu_src/native/kernels_simd.cpp \
+  cpu_src/native/convolution.cpp cpu_src/native/kernels.cpp -o /tmp/d4cnn_test_kernels
+/tmp/d4cnn_test_kernels
 python -m unittest discover -s cpu_src/tests -v
 ```
 
-The standalone test exercises every supported x86 ISA, F2/F4, T=2/T=4,
-boundaries and projected/identity residuals against independent scalar double
-calculations. CTest registers it as `x86_math` and marks it skipped on ARM.
+The standalone test exercises every available SIMD ISA (NEON, AVX2, AVX-512),
+F2/F4, T=2/T=4, boundaries, the fused raw/store/pool/canonical epilogue sinks,
+the first layer, LayerNorm, GELU, softmax and attention against independent
+double calculations. CTest registers it as `kernels`. Set
+`D4CNN_TEST_NO_THREADS=1` to skip the thread-pool checks (needed under qemu-user).
+`D4CNN_ISA=avx2|avx512|neon|scalar` overrides the ISA; `auto` probes AVX2 against
+AVX-512 once per process (`D4CNN_ISA_PROBE=0` disables the probe).
 The full Python C32 test explicitly covers every available ISA and each
 convolution override, including default F4. For AnaCal-dependent tests/builds,
 set `ANACAL_SOURCE_DIR` to the AnaCal checkout before building.

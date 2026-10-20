@@ -7,16 +7,15 @@ ARM and x86 share weight transformations. Direct, scalar, FP64 and trace paths
 remain available. Build entry points include the new x86 translation unit and
 the direct builder tracks its shared `.inc` dependency.
 
-**This port has not been compiled, tested or benchmarked.** Per the user's
-instruction, validation is delegated to the user on Delta. The temporary ARM
-allocation 3419652 was released; it ran only environment discovery. No numerical
-or performance claims for x86 follow from the Grace results below. The installed
-ARM binary has not been replaced for this source change.
-
-Prepared coverage: `tests/test_x86.cpp` (standalone/CTest `x86_math`) compares
-all supported x86 kernels against independent double references; the Python C32
-model regression now iterates over all supported ISAs and direct/F2/F4/default
-modes. Commands and build prerequisites are in [README.md](README.md).
+**x86 status (2026-10-20).** The shared SIMD kernels (`native/simd_impl.inc`,
+instantiated for NEON/AVX2/AVX-512 in `native/kernels_simd.cpp`) were cross-built
+for x86-64 and run under qemu-user on Grace: the kernel tests pass for AVX2, and
+real held-out stamps (16 stamps, s4 and AttnW, F4/F2/direct/scalar) agree with the
+strict-FP32 GPU reference (component-mean bias <= 3.7e-7, 1e-4 required) and with
+the NEON output (max |dR| 2.3e-6); T=2 and T=4 outputs are identical.
+**AVX-512 has been compiled and its assembly inspected, but never executed**
+(qemu has no AVX-512), and no x86 timing exists: validate and benchmark both
+on Delta/Candide. Commands and build prerequisites are in [README.md](README.md).
 
 ---
 
@@ -411,3 +410,22 @@ No new end-to-end m/c validation is claimed.
 Saved artifacts under `runs/profile_3418136/` include all repeated timings,
 predictions, stage profiles, PMU counters, assembly, PNG/PDF figures, and exact
 experimental source/binary snapshots in `experimental_builds.tar.gz`.
+
+---
+
+# CPU optimization round 3 — 2026-10-20 (shared SIMD kernels, fused epilogues)
+
+Same-node (Grace gh129/gh124, real stamps, T=2) gal/s, one core / 72 cores (512 sources):
+
+| Model | previous build | this build |
+|---|---|---|
+| s4 | 15.6 / 929 | 17.0 / 1031 |
+| AttnW | 13.8 / 788 | 15.5 / 895 |
+
+Acceptance: component-mean bias vs strict-FP32 GPU <= 2.3e-7 (1e-4 required); T=2 and T=4 identical.
+Findings that bound further work on Grace: the production Winograd GEMM runs at
+74.7 GFLOP/s per core against a 101 GFLOP/s NEON FMA peak (74%), so the GEMM has
+about 4% total headroom; the exp polynomial was cut to degree 5 (minimax, 7.5e-8) and
+LayerNorm statistics are computed one pixel ahead of the apply step (+2-3%);
+reusing overlapping Winograd input columns between adjacent tiles was measured
+and was 3% slower, so it was not kept.

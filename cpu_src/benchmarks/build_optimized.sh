@@ -14,7 +14,7 @@ export ANACAL_SOURCE_DIR=/projects/bdsp/wenyinli/packages/AnaCal
 python_bin=/u/wenyinli/.conda/envs/anacal_clone/bin/python
 cd "$scratch/current"
 "$python_bin" -B cpu_src/build_direct.py
-g++ -std=c++17 -O3 -pthread -I cpu_src/include cpu_src/tests/test_simd_math.cpp -o "$scratch/test_math"
+g++ -std=c++17 -O3 -pthread -I cpu_src/include cpu_src/tests/test_kernels.cpp cpu_src/native/kernels_simd.cpp cpu_src/native/kernels.cpp cpu_src/native/convolution.cpp -o "$scratch/test_math"
 "$scratch/test_math"
 "$python_bin" -B -m unittest discover -s cpu_src/tests -v
 "$python_bin" -B cpu_src/benchmarks/profile_native.py --worker --variant optimized --base "$scratch/current" --work "$scratch/work" --data "$scratch/data" --output "$output"

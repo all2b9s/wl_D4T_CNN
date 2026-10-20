@@ -21,7 +21,7 @@ cd "$scratch/code"
 hostname
 lscpu > "$output/lscpu.txt"
 "$python_bin" -B cpu_src/build_direct.py
-g++ -std=c++17 -O3 -pthread -I cpu_src/include cpu_src/tests/test_simd_math.cpp -o "$scratch/test_math"
+g++ -std=c++17 -O3 -pthread -I cpu_src/include cpu_src/tests/test_kernels.cpp cpu_src/native/kernels_simd.cpp cpu_src/native/kernels.cpp cpu_src/native/convolution.cpp -o "$scratch/test_math"
 "$scratch/test_math"
 "$python_bin" -B -m unittest discover -s cpu_src/tests -v
 "$python_bin" -B -m cpu_src validate --model "$repo/cpu_src/runs/attnw.npz" \

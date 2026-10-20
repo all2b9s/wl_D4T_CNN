@@ -17,7 +17,7 @@ export TMPDIR="$work/temp" PYTHONPATH="$work/$tag:$repo" ANACAL_SOURCE_DIR=/proj
 py=/u/wenyinli/.conda/envs/anacal_clone/bin/python
 cd "$work/$tag"
 "$py" -B cpu_src/build_direct.py
-g++ -std=c++17 -O3 -pthread -I cpu_src/include cpu_src/tests/test_simd_math.cpp -o "$work/$tag/test_math"
+g++ -std=c++17 -O3 -pthread -I cpu_src/include cpu_src/tests/test_kernels.cpp cpu_src/native/kernels_simd.cpp cpu_src/native/kernels.cpp cpu_src/native/convolution.cpp -o "$work/$tag/test_math"
 "$work/$tag/test_math"
 "$py" -B -m unittest discover -s cpu_src/tests -v
 D4CNN_CONV="$algorithm" "$py" -B -m cpu_src.benchmarks.profile_native --worker --variant "$tag" --base "$work/$tag" --work "$work/work" --data "$work/data" --output "$output"

@@ -76,6 +76,9 @@ public:
     const S* ptr=in+size_t(i)*5*cfg.size*cfg.size;
     if(tangent==2){auto v=m2.measure(ptr);std::copy(v.begin(),v.end(),out+size_t(i)*d*2);}
     else {auto v=m4.measure(ptr);std::copy(v.begin(),v.end(),out+size_t(i)*d*2);}
+#ifdef D4CNN_PROFILE
+    prof::commit();
+#endif
    });
   }return result;
  }
@@ -94,7 +97,11 @@ void bind_anacal(py::module_&);
 #endif
 PYBIND11_MODULE(_native,m){
  m.doc()="D4CNN forward-mode CPU inference; no libtorch dependency";
- m.attr("api_version")=2;
+ m.attr("api_version")=3;
+#ifdef D4CNN_PROFILE
+ m.def("profile_reset",&prof::reset);
+ m.def("profile_stats",[](){py::dict out;for(int k=0;k<prof::count;++k)out[prof::names[k]]=prof::sums[k].load();return out;});
+#endif
  m.def("available_isas",&available_isas);m.def("resolve_isa",&resolve_isa);
  py::class_<BoundModel<float>>(m,"FloatModel")
   .def(py::init([](py::dict meta,py::dict weights,std::string isa){return std::make_unique<BoundModel<float>>(config_from(meta),weights_from(weights),isa);}))

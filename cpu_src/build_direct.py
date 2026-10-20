@@ -16,9 +16,9 @@ def main():
     temp.mkdir(exist_ok=True)
     env={**os.environ,"TMPDIR":str(temp)}
     compiler=shlex.split(os.environ.get("CPU_CXX","g++"))
-    flags=["-std=c++17","-O3","-fPIC","-fvisibility=hidden","-pthread","-pipe",
+    flags=["-std=c++17","-O3"]+shlex.split(os.environ.get("D4CNN_EXTRA_FLAGS",""))+["-fPIC","-fvisibility=hidden","-pthread","-pipe",
            "-I"+str(root/"include"),"-I"+pybind11.get_include(),"-I"+sysconfig.get_paths()["include"]]
-    sources=[root/"native"/x for x in ("bindings.cpp","convolution.cpp","kernels.cpp","x86.cpp")]
+    sources=[root/"native"/x for x in ("bindings.cpp","convolution.cpp","kernels.cpp","kernels_simd.cpp")]
     headers=list((root/"include").rglob("*.h"))+list((root/"native").glob("*.inc"))
     anacal=os.environ.get("ANACAL_SOURCE_DIR")
     if anacal:

@@ -1,5 +1,7 @@
 #include "d4cnn/convolution.h"
+#include "d4cnn/kernels.h"
 #include <cstdlib>
+#include <mutex>
 #include <stdexcept>
 #if defined(__aarch64__)
 #include <arm_neon.h>
@@ -72,9 +74,23 @@ std::vector<std::string> available_isas() {
 #endif
  return out;
 }
+// "auto": D4CNN_ISA if set; otherwise the widest ISA, except that x86 CPUs with
+// both AVX2 and AVX512 time a short GEMM probe once per process and keep
+// AVX512 only if it is at least 3% faster (D4CNN_ISA_PROBE=0 disables this).
 std::string resolve_isa(const std::string& requested) {
  std::string s=requested; if(s=="auto") {const char* v=std::getenv("D4CNN_ISA");if(v)s=v;}
- auto all=available_isas(); if(s=="auto")return all.back();
+ auto all=available_isas();
+ if(s=="auto"){
+#if defined(__x86_64__)
+  const char* probe=std::getenv("D4CNN_ISA_PROBE");
+  if(all.back()=="avx512"&&!(probe&&std::string(probe)=="0")){
+   static std::once_flag once;static std::string chosen;
+   std::call_once(once,[]{chosen=probe_isa_seconds("avx512")<=.97*probe_isa_seconds("avx2")?"avx512":"avx2";});
+   return chosen;
+  }
+#endif
+  return all.back();
+ }
  for(auto& a:all)if(s==a)return s;
  throw std::invalid_argument("ISA unavailable: "+s);
 }
