@@ -232,7 +232,11 @@ class xlen_simulator():
                  rotId=0,
                  galaxy_profile=1,
                  mode = 'calibration',
-                 rot_ids = None):
+                 rot_ids = None,
+                 sim_start = 0,
+                 sim_stop = None):
+        self.sim_start = sim_start      # process only i in [sim_start, sim_stop) of the num_sims
+        self.sim_stop = sim_stop        # sims per rot group; seeds are still drawn for all num_sims
         self.seed = ori_seed
         self.output_dir = output_dir
         self.abs_shear = abs_shear
@@ -299,19 +303,34 @@ class xlen_simulator():
 
         for shear_mode, shear_comp in shear_tasks:
             for rotId in rot_ids:
-                args = [(self, self._worker, self.init_id + rotId * num_sims + i, seeds[i], shear_mode, shear_comp, rotId) for i in range(num_sims)]
+                args = [(self, self._worker, self.init_id + rotId * num_sims + i, seeds[i], shear_mode, shear_comp, rotId) for i in range(self.sim_start, self.num_sims_stop(num_sims))]
                 with Pool(processes=self.num_workers) as pool:
                     res = list(tqdm(
                         pool.imap_unordered(_worker_wrapper, args,chunksize=4),
-                        total=num_sims,
+                        total=len(args),
                         desc=f"Mode {shear_mode}, Comp {shear_comp}, rotId {rotId}"
                     ))
                     results.extend(res)
         print("Simulation finished")
         return results
 
+    def num_sims_stop(self, num_sims):
+        return num_sims if self.sim_stop is None else min(self.sim_stop, num_sims)
+
+    @staticmethod
+    def _is_complete(output_dir):
+        # gt_cat.csv is written last; also require the full-size cutouts (100x64x64 float64 + header)
+        try:
+            return (os.path.getsize(output_dir + 'cutouts.npy') == 3276928
+                    and os.path.getsize(output_dir + 'psf_image.npy') > 0
+                    and open(output_dir + 'gt_cat.csv', 'rb').read()[-1:] == b'\n')
+        except OSError:
+            return False
+
     def _worker(self, index, seed, shear_mode, shear_comp, rotId):
         output_dir = f'{self.output_dir}/{shear_comp}_{shear_mode}_val_{self.abs_shear:.3f}/img_{int(index)}/'
+        if self._is_complete(output_dir):   # resume: skip finished images
+            return None
         xlens_gal_sim(
             output_dir = output_dir,
             shear_mode = shear_mode,
@@ -361,6 +380,10 @@ def main():
         help="galaxy light profile (1: gaussian, 2: exponential); 0 keeps the catalog's native",
     )
     parser.add_argument("--num_sims", type=int, default=200_000)
+    parser.add_argument("--sim_start", type=int, default=0,
+                        help="first within-group index i to simulate (seeds/layout unchanged)")
+    parser.add_argument("--sim_stop", type=int, default=None,
+                        help="stop (exclusive) within-group index; default num_sims")
     parser.add_argument(
         "--rot_ids",
         default=None,
@@ -385,6 +408,8 @@ def main():
         galaxy_profile=args.galaxy_profile,
         mode=args.mode,
         rot_ids=args.rot_ids,
+        sim_start=args.sim_start,
+        sim_stop=args.sim_stop,
     )
     simulator(args.num_sims)
 
