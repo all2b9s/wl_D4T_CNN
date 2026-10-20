@@ -35,6 +35,8 @@ Then open `example.ipynb` and follow the cells:
 3. Compute the **pixel response** and **shear response matrix** for calibration
 
 For large-scale shape measurement, see `src/shape_measurement.py` and `src/cal_biases.py`.
+For C++ CPU inference on ARM and x86, see [cpu_src](cpu_src/README.md);
+for the configurable training/measurement workflow, see [ml_wl](ml_wl/README.md).
 
 ## Repository Structure
 
@@ -42,6 +44,8 @@ For large-scale shape measurement, see `src/shape_measurement.py` and `src/cal_b
 .
 ├── example.ipynb          # End-to-end tutorial (training + inference + response)
 ├── models/                # Pretrained weights (.pth)
+├── cpu_src/               # C++ CPU inference, Python API, tests and benchmarks
+├── ml_wl/                 # Configurable CNN → eDSM → RDSM workflow
 ├── src/
 │   ├── blended_run.py           # Entry point: FPFS detect + ML measure (blended FITS)
 │   ├── blended_calibration.py   # Entry point: single-shear (g1) calibration

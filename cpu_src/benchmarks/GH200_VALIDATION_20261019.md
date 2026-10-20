@@ -144,8 +144,8 @@ saved CPU results and inputs within the same allocation, and repeated the full
 GPU phase successfully (`gpu.log`/`gpu.err`). No failed measurement was silently
 counted as a numerical pass.
 
-Use [`launch_pair.sh`](launch_pair.sh) after obtaining a suitable interactive
-allocation, as documented in `cpu_src/README.md`. Run
+The one-off launcher used for this historical run is retained in Git commit
+`cbf2634`. Current runner conventions are in [README.md](README.md). Run
 `python -m cpu_src.benchmarks.diagnose_pair --output OUTPUT` in the allocation
 for float64 outlier checks. `cluster_pair --plots-only` redraws saved predictions
 without repeating inference. No existing `src/` code was modified.

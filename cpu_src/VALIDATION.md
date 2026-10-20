@@ -166,11 +166,11 @@ See `installed.json` for pointwise pass counts.
 - [Experiment notes, including failed/duplicate attempts](runs/tune2_3419259/experiment_notes.json)
 - Final source archive, compiler metadata and source/binary hashes are retained.
   The old installed extension is saved as `previous_native.so`.
-- `benchmarks/tune_variant.sh TAG winograd4` builds an isolated variant inside an
-  existing allocation; `benchmarks/finalize_interactive.sh final` performs final
-  testing. `finalize_sources.py` and `finalize_reference.py` run in subsequent
-  sequential steps. `tune_profile.py` instruments the saved **F2 baseline**;
-  its exact-pattern assertions intentionally reject changed implementations.
+- The one-off launchers and source-rewriting profilers used for these historical
+  runs were removed during cleanup. Their versions remain in Git commit
+  `cbf2634` and the saved source archives. Current build/test commands are in
+  [README.md](README.md); dataset-specific runners are described in
+  [benchmarks/README.md](benchmarks/README.md).
 
 Installed binary SHA256: `7c0285350592eb5efb254ee7f6629a4e6202807433ac2bfe529bf2b6dab841a4`.
 
@@ -322,8 +322,8 @@ Artifacts: [`runs/finalize_3418647/`](runs/finalize_3418647/).
 - `initial.log`, `final.log/.err`, `reference.log/.err`, `source_checks.log/.err`,
   `installed.log/.err`: complete build, regression, CTest and installed checks.
 
-Use `benchmarks/finalize_interactive.sh TAG` under `srun` in an allocated
-interactive job. `finalize_reference.py` runs independent CPU/GPU references;
+The original one-off launcher is retained in Git history (`cbf2634`).
+`finalize_reference.py` runs independent CPU/GPU references;
 `finalize_sources.py` checks source batching. Results are Git-ignored and must
 be retained separately when sharing a build.
 

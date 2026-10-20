@@ -1,4 +1,4 @@
-# D4CNN CPU demo
+# D4CNN CPU inference
 
 Standalone CPU inference and blended-image calibration, isolated under `cpu_src/`.
 The default is **float32 throughout** (normalization, CNN, attention, pooling and
@@ -20,22 +20,21 @@ Use the same Python interpreter and AnaCal source revision as your detection
 installation. NumPy and pybind11 must be available. Run from `single_galaxies/`:
 
 ```bash
-PYTHON_BIN=/u/wenyinli/.conda/envs/anacal_clone/bin/python \
-ANACAL_SOURCE_DIR=/projects/bdsp/wenyinli/packages/AnaCal \
+PYTHON_BIN=python3 ANACAL_SOURCE_DIR=/path/to/AnaCal \
 bash cpu_src/build_local.sh
 ```
 
 `CPU_CXX` selects a direct C++17 GCC/Clang compiler (default `g++`), and
 `BUILD_JOBS` defaults to 2. The helper uses `cpu_src/.build-tmp/`, so a full `/tmp`
-does not prevent compilation. Do not use the Cray `CC` wrapper unless required
-by your deployment. A separate CMake build directory is needed when changing
-compilers after initial configuration.
+does not prevent compilation. Use a separate CMake build directory when changing
+compilers after initial configuration. Build on the target architecture; an ARM
+extension cannot be reused on x86, or vice versa.
 
 On filesystems where CMake probe creation is very slow, add
 `D4CNN_DIRECT_BUILD=1` to the same command. This uses the same compiler flags,
 parallel compilation and cached object files, without CMake probes. Both build
 paths install the extension atomically.
-The Python API checks native API version 2 at model construction and reports a
+The Python API checks native API version 3 at model construction and reports a
 rebuild instruction if an old extension is present. Always restart interpreters
 that loaded an older extension after rebuilding it.
 
@@ -47,7 +46,7 @@ extension does not register AnaCal classes again or link to its Python binary.
 For wheel installation, `pyproject.toml` also supports scikit-build-core:
 
 ```bash
-TMPDIR="$PWD/cpu_src/.build-tmp" python -m pip install ./cpu_src \
+python -m pip install ./cpu_src \
   -Ccmake.define.ANACAL_SOURCE_DIR=/path/to/AnaCal
 ```
 
@@ -60,7 +59,7 @@ golden data, reference comparisons and reference tests.
 
 ```bash
 python -m cpu_src export \
-  --checkpoint models/blended_rdsm_runs/renoised_q_n0594_330k_3m/attnw/last.pth \
+  --checkpoint /path/to/attnw/last.pth \
   --output cpu_src/runs/attnw.npz
 ```
 
@@ -71,7 +70,7 @@ architecture, explicit sigmas and preprocessing, rather than guessing defaults:
 
 ```bash
 python -m cpu_src export \
-  --checkpoint models/F8_gauss_truth_final.pth \
+  --checkpoint /path/to/fixw/checkpoint.pth \
   --architecture Forward8_fixW_CNN \
   --model-kwargs '{"nl_sigma":16,"gw_sigma":16}' \
   --pixel-scale 0.2 --sigma-arcsec 0.3609341825902335 --flim 10 \
@@ -265,163 +264,90 @@ The result metadata records the selected convolution algorithm.
 
 ### Measured CPU throughput and numerical validation (2026-10-20)
 
-Production inference uses FP32. The following T=2 rates are galaxies/s, medians
-of three runs after warmup. The user reports all Delta x86 timing groups stable;
-Grace results are from optimization round 3 in [VALIDATION.md](VALIDATION.md).
-The native Delta run used exclusive node **cn126**, **2× AMD EPYC 7763**,
-128 cores, job **23059395**. The current workspace was rebuilt on-node with
-**g++ 14**; `auto` selected **AVX2** (Milan does not support AVX-512).
-These are network/q-stamp inference rates, not full detection/exposure rates.
+FP32 inference, T=2, median of three stable runs. EPYC results were measured on
+2× AMD EPYC 7763 with GCC 14 and AVX2; ARM results use NVIDIA Grace with NEON.
+These timings include network inference and Python input/output handling,
+excluding model loading, q-stamp preparation and detection. Hardware, compiler,
+batch size and thread placement affect performance. Run provenance and earlier
+optimization rounds are retained in [VALIDATION.md](VALIDATION.md).
 
-| Platform / configuration | s4 | AttnW |
+| CPU / configuration | s4 (gal/s) | AttnW (gal/s) |
 |---|---:|---:|
-| Delta x86 (Milan), 1 core | 21.7 | 18.8 |
-| Delta x86, 72 cores, 512 sources | 1175 | 912 |
-| Delta x86, 128 cores, 512 sources | 1934 | 1474 |
-| Delta x86, 128 cores, 2304 sources | 1987 | 1563 |
-| Grace round 3, 1 core | 17.0 | 15.5 |
-| Grace round 3, 72 cores, 512 sources | 1031 | 895 |
+| EPYC 7763, 1 core | 21.7 | 18.8 |
+| EPYC 7763, 72 cores, 512 sources | 1175 | 912 |
+| EPYC 7763, 128 cores, 512 sources | 1934 | 1474 |
+| EPYC 7763, 128 cores, 2304 sources | 1987 | 1563 |
+| Grace, 1 core | 17.0 | 15.5 |
+| Grace, 72 cores, 512 sources | 1031 | 895 |
 
-On these runs, x86 single-core throughput exceeds Grace by 27.6% / 21.3%
-(s4 / AttnW); at 72 cores the gains are 14.0% / 1.9%. This is a comparison of
-separate machine runs, not a controlled architecture-only speedup.
-Using `throughput(N)/(N*throughput(1))`, x86 parallel efficiency at 128 cores is
-69.6% / 61.3% for 512 sources and 71.5% / 65.0% for 2304 sources.
-The reported Milan node has eight NUMA domains. s4 rises from 973 at 64 cores
-to 1934 at 128 cores (1.99x); these two points alone do not show a scaling
-break above 64 cores or establish NUMA as the cause of lost efficiency.
+At 128 cores and 512 sources, EPYC parallel efficiency relative to one core is
+69.6% / 61.3% (s4 / AttnW). s4 rises from 973 at 64 cores to 1934 at 128 cores.
 
-Practical choices from the supplied x86 measurements:
+- F4 is the default: s4 reaches 1934 gal/s versus 1532 with F2 at 128 cores.
+- Direct convolution is a slow fallback on the measured x86 CPU: s4 gives
+  2.2 / 245 gal/s at 1 / 128 cores; scalar gives 1.4 / about 144.
+- Use automatic batching or enough sources to occupy all workers. Batches of
+  only 64 sources at 128 cores give 1131 / 978 gal/s in the source-API experiment.
+  Automatic source batches contain `max(64,8*nthreads)` objects (1024 at 128
+  workers). The table above measures q-stamp inference separately.
 
-- **Keep F4 as default.** s4 at 128 cores is 1934 with F4 versus 1532 with F2
-  (+26.2%). `D4CNN_CONV=winograd` selects F2; `winograd4` selects F4.
-- **Direct is a slow fallback on x86.** Reported s4 rates are 2.2 at one core
-  and 245 at 128 cores, versus 21.7 / 1934 for F4. Scalar is 1.4 / about 144.
-  Thus the measured direct path has substantial optimization headroom; setting
-  `D4CNN_CONV=direct` carries a large throughput cost.
-- **Use sufficiently large source batches.** At 128 cores, batches of only 64
-  sources give 1131 / 978. Use batches of 576 or automatic batching to expose
-  more source parallelism. The automatic source batch is `max(64,8*nthreads)`:
-  576 at 72 workers and 1024 at 128 workers. These source-API batching numbers
-  are a separate experiment from the 512-source q-stamp table.
+On x86, C++ kernel tests, 14 Python tests and FP64 golden validation passed.
+For 512 real stamps against strict-FP32 GPU, the measured maximum absolute
+signed component-mean biases are:
 
-Numerical evidence has different scopes:
-
-| Check | Result / scope |
-|---|---|
-| FP64 golden, independent autograd and primal traces (previous Grace validation) | Pass at unchanged pointwise `atol=rtol=1e-12`; maximum e error 7.49e-16, R error 7.11e-15 |
-| Grace round-3 production FP32 vs strict-FP32 GPU | Component-mean bias <=2.3e-7, below the 1e-4 criterion; T=2/T=4 identical |
-| Prior AVX2 emulation on Grace | Kernel tests pass; 16 real stamps/model, F4/F2/direct/scalar: maximum component-mean bias <=3.7e-7; T=2/T=4 identical |
-| Native Delta AVX2, cn126 / job 23059395, g++ 14 | C++ kernel tests, all 14 unittests and FP64 golden at 1e-12 pass; 512 real stamps pass each e/R mean-bias criterion; T=2/T=4 e/R bit-identical; position derivatives pass |
-
-Native Delta FP32 comparison against the strict-FP32 GPU reference, 512 real
-stamps, user-reported absolute signed component-mean biases:
-
-| Model | Maximum e mean bias | Maximum R mean bias | Largest individual absolute ΔR |
+| Model | e mean bias | R mean bias | Largest individual absolute ΔR |
 |---|---:|---:|---:|
 | s4 | 5.8e-9 | 1.1e-7 | 6.9e-6 |
 | AttnW | 1.1e-8 | 1.1e-7 | 4.2e-6 |
 
-Every e/R component passes `abs(mean(CPU-reference)) < 1e-4`; F2, direct and
-scalar paths also pass, with reported mean biases of order 1e-7. Some individual
-R values exceed the older pointwise diagnostic tolerance, as on Grace.
-The native x86 FP64 golden passes the unchanged 1e-12 pointwise tolerance;
-FP64 throughput and its exact maximum errors were not supplied. The 7.49e-16 /
-7.11e-15 maxima in the table belong to the earlier Grace FP64 check.
-AVX-512 evidence remains cross-compilation/assembly inspection; Milan executes
-AVX2. These native results are supplied by the user, not rerun in this
-README update; raw artifacts and an exact tested source/binary hash were not
-provided. Exposure-level m/c calibration remains separate.
+All e/R components pass the 1e-4 mean-bias criterion. F2/direct/scalar also pass;
+T=2/T=4 e/R are bit-identical and position-derivative checks pass. Some individual
+R values exceed the older pointwise diagnostic tolerance. Grace round 3 has
+maximum component-mean bias <=2.3e-7 and identical T=2/T=4 e/R.
 
-Rebuild on the target x86 machine; an aarch64 extension cannot be reused there.
+FP64 golden validation passes the unchanged pointwise `atol=rtol=1e-12` on both
+architectures. The earlier Grace maximum e/R errors are 7.49e-16 / 7.11e-15;
+exact x86 FP64 maxima and FP64 throughput were not supplied. AVX-512 was compiled
+and inspected but has no execution result in these records; EPYC 7763 uses AVX2.
+Numerical agreement does not replace exposure-level m/c science validation.
 
-Inside a Delta interactive allocation, from the repository root (with an x86
-Python environment and GCC/Clang):
+### Kernel tests and profiling
+
+Run on your workstation or allocated compute resources with a C++17 compiler.
+On a managed cluster, follow its scheduling policy for builds and benchmarks.
+After the CMake build above:
 
 ```bash
-python -m cpu_src.build_direct
-# Standalone tests need no Python/NumPy/Torch or AnaCal at execution time.
+ctest --test-dir cpu_src/build/local --output-on-failure
+python -m unittest discover -s cpu_src/tests -v
+```
+
+For a standalone kernel test without Python or AnaCal at execution time:
+
+```bash
 g++ -std=c++17 -O3 -pthread -I cpu_src/include \
   cpu_src/tests/test_kernels.cpp cpu_src/native/kernels_simd.cpp \
   cpu_src/native/convolution.cpp cpu_src/native/kernels.cpp -o /tmp/d4cnn_test_kernels
 /tmp/d4cnn_test_kernels
-python -m unittest discover -s cpu_src/tests -v
 ```
 
-The standalone test exercises every available SIMD ISA (NEON, AVX2, AVX-512),
-F2/F4, T=2/T=4, boundaries, the fused raw/store/pool/canonical epilogue sinks,
-the first layer, LayerNorm, GELU, softmax and attention against independent
-double calculations. CTest registers it as `kernels`. Set
-`D4CNN_TEST_NO_THREADS=1` to skip the thread-pool checks (needed under qemu-user).
-`D4CNN_ISA=avx2|avx512|neon|scalar` overrides the ISA; `auto` probes AVX2 against
-AVX-512 once per process (`D4CNN_ISA_PROBE=0` disables the probe).
-The full Python C32 test explicitly covers every available ISA and each
-convolution override, including default F4. For AnaCal-dependent tests/builds,
-set `ANACAL_SOURCE_DIR` to the AnaCal checkout before building.
+The test exercises each available SIMD ISA, F2/F4, T=2/T=4, boundary tiles,
+fused epilogues, first-layer skip projections, LayerNorm, GELU, softmax and
+attention against independent double calculations. CTest registers it as
+`kernels`. Python tests additionally cover the full model and pipeline; install
+the reference/pipeline dependencies and build with `ANACAL_SOURCE_DIR` first.
 
-Use `D4CNN_ISA=avx2` or `avx512` to force an available backend. For matched
-throughput runs, compare `D4CNN_CONV=direct`, `winograd` (F2) and `winograd4`
-(F4) with the same model/q-stamps/thread count; all now use fused C32 epilogues.
-For example, after replacing model/input paths:
+`D4CNN_ISA=avx2|avx512|neon|scalar` selects an available ISA. On x86, `auto`
+probes AVX2 against AVX-512 once per process when both are available;
+`D4CNN_ISA_PROBE=0` disables that probe. For example:
 
 ```bash
 D4CNN_ISA=avx2 D4CNN_CONV=winograd4 python -m cpu_src benchmark \
-  --model MODEL.npz --qstamps QSTAMPS.npz --count 512 \
-  --threads 1 8 32 --repeats 3 --output x86_f4.json
+  --model /path/to/model.npz --qstamps /path/to/qstamps.npz --count 512 \
+  --threads 1 8 32 --repeats 3 --output cpu_src/runs/f4_benchmark.json
 ```
 
-For the current interactive validation, use `benchmarks/finalize_interactive.sh`
-inside `srun`; it snapshots source, rebuilds on node-local storage, runs the C++
-math/executor tests, Python tests, FP64 golden checks and real-stamp CPU timing.
-`benchmarks/finalize_reference.py` separately reruns Torch CPU and strict-FP32 GPU
-references after the CPU timing step. Both require an existing allocation.
-The C++ test is also registered with CTest (`ctest --test-dir BUILD_DIR`).
-
-Performance must be measured on the intended Grace/x86 hardware; peak-FLOP
-estimates are not delivery claims. SIMD backends need validation on each actual
-ISA, and dedicated-node scaling/science runs should be scheduled separately
-from the small local checks.
-
-### Historical paired GH200 / Grace run
-
-The current optimized build and fresh comparisons are recorded in
-[VALIDATION.md](VALIDATION.md). The following report is retained as a baseline.
-
-The [2026-10-19 measured report](benchmarks/GH200_VALIDATION_20261019.md) records
-321–345 gal/s at 72 cores (about 83% parallel efficiency). The 500–580 gal/s
-forecast is not reached. Both models pass the revised e/R component-mean
-criterion against strict-FP32 GPU. Individual-output diagnostics and the
-TF32 s4 R11 mean-bias failure are detailed in that report.
-
-`benchmarks/cluster_pair.py` compares the trained s4 and AttnW `last.pth`
-checkpoints on 512 common held-out blended stamps (exposures 940–943). It
-reconstructs all five q planes with the training noise seeds and checks q0
-against the cached training preprocessing before inference. It records C++
-1/8/36/72-core scaling, persistent PyTorch CPU 1/8/72-process baselines,
-GPU batch sweeps with strict FP32 and original TF32 settings, T=4 correctness,
-one-to-one/residual figures, raw predictions and repeated timings.
-
-Allocate resources using the live site/account requirements, then launch from
-this repository root (replace the example job ID with your allocation):
-
-```bash
-salloc --account=bdsp-dtai-gh --partition=ghx4-interactive \
-  --nodes=1 --ntasks=1 --cpus-per-task=72 --gpus-per-node=1 \
-  --mem=100G --time=02:00:00 --constraint='projects&taiga&work' --no-shell
-bash cpu_src/benchmarks/launch_pair.sh 3417691
-scancel 3417691
-```
-
-The launcher stages source, the built native extension and data on compute-node
-`/tmp`; it uses the local `anacal_clone` interpreter. Outputs default to
-`cpu_src/runs/paired_JOB_ID/`. The launcher does not allocate or release a job.
-All CPU fork pools finish before CUDA initialization. Host-to-output inference
-timings include input/output handling and exclude q generation, loading and
-plotting; GPU device-resident timings are retained separately. This comparison
-does not measure full-exposure detection or m/c calibration.
-
-`--resume-cpu` on the Python runner reuses saved CPU results in the same
-allocation and repeats GPU measurements. `--plots-only` redraws saved figures.
-`python -m cpu_src.benchmarks.diagnose_pair --output OUTPUT` checks the eight
-most sensitive stamps per model in float64 and repeats GPU predictions. Run
-these commands on compute resources, with this repository on `PYTHONPATH`.
+Choose thread counts within your available CPU allocation. Compare F4, F2 and
+direct with identical model/input/thread settings. The portable benchmark entry
+point is `python -m cpu_src benchmark`; dataset-specific research utilities and
+their input conventions are listed in [benchmarks/README.md](benchmarks/README.md).

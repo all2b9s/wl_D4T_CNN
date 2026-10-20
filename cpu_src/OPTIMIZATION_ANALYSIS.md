@@ -257,22 +257,7 @@ QK 和 AV 各自的 primal + 两条 tangent 需要约 20.97 MFLOP，共约 41.94
 - `experimental_builds.tar.gz` + `.sha256`：原版快照、全部实验源码和 `.so`、运行脚本；各 `*_build.json` 和 `build_*.log` 记录编译选项与日志。向量 GELU 的额外 `-lmvec` 链接参数见构建脚本。
 - `lscpu.txt`、`numa.txt`、`allocation.txt`、`accounting.txt`：环境及作业记录。allocation 已释放。
 
-可复用脚本：[profile_native.py](benchmarks/profile_native.py)、[perf_native.py](benchmarks/perf_native.py)、[summarize_profile.py](benchmarks/summarize_profile.py)、[check_profile_t4.py](benchmarks/check_profile_t4.py)。`finish_profile.sh` 保留本次现场的最终收集命令。
-
-在已分配的同类计算节点上，可从归档基线重跑；使用新的输出目录，避免覆盖原始结果：
-
-```bash
-repo=/projects/bdsp/wenyinli/codes/single_galaxies
-python_bin=/u/wenyinli/.conda/envs/anacal_clone/bin/python
-scratch=/tmp/d4cnn_recheck_${SLURM_JOB_ID}
-mkdir -p "$scratch"
-tar -xzf "$repo/cpu_src/runs/profile_3418136/experimental_builds.tar.gz" -C "$scratch"
-export OPENBLAS_NUM_THREADS=1 OMP_NUM_THREADS=1 MKL_NUM_THREADS=1
-export TMPDIR="$scratch" MPLCONFIGDIR="$scratch/matplotlib"
-"$python_bin" -B "$repo/cpu_src/benchmarks/profile_native.py" \
-  --base "$scratch/base" --work "$scratch/rebuild" \
-  --data "$repo/cpu_src/runs/paired_3417691" \
-  --output "$repo/cpu_src/runs/profile_recheck_${SLURM_JOB_ID}"
-```
-
-该脚本会重建全部实验，默认跑 baseline/tuned 的 batch sweep；combined 的 batch sweep 用 `--worker --balanced --variant combined_balanced --base "$scratch/rebuild/combined"` 再运行，其他路径参数相同。汇总脚本读取三种 batch sweep 后生成 PNG/PDF。不要在登录节点执行推理、构建或批量绘图。
+这些历史实验使用的源码替换式 profiler、一次性启动和汇总脚本已从当前代码树清理；
+可从 Git 提交 `cbf2634` 或上述源码归档中恢复。它们针对当时的源码布局，
+不能用于当前共享 SIMD 实现。当前性能分析工具和数据约定见
+[benchmarks/README.md](benchmarks/README.md)。
