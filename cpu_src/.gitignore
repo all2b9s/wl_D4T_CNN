@@ -6,3 +6,7 @@ build/
 runs/
 .pytest_cache/
 *.core
+
+# Keep README.md files; exclude other Markdown documentation.
+*.md
+!README.md

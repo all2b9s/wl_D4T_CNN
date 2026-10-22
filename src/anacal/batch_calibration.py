@@ -185,7 +185,11 @@ def _get_total_memory_bytes(default=64 * (1024 ** 3)):
         pages = os.sysconf("SC_PHYS_PAGES")
         page_size = os.sysconf("SC_PAGE_SIZE")
         if pages > 0 and page_size > 0:
-            return int(pages * page_size)
+            physical = int(pages * page_size)
+            allocated_mb = os.environ.get("SLURM_MEM_PER_NODE")
+            if allocated_mb:
+                return min(physical, int(allocated_mb) * 1024**2)
+            return physical
     except Exception:
         pass
     return default
@@ -238,17 +242,21 @@ def get_biases(
     shape_elems_per_obj = int(np.prod(shapes.shape[1:]))
     resp_elems_per_obj = int(np.prod(Rs.shape[1:]))
     mask_elems_per_obj = int(np.prod(mask.shape[1:])) if mask is not None else 0
-    est_bytes_per_sample = bs_size * (
+    est_bytes_per_sample = bs_size * (2 if is_twin else 1) * (
         shape_elems_per_obj * shape_itemsize
         + resp_elems_per_obj * resp_itemsize
         + mask_elems_per_obj * mask_itemsize
     )
-    est_mb_per_sample = est_bytes_per_sample / (1024 ** 2)
 
     total_mem_bytes = _get_total_memory_bytes()
     # Reserve part of RAM for base arrays / Python / other processes.
-    # Keep bootstrap worker temporary slices within ~35% of total RAM.
-    worker_budget_bytes = int(total_mem_bytes * 0.35)
+    # Leave 30% of allocation for Python, libraries and allocator overhead.
+    base_bytes = shapes.nbytes + Rs.nbytes + (mask.nbytes if mask is not None else 0)
+    worker_budget_bytes = max(0, int(total_mem_bytes * 0.70) - base_bytes)
+    # Allow for reduction temporaries, bootstrap indices and IPC copies.
+    est_bytes_per_sample = int(est_bytes_per_sample * 1.5 + bs_size * (2 if is_twin else 1) * 16)
+
+    est_mb_per_sample = est_bytes_per_sample / (1024 ** 2)
 
     if est_bytes_per_sample > 0 and n_jobs > 1:
         max_safe_jobs = worker_budget_bytes // est_bytes_per_sample
@@ -264,6 +272,8 @@ def get_biases(
                 f"RAM budget ~{worker_budget_bytes / (1024 ** 3):.1f} GB. "
                 f"Adjusting n_jobs {old_jobs} -> {n_jobs}, chunk_bs -> {chunk_bs}."
             )
+
+    chunk_bs = max(1, min(chunk_bs, n_jobs))
 
     # Bootstrap result containers
     m_list = []

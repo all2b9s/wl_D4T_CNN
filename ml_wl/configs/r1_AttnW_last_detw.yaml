@@ -11,7 +11,7 @@ blended:
   discard_measurements: true
   prepare_catalog_in_measure: true  # DeltaAI rejects CPU-only Slurm jobs
   measurement:
-    blended_dir: /projects/bdsp/wenyinli/codes/single_galaxies/output/training_size_test/tract_variance_calibration/input
+    blended_dir: /work/hdd/bfcn/wenyinli/blended_shapenoise_fullIMG
     noise_level: 0.594
     sim_mode: sim_mode80
     psf_path: /projects/bdsp/wenyinli/codes/single_galaxies/logs/blended_test_psf.npy

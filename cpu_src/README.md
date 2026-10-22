@@ -11,8 +11,6 @@ fused Winograd epilogues, persistent workers and reusable per-worker buffers.
 fixW pools each orbit directly. AttnW uses query tiles, vector QK/AV and directly
 accumulates low-resolution scalar tokens when the grid divides the image size.
 See [current validation](VALIDATION.md) for measured acceptance and throughput.
-The [earlier performance audit](OPTIMIZATION_ANALYSIS.md) retains historical
-baseline/ablation results; those numbers are not measurements of the current code.
 
 ## Build
 
@@ -306,10 +304,51 @@ R values exceed the older pointwise diagnostic tolerance. Grace round 3 has
 maximum component-mean bias <=2.3e-7 and identical T=2/T=4 e/R.
 
 FP64 golden validation passes the unchanged pointwise `atol=rtol=1e-12` on both
-architectures. The earlier Grace maximum e/R errors are 7.49e-16 / 7.11e-15;
-exact x86 FP64 maxima and FP64 throughput were not supplied. AVX-512 was compiled
-and inspected but has no execution result in these records; EPYC 7763 uses AVX2.
+architectures. EPYC 7763 (Milan) has no AVX-512 and runs AVX2.
 Numerical agreement does not replace exposure-level m/c science validation.
+
+### Isolated xlens measurement (`isolated_measure_pool`)
+
+Production path for the isolated-galaxy xlens sims (`shape_measure_multi_cpu.sh`).
+One batch = 100 `img_` dirs = 10 000 galaxies; output is `<fname>_shapes_<b>.npy`
+`[N,2]` and `<fname>_Rana_<b>.npy` `[N,1,2,2]`, compatible with `src/cal_biases.py`.
+
+```bash
+python -u -m cpu_src.isolated_measure_pool --model cpu_src/runs/X.npz --noise 0.594 \
+  --fname NAME --shear_tasks 0_g1 --range 0 2000 --save_base /path/to/measurement_cpu/
+```
+
+**Design.** A single pool of worker processes, one per core (default: allowed cores
+minus 2 kept for the parent). Each worker takes one `img_` dir (100 galaxies) and runs
+load -> q-image -> 1-thread C++ inference, so no core idles between stages and none is
+oversubscribed. The parent draws the per-batch measurement noise from
+`RandomState(20020620 + batch)` (same stream and float32 noise level as before) into
+shared memory, at most `--max_batches_inflight` (default 4, 328 MB each) batches ahead,
+and writes a batch once all 100 dirs are back. Files are written atomically and finished
+batches are skipped, so a timed-out job can simply be resubmitted. Output is
+bit-identical to the previous prefetch-thread version (`isolated_measure.py`, kept for
+reference): max abs difference 0 for e and R over 16 batches. `--nthreads` and
+`--io_workers` are accepted but ignored.
+
+**Measured (2026-10-22, 2× EPYC 7763, 128 cores, `0_g1`, noise 0.594):**
+
+| Version | s / batch | gal/s | Note |
+|---|---:|---:|---|
+| Old production job (`io_workers=64`, 14 h run, 1699 batches) | 29.7 | 337 | avg ~54 of 128 cores busy; timed out |
+| Old pipeline re-measured, `io_workers=64` | 17.1 | ~580 | CPU idle 41%, sys 32% (192 threads on 128 cores) |
+| Old pipeline re-measured, `io_workers=16` | 10.7 | ~930 | CPU idle 45% |
+| `isolated_measure_pool`, 126 workers (16 batches) | 5.5 | 1819 | worker utilization 93%, steady CPU idle 3–9%, sys ~1% |
+
+The pool figure includes startup; its busy core-seconds split into load 2%, q-image 1%,
+inference 97%, i.e. throughput is now set by inference (~1950 gal/s ceiling, matching
+the table above). A full 4-shear run (16 000 batches) is therefore about 24 node-hours
+at 5.5 s/batch (estimate from the 16-batch measurement), versus about 132 at 29.7 s.
+
+Why the old version stalled: its prep (per batch, `io_workers=16`, no inference running)
+took 6.5 s serially, namely `build_dataset` 2.7 s, noise draw 0.94 s (single thread),
+`prepare_q_images` 2.7 s, `astype` 0.13 s. Most of the reading and q-image time was
+shipping ~1 GB of cutouts/PSFs/noise between processes, not disk or arithmetic; prep
+was longer than inference and the two competed for the same cores when overlapped.
 
 ### Kernel tests and profiling
 
