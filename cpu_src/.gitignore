@@ -3,7 +3,12 @@ __pycache__/
 build/
 .build-tmp/
 *.egg-info/
-runs/
+runs/*
+# Exported blended CPU models that are shared through git.
+!runs/circular_blending/
+runs/circular_blending/*
+!runs/circular_blending/Blending_truth_s4.npz
+!runs/circular_blending/Blending_AttnW_(RDSM).npz
 .pytest_cache/
 *.core
 

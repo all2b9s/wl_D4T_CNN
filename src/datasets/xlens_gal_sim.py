@@ -234,9 +234,11 @@ class xlen_simulator():
                  mode = 'calibration',
                  rot_ids = None,
                  sim_start = 0,
-                 sim_stop = None):
+                 sim_stop = None,
+                 overwrite = False):
         self.sim_start = sim_start      # process only i in [sim_start, sim_stop) of the num_sims
         self.sim_stop = sim_stop        # sims per rot group; seeds are still drawn for all num_sims
+        self.overwrite = overwrite
         self.seed = ori_seed
         self.output_dir = output_dir
         self.abs_shear = abs_shear
@@ -255,6 +257,7 @@ class xlen_simulator():
     def __call__(self, num_sims: int):
         print(f"Starting xlens simulations: mode={self.mode}, num_sims={num_sims}, has_shift={self.has_shift}, rotId={self.rotId}, galaxy_profile={self.galaxy_profile}")
         print(f"Saving at {self.output_dir}")
+        print(f"Overwrite existing samples: {self.overwrite}")
         if self.mode == 'calibration':
             shear_tasks = [
                 #(2, "g1"),
@@ -329,7 +332,7 @@ class xlen_simulator():
 
     def _worker(self, index, seed, shear_mode, shear_comp, rotId):
         output_dir = f'{self.output_dir}/{shear_comp}_{shear_mode}_val_{self.abs_shear:.3f}/img_{int(index)}/'
-        if self._is_complete(output_dir):   # resume: skip finished images
+        if not self.overwrite and self._is_complete(output_dir):   # resume: skip finished images
             return None
         xlens_gal_sim(
             output_dir = output_dir,
@@ -364,6 +367,8 @@ def main():
     )
     parser.add_argument("--abs_shear", type=float, default=0.02)
     parser.add_argument("--ori_seed", type=int, default=666)
+    parser.add_argument("--overwrite", action="store_true",
+                        help="regenerate samples and overwrite existing output files")
     parser.add_argument("--image_size", type=int, default=1000)
     parser.add_argument("--pixel_scale", type=float, default=0.2)
     parser.add_argument("--num_workers", type=int, default=128)
@@ -410,6 +415,7 @@ def main():
         rot_ids=args.rot_ids,
         sim_start=args.sim_start,
         sim_stop=args.sim_stop,
+        overwrite=args.overwrite,
     )
     simulator(args.num_sims)
 
