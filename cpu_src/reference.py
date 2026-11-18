@@ -78,8 +78,9 @@ def primal_trace(path, q, precision="float64"):
         m = (tensor*weight).sum((1,2,3),keepdim=True)*100
         norm = 1+torch.nn.functional.softplus(m-1,beta=10,threshold=20)
         result["normalized"] = (tensor/norm)[0].permute(1,2,0).reshape(-1,1).numpy()
+        model.inframe_pool = False  # full-field path: feats / f_mean_e1 / f_mean_e2 are recorded
         model(tensor)
-        fields = {"scalar_field": model.feats.mean(0), "f_mean_e1": model.f_mean_e1, "f_mean_e2": model.f_mean_e2}
+        fields ={"scalar_field": model.feats.mean(0), "f_mean_e1": model.f_mean_e1, "f_mean_e2": model.f_mean_e2}
         for name, out in fields.items():
             result[name] = out[0].permute(1,2,0).reshape(-1,out.shape[1]).numpy()
         if hasattr(model, "pool_kernel"):

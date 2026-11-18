@@ -26,6 +26,11 @@ ml_wl/rounds/
 !cpu_src/
 !cpu_src/**
 
+# 只跟踪最终选定的 legacy 模型（权重 + 复现说明），其余 models/ 不跟踪
+!models/
+!models/legacy/
+!models/legacy/**
+
 # 缓存文件一律忽略（放在最后，确保 src/ 里面也生效）
 __pycache__/
 *.pyc

@@ -238,6 +238,7 @@ def measure_catalogs_with_run(
     verbose: bool = True,
     exposure_ids: Optional[Sequence[int]] = None,
     catalog_callback=None,
+    measure_er_timing: bool = False,
 ) -> dict:
     """Measure one trained run on a blended simulation, one exposure at a time.
 
@@ -327,6 +328,7 @@ def measure_catalogs_with_run(
     manifest: List[dict] = []
     n_new, n_stamps_total = 0, 0
     t_measure_total = 0.0
+    er_timings = [] if measure_er_timing else None
     t_wall_start = time.time()
 
     requested = list(range(start, stop)) if exposure_ids is None else sorted(map(int, exposure_ids))
@@ -387,11 +389,15 @@ def measure_catalogs_with_run(
                 ml_batch_size=ml_batch_size,
                 seed=20020620 + exp_idx,
                 verbose=False,
+                timing_records=er_timings,
             )
         else:
             ml_shapes = np.empty((0, 2))
             ml_R = np.empty((0, 1, 2, 2))
         t_measure = time.perf_counter() - t_start
+        if er_timings is not None and n_det > 0:
+            er_timings[-1]['exposure'] = exp_idx
+            print(f"[eR timing] exp={exp_idx} n={n_det} seconds={er_timings[-1]['eR_seconds']:.9f}", flush=True)
 
         merge_and_save_catalog(
             det_cat=det_cat,
@@ -437,6 +443,7 @@ def measure_catalogs_with_run(
         n_written=n_new,
         n_skipped=n_skipped,
         n_detections=n_stamps_total,
+        eR_timings=er_timings,
         t_measure_s=t_measure_total,
         t_wall_s=time.time() - t_wall_start,
         selection=dict(weight_threshold=WEIGHT_THRESHOLD, edge_margin=EDGE_MARGIN,

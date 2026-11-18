@@ -1,3 +1,5 @@
+> D4 后续测量统一取消径向压缩：公开加载与直接构造均强制 alpha=0，旧 catalog 不重写。整体奇 GeLU 读出请使用 PyTorch；当前 native 后端会明确拒绝该结构。
+
 # D4CNN CPU inference
 
 Standalone CPU inference and blended-image calibration, isolated under `cpu_src/`.
@@ -133,6 +135,108 @@ process per NUMA domain. Omitted/JSON-null `batch_size` resolves to
 `max(64, 8*nthreads)` (576 at 72 threads). Explicit batch sizes remain supported.
 The source adapter batches q preparation and inference instead of allocating
 all q-images for an exposure.
+
+## D4InvCNN (models/d4_f8)
+
+`d4inv.py` + `native/d4inv.cpp` are a separate, self-contained CPU path for the
+`src/architecture/d4inv_CNN.py` checkpoints (ObservableCenter + InputCrop63 +
+radial readout + D4 scalar/spin-2 core). It returns e and R = de/dt for the
+q-stamp tangents in forward mode (T <= 4: g1, g2, x1, x2), equal to
+`CNN_toolkit.response_torch` / `Calibrator.shape_measure`.
+
+```bash
+python -m cpu_src.d4inv build                      # -> cpu_src/_d4inv*.so
+python -m cpu_src.d4inv validate models/d4_f8/*.pth
+python -m cpu_src.d4inv bench models/d4_f8/*.pth   # single core, gal/(CPU s)
+```
+
+```python
+from cpu_src.d4inv import D4InvCPU
+model = D4InvCPU.load("models/d4_f8/observable_center_selected_final.pth")  # or exported .npz
+e, R = model.measure(q, n_tangent=2, nthreads=1)    # q [N,5,64,64]; R[n,i,j] = de_i/dg_j
+```
+
+Exact reductions used (listed in `native/d4inv.cpp`): separable Dirichlet-kernel
+recentering, two-tap isotropic front convolutions (edge = 4 corner), pooling
+before the F8 scalar convolution, and the adjoint of the spin-2 convolutions.
+Accuracy on 64 real training stamps (max-abs error / max-abs value vs float64
+torch): float64 3e-11 (selected checkpoint; single-stage checkpoints store
+float32 Fourier frequencies, giving ~1e-8 there); float32 e 2-4e-6 and R 4-9e-6,
+the same level as torch float32 (e 2-7e-6, R 8e-6).
+Single Neoverse-V2 core, float32, 2026-11-09: 300-308 gal/(CPU s) with T=2
+(e+R) and 750-800 gal/(CPU s) for e only, versus PyTorch float32 single-thread
+29 and 95.
+
+## F8_noTanh, parab10, 16 channels (models/legacy/f8_3c16_s43.pth)
+
+`f8notanh.py` + `native/f8notanh.cpp` are a self-contained CPU path for the cropped
+`F8_noTanh` recipes `f8c_parab10_d{D}c16_truth` (ObservableCenter disabled +
+InputCrop63 + TrainableRadial; WindowedChannelNorm gaussian-6 shared over the D4
+orbit, exact GELU, parabola pooling, scalar MLP readout). Forward mode returns e and
+R = de/dt for T <= 4 tangents (g1, g2, x1, x2), equal to `response_torch`/`response_jvp`.
+
+```bash
+python -m cpu_src.f8notanh build
+python -m cpu_src.f8notanh validate models/legacy/f8_3c16_s43.pth
+python -m cpu_src.f8notanh bench models/legacy/f8_3c16_s43.pth   # single core
+```
+
+```python
+from cpu_src.f8notanh import F8NoTanhCPU
+model = F8NoTanhCPU.load("models/legacy/f8_3c16_s43.pth")   # or an exported .npz
+e, R = model.measure(q, n_tangent=2, nthreads=8)            # q [N,5,64,64]
+```
+
+C=16-specific optimizations: norm channel-centring folded into the conv weights;
+channels-last features (16 ch = 4 NEON vectors) with primal and tangents sharing
+every weight load; Winograd F(2x2,3x3) for the 16->16 layers (`conv='direct'`
+selects the direct kernel); variance accumulated in the conv epilogue;
+norm+GELU+residual fused in place; the last layer is activated only on the
+pool-kernel support (577 of 1089 pixels) and pooled directly.
+
+Validation on 64 real blended training stamps (vs float64 torch autograd, T=4):
+float64 max rel. error e 3e-15, R 1e-15; float32 max |component-mean bias| e 1e-8,
+R 3e-8 (torch float32 itself: 8e-9, 5e-8).
+Single Neoverse-V2 core (login node, 2026-11-17), float32, gal/(CPU s):
+
+| | e+R (T=2) | T=4 | e only |
+|---|---:|---:|---:|
+| native, Winograd (default) | 259 | 192 | 646 |
+| native, direct conv | 184 | 136 | 498 |
+| PyTorch float32, 1 thread | 48.5 (autograd) | | 195 |
+
+8 threads: 2094 gal/s for T=2 (7.8x one core).
+
+## Moment model (AnaCal Fourier shapelets)
+
+`moment_model.py` is a torch-free NumPy port of the fixed-moment estimator
+`output/Codex_freestyle/score_research_20261029/model.py` (1,080 frozen weights).
+The 30 Gaussian moments are built from AnaCal `shapelets2d_func` modes plus an
+explicit 64x64 truncation correction (relevant only for the 6 and 8 pixel scales),
+and are applied to the PSF-deconvolved stamp spectrum. No q-images are formed: the
+moments of AnaCal's g1/g2/x1/x2 channels come from the adjoint of ImageQ's
+operators, and the head propagates them in forward mode.
+
+```bash
+python -m cpu_src.moment_model export \
+  --checkpoint output/Codex_freestyle/score_research_20261029/model.pt \
+  --output cpu_src/runs/moment_cross.npz
+```
+
+```python
+from cpu_src.moment_model import MomentModel
+model = MomentModel.load("cpu_src/runs/moment_cross.npz")
+r = model.measure_stamps(stamps, psf, noise)   # [N,64,64] cutouts, source at pixel 32
+r = model.measure_sources(image, psf, positions_xy, noise, n_tangent=4)
+r = model.measure_qstamps(q)                   # existing q [N,5,64,64]
+```
+
+Results are `Measurement` objects, as in the API above. Stamps and noise are rounded
+to float32 like AnaCal's `pixel_t`; everything else is float64. With this rounding,
+outputs and responses agree with `anacal_pix_r` + `model.py` to about 1e-13.
+The kernels deliberately stay centred on pixel 31.5, half a pixel from AnaCal's
+centre, because the weights were fitted that way.
+Tests: `python -m unittest cpu_src.tests.test_moment_model -v`.
 
 ## Complete blended pipeline
 
@@ -390,3 +494,48 @@ Choose thread counts within your available CPU allocation. Compare F4, F2 and
 direct with identical model/input/thread settings. The portable benchmark entry
 point is `python -m cpu_src benchmark`; dataset-specific research utilities and
 their input conventions are listed in [benchmarks/README.md](benchmarks/README.md).
+
+
+### Fixed-moment estimator: subpixel offset correction
+
+`MomentModel` is a separate NumPy/Fourier estimator; load it with
+`from cpu_src.moment_model import MomentModel` rather than the generic CNN loader.
+Version-2 exports default to `pixel_average_order=4`. Version-1 archives retain
+legacy behaviour unless an override is supplied.
+
+```python
+model = MomentModel.load("moment_model.npz", pixel_average_order=4)
+result = model.measure_stamps(observed_stamps, psf, noise=independent_renoise)
+```
+
+The raw stamp convention is a mean source centre at pixel 32. The implementation
+aligns this to the head's fixed centre 31.5, including the shear-generator origin.
+It then corrects uniform pixel-phase averaging of the final nonlinear e AND R
+using a fourth-order inverse averaging stencil. The 1D shifts are
+`[-1, -0.5, 0, 0.5, 1]` pixels with weights
+`[1/30, -3/10, 23/15, -3/10, 1/30]`; their tensor product gives 25 evaluations.
+One image/PSF FFT is shared by all evaluations. No true centroid is accepted or
+estimated, and checkpoint weights are unchanged.
+
+This is a population correction for independent uniform offsets in
+`[-0.5,0.5]` in each axis. Its R is intended for ensemble shear calibration;
+it is not the per-object derivative of the corrected e at an arbitrary fixed
+offset. Do not silently apply this prior to detected blends or other position
+selections. `pixel_average_order=0` selects centre alignment for a fixed-phase
+population; `None` reproduces the historical unaligned measurement.
+
+`measure_stamps`, `measure_sources` and `measure_qstamps` use the same convention.
+Corrected q-input measurements require all **five** native AnaCal channels
+`[q0,g1,g2,x1,x2]`, before any half-pixel shift. The position channels retain the
+signal-minus-renoise information needed for the response. Three-channel input
+raises an error in corrected modes. `fourier_jets`, `qstamp_jets` and
+`measure_jets` remain low-level evaluations of the original frozen head; use the
+measurement entry points for the population correction.
+
+Export a new archive with `python -m cpu_src.moment_model export --checkpoint
+PATH/model.pt --output PATH/model.npz`. Use `--legacy-center` to reproduce the old
+export, or `--pixel-average-order 0` for fixed phase. The runtime remains CPU-only
+and does not import torch. Results and validation scope are recorded in
+[the offset report](../scripts/moment_models/bias_diagnosis.md) and
+`../scripts/moment_models/offset_repair.json`. The old fixed-centre throughput
+figures do not describe the 25-point corrected estimator.

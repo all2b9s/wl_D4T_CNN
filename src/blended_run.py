@@ -60,8 +60,8 @@ from src.anacal.detection_ml_pipeline import (
     _build_cell_list,
     match_detections_to_truth,
 )
-from src.blending.ml_shape_measurement import ml_shape_measure
-from src.architecture.forward8_CNN import Forward8_fixW_CNN, Forward8_AttnW_CNN
+from src.blending.ml_shape_measurement import ml_shape_measure, prepare_chunk_q_images
+from src.architecture.forward8_CNN import Forward8_fixW_CNN, Forward8_AttnW_CNN, load_f8_checkpoint
 from src.architecture.quad_Gauss import QuadGauss
 from src.datasets.dataset_toolkit import get_weighted_e
 
@@ -94,6 +94,34 @@ SIM_MODE_MAP = {
     "sim_mode40": ("g1", 1),
     "sim_mode80": ("g1", 2),
 }
+
+# Noiseless variants (e.g. ``sim_mode0_noiseless``) share the shear label of
+# their base mode.  Their exposures live in ``group{NN}/`` subdirectories
+# holding ``GROUP_SIZE`` exposures each (group00: 00000-09999, ...).
+NOISELESS_SUFFIX = "_noiseless"
+GROUP_SIZE = 10000
+
+
+def _shear_label(sim_mode: str) -> tuple[str, int]:
+    """Return (shear_comp, shear_mode) for a sim_mode, incl. noiseless variants."""
+    base = sim_mode[:-len(NOISELESS_SUFFIX)] if sim_mode.endswith(NOISELESS_SUFFIX) else sim_mode
+    if base not in SIM_MODE_MAP:
+        raise ValueError(f"Unknown sim_mode {sim_mode!r}; known: {sorted(SIM_MODE_MAP)} "
+                         f"(optionally with suffix {NOISELESS_SUFFIX!r})")
+    return SIM_MODE_MAP[base]
+
+
+def _resolve_exposure_paths(sim_dir: str, exp_idx: int) -> tuple[str, str]:
+    """Locate exp-i/truth files in a flat sim dir or a ``group{NN}/`` layout."""
+    names = (f"exp-i-{exp_idx:05d}.fits", f"truth-{exp_idx:05d}.fits")
+    candidates = [sim_dir, os.path.join(sim_dir, f"group{exp_idx // GROUP_SIZE:02d}")]
+    for d in candidates:
+        fits_path, truth_path = (os.path.join(d, n) for n in names)
+        if os.path.exists(fits_path):
+            if not os.path.exists(truth_path):
+                raise FileNotFoundError(f"Found {fits_path} but missing {truth_path}")
+            return fits_path, truth_path
+    raise FileNotFoundError(f"{names[0]} not found in any of: {candidates}")
 
 PIXEL_SCALE = 0.2
 WEIGHT_THRESHOLD = 1e-6
@@ -154,9 +182,13 @@ def load_blended_exposure(
         Truth (y, x) positions for matching.
     """
     # ---- Load exposure ----
+    # HDUs are read lazily: with a fixed noise level the VARIANCE plane
+    # (one third of the image I/O) is never touched.
+    variance_map = None
     with fits.open(fits_path, memmap=False) as hdul:
         large_image = np.asarray(hdul[1].data, dtype=np.float64)
-        variance_map = np.asarray(hdul[3].data, dtype=np.float64)
+        if noise_mode == "from_variance":
+            variance_map = np.asarray(hdul[3].data, dtype=np.float64)
 
     ny, nx = large_image.shape
 
@@ -293,6 +325,12 @@ class _CpuPreparationConfig:
     snr_cut: float
     center_on_truth: bool
     match_threshold: float
+    add_image_noise: bool = False
+    # Q-image preparation (anacal pixel response) runs in the CPU prefetch
+    # stage so it overlaps GPU inference of the previous chunk.
+    q_workers: int = 32
+    psf_fwhm: float = 0.85
+    dtype: str = "float32"
 
 
 def _empty_stamps(stamp_size: int) -> tuple[np.ndarray, np.ndarray]:
@@ -371,8 +409,7 @@ def _process_one_exposure(
     """Load, detect, filter, and cut stamps for one exposure."""
     exp_idx = exp_start + i_local
     sim_dir = os.path.join(config.blended_dir, sim_mode)
-    fits_path = os.path.join(sim_dir, f"exp-i-{exp_idx:05d}.fits")
-    truth_path = os.path.join(sim_dir, f"truth-{exp_idx:05d}.fits")
+    fits_path, truth_path = _resolve_exposure_paths(sim_dir, exp_idx)
 
     t1 = time.perf_counter()
     large_img, noise_sigma, truth_df, positions = load_blended_exposure(
@@ -380,6 +417,13 @@ def _process_one_exposure(
         config.noise_mode, config.noise_level,
     )
     t2 = time.perf_counter()
+    if config.add_image_noise:
+        # Image noise: a stream independent of the renoise canvas below
+        # (distinct SeedSequence entropy), but tied to exp_idx so that the
+        # same exposure in sim_mode0/sim_mode40 gets identical noise.
+        large_img = large_img + np.random.default_rng([exp_idx, 20261104]).normal(
+            0, noise_sigma, large_img.shape,
+        )
     noise_canvas = np.random.default_rng(19491001 + exp_idx).normal(
         0, noise_sigma, large_img.shape,
     ).astype(np.float32)
@@ -465,12 +509,31 @@ def _prepare_cpu_chunk(
 
     fields = list(zip(*results))
     total_stamps = sum(len(stamps) for stamps in fields[7])
+    t_detect = time.time() - started
+
+    # Q-images for the whole chunk, identical to what ml_shape_measure would
+    # compute (same inputs, same anacal call), but off the GPU critical path.
+    q_imgs = None
+    t_q = 0.0
+    if total_stamps > 0:
+        t_q_start = time.time()
+        stamps_all = np.concatenate([s for s in fields[7] if len(s) > 0], axis=0)
+        noise_stamps_all = np.concatenate([n for n in fields[8] if len(n) > 0], axis=0)
+        q_imgs = prepare_chunk_q_images(
+            stamps_all, noise_stamps_all, config.psf_image,
+            pixel_scale=config.pixel_scale, psf_fwhm=config.psf_fwhm,
+            n_workers=config.q_workers, dtype=config.dtype,
+        )
+        del stamps_all, noise_stamps_all
+        t_q = time.time() - t_q_start
+
     elapsed = time.time() - started
     mode_tag = "[TEST]" if config.skip_detection else ""
-    print(f"  Chunk [{exp_start}:{exp_end}) {chunk_n} exposures, {total_stamps} stamps {mode_tag}  [{elapsed:.1f}s]")
+    print(f"  Chunk [{exp_start}:{exp_end}) {chunk_n} exposures, {total_stamps} stamps {mode_tag}  "
+          f"[{elapsed:.1f}s: load+detect+cut {t_detect:.1f}s, prepare_q {t_q:.1f}s]")
     return {
         "exp_start": exp_start, "exp_end": exp_end, "chunk_n": chunk_n,
-        "t_cpu": elapsed, "total_stamps": total_stamps,
+        "t_cpu": elapsed, "t_q": t_q, "total_stamps": total_stamps, "q_imgs": q_imgs,
         "all_large_images": list(fields[2]), "all_noise_sigmas": list(fields[3]),
         "all_truth_dfs": list(fields[4]), "all_positions": list(fields[5]),
         "all_det_cats": list(fields[6]), "all_stamps_list": list(fields[7]),
@@ -510,11 +573,21 @@ def run_detection_ml_pipeline(
     mag_cut: float = None,
     snr_cut: float = 5.0,
     center_on_truth: bool = False,
+    add_image_noise: bool = False,
 ):
     if sim_modes is None:
         sim_modes = list(SIM_MODE_MAP.keys())
+    for _m in sim_modes:  # fail fast on unknown modes before any work
+        _shear_label(_m)
 
     noise_mode = "from_variance" if noise_level is None else "fixed"
+    noiseless_modes = [m for m in sim_modes if m.endswith(NOISELESS_SUFFIX)]
+    if add_image_noise and len(noiseless_modes) != len(sim_modes):
+        raise ValueError("--add_image_noise is only for *_noiseless sim_modes "
+                         f"(got {sim_modes}); the other sims already contain noise.")
+    if noiseless_modes and not add_image_noise:
+        print("[pipeline] WARNING: noiseless input without --add_image_noise; "
+              "images stay noise-free but detection/renoise still use noise sigma.")
 
     # ---- Device & Model ----
     device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -525,6 +598,12 @@ def run_detection_ml_pipeline(
         model = QuadGauss(sigma=gauss_sigma).to(device)
         model.eval()
         print(f"[pipeline] QuadGauss model created (sigma={gauss_sigma}, no checkpoint needed)")
+    elif model_type == "cnn" and architecture == "F8_noTanh":
+        # Restore the recipe, crop and normalization wrappers, not just the trunk.
+        model = load_f8_checkpoint(model_path, device=device, dtype=getattr(torch, dtype))
+        torch.backends.cuda.matmul.allow_tf32 = False
+        torch.backends.cudnn.allow_tf32 = False
+        print(f"[pipeline] {architecture} recipe checkpoint loaded from {model_path}")
     elif model_type == "cnn":
         classes = {"Forward8_fixW_CNN": Forward8_fixW_CNN,
                    "Forward8_AttnW_CNN": Forward8_AttnW_CNN}
@@ -566,6 +645,7 @@ def run_detection_ml_pipeline(
     # ---- Summary ----
     print(f"[pipeline] Noise mode: {noise_mode}"
           + (f"  sigma={noise_level}" if noise_level is not None else "  (from variance_map)"))
+    print(f"[pipeline] Add image noise (same sigma, independent of renoise): {add_image_noise}")
     print(f"[pipeline] I/O chunk: {io_chunk_size} exposures, ML batch: {ml_batch_size}")
     print(f"[pipeline] sim_modes: {sim_modes}, exposure range: {exp_range}")
     print(f"[pipeline] Save npz={save_npz}, csv={save_csv}")
@@ -598,6 +678,10 @@ def run_detection_ml_pipeline(
         snr_cut=snr_cut,
         center_on_truth=center_on_truth,
         match_threshold=match_threshold,
+        add_image_noise=add_image_noise,
+        q_workers=n_workers,
+        psf_fwhm=psf_fwhm,
+        dtype=dtype,
     )
 
     # ==================================================================
@@ -605,7 +689,7 @@ def run_detection_ml_pipeline(
     # ==================================================================
 
     for sim_mode in sim_modes:
-        shear_comp, shear_mode = SIM_MODE_MAP[sim_mode]
+        shear_comp, shear_mode = _shear_label(sim_mode)
         print(f"\n{'='*60}")
         print(f"[pipeline] sim_mode={sim_mode}  →  output: {shear_comp}_{shear_mode}")
         print(f"{'='*60}")
@@ -659,13 +743,7 @@ def run_detection_ml_pipeline(
                         torch.cuda.reset_peak_memory_stats()
                         torch.cuda.synchronize()
                     t_gpu_start = time.time()
-
-                    stamps_all = np.concatenate(
-                        [s for s in all_stamps_list if len(s) > 0], axis=0
-                    )
-                    noise_stamps_all = np.concatenate(
-                        [n for n in all_noise_stamps_list if len(n) > 0], axis=0
-                    )
+                    q_imgs_all = cpu_data["q_imgs"]
 
                     # GPU utilization monitor
                     gpu_mon = {"util_samples": [], "mem_util_samples": [],
@@ -677,17 +755,13 @@ def run_detection_ml_pipeline(
                         )
                         gpu_thread.start()
 
+                    # Q-images were prepared in the CPU prefetch stage.
                     ml_shapes_all, ml_R_all = ml_shape_measure(
-                        stamps=stamps_all,
+                        stamps=None,
                         psf_image=psf_image,
                         calibrator=calibrator,
-                        pixel_scale=pixel_scale,
-                        psf_fwhm=psf_fwhm,
-                        noise_arrays=noise_stamps_all,
-                        n_workers=n_workers,
-                        dtype=dtype,
+                        q_imgs=q_imgs_all,
                         ml_batch_size=ml_batch_size,
-                        seed=20020620 + exp_start,
                     )
 
                     if is_cuda:
@@ -764,9 +838,10 @@ def run_detection_ml_pipeline(
                 del all_det_cats, all_truth_dfs, all_positions
                 del all_stamps_list, all_noise_stamps_list
                 if total_stamps > 0:
-                    del stamps_all, ml_shapes_all, ml_R_all
+                    del q_imgs_all, ml_shapes_all, ml_R_all
                     if is_cuda:
                         torch.cuda.empty_cache()
+                del cpu_data
 
                 # --- Accumulate ---
                 t_total_io += 0.0  # I/O included in t_cpu for blended
@@ -814,7 +889,8 @@ if __name__ == "__main__":
                    help="Path to OneDegSq.fits reference catalog")
     p.add_argument("--sim_modes", nargs="+", type=str,
                    default=list(SIM_MODE_MAP.keys()),
-                   help="Simulation mode names (default: sim_mode0 sim_mode40)")
+                   help="Simulation mode names, e.g. sim_mode0 sim_mode40 or "
+                        "sim_mode0_noiseless sim_mode40_noiseless (group{NN}/ layout)")
     p.add_argument("--noise", type=float, default=None,
                    help="Fixed noise level; if not set, estimated from variance_map")
     p.add_argument("--fname", type=str, default="det_ml",
@@ -826,8 +902,8 @@ if __name__ == "__main__":
     p.add_argument("--model_type", type=str, default="cnn", choices=["cnn", "gauss"],
                    help="Model type: 'cnn' (Forward8_fixW_CNN) or 'gauss' (QuadGauss)")
     p.add_argument("--architecture", type=str, default="Forward8_fixW_CNN",
-                   choices=["Forward8_fixW_CNN", "Forward8_AttnW_CNN"],
-                   help="CNN architecture; checked against config.json when present")
+                   choices=["Forward8_fixW_CNN", "Forward8_AttnW_CNN", "F8_noTanh"],
+                   help="CNN architecture; F8_noTanh restores the embedded recipe and wrappers")
     p.add_argument("--gauss_sigma", type=float, default=4.0,
                    help="Gaussian weight sigma in pixels (only for --model_type=gauss)")
     p.add_argument("--workers", type=int, default=32,
@@ -857,6 +933,11 @@ if __name__ == "__main__":
                    help="Minimum peak SNR for FPFS detection (anacal Task snr_peak_min, "
                         "default 5.0). Has no effect with --skip_detection.")
 
+    p.add_argument("--add_image_noise", action="store_true",
+                   help="For *_noiseless sim_modes: add Gaussian image noise with the "
+                        "same sigma as --noise (or variance_map), independent of the "
+                        "renoise realization.")
+
     args = p.parse_args()
 
     run_detection_ml_pipeline(
@@ -881,6 +962,7 @@ if __name__ == "__main__":
         mag_cut=args.mag_cut,
         snr_cut=args.snr_cut,
         center_on_truth=args.center_on_truth,
+        add_image_noise=args.add_image_noise,
     )
 
     print(f"[main] Total time: {time.time() - start_time:.1f}s "

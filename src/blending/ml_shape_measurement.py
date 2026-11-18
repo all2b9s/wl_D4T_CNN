@@ -15,6 +15,33 @@ from typing import Tuple, Optional
 # ML Shape Measurement
 # ===========================================================================
 
+def prepare_chunk_q_images(
+    stamps: np.ndarray,
+    noise_arrays: np.ndarray,
+    psf_image: np.ndarray,
+    pixel_scale: float = 0.2,
+    psf_fwhm: float = 0.85,
+    n_workers: int = 32,
+    flim: float = 10.0,
+    dtype: str = "float32",
+) -> np.ndarray:
+    """Q-images for pre-generated noise stamps, as computed in ``ml_shape_measure``.
+
+    Split out so a pipeline can build Q-images in a CPU prefetch stage and
+    pass them to ``ml_shape_measure(q_imgs=...)``; the arithmetic is identical.
+    """
+    from src.anacal.batch_calibration import prepare_q_images
+
+    noises = noise_arrays.astype(np.float64 if dtype == "float64" else np.float32)
+    psfs = np.tile(psf_image, (stamps.shape[0], 1, 1))
+    q_imgs = prepare_q_images(
+        images=stamps, psfs=psfs, noises=noises, cat=None,
+        pixel_scale=pixel_scale, sigma_arcsec=psf_fwhm / 2.355,
+        flim=flim, workers=n_workers,
+    )
+    return q_imgs.astype(np.float64 if dtype == "float64" else np.float32)
+
+
 def ml_shape_measure(
     stamps: np.ndarray,
     psf_image: np.ndarray,
@@ -30,6 +57,8 @@ def ml_shape_measure(
     ml_batch_size: int = 800,
     seed: int = 20020620,
     verbose: bool = True,
+    timing_records=None,
+    q_imgs: Optional[np.ndarray] = None,  # precomputed (N, 5, H, W); skips steps 1-2
 ) -> Tuple[np.ndarray, np.ndarray]:
     """
     Run ML shape measurement on a set of postage stamps.
@@ -80,6 +109,14 @@ def ml_shape_measure(
         ML response matrix for each stamp.
     """
     from src.anacal.batch_calibration import prepare_q_images
+
+    if q_imgs is not None:
+        t_shape_start = time.perf_counter()
+        ml_shapes, ml_R = calibrator.shape_measure(q_imgs, batch_size=ml_batch_size)
+        if verbose:
+            print(f"  [ml_shape_measure timing]  n_stamps={len(q_imgs)}  "
+                  f"(precomputed Q-images)  shape_meas: {time.perf_counter() - t_shape_start:.2f}s")
+        return ml_shapes, ml_R
 
     n_stamps = stamps.shape[0]
     sigma_arcsec = psf_fwhm / 2.355
@@ -141,9 +178,19 @@ def ml_shape_measure(
     t_cast = time.perf_counter() - t_cast_start
 
     # Run ML measurement
+    # Synchronize only for explicitly requested performance measurements.
+    if timing_records is not None:
+        import torch
+        timing_device = torch.device(calibrator.device)
+        if timing_device.type == 'cuda':
+            torch.cuda.synchronize(timing_device)
     t_shape_start = time.perf_counter()
     ml_shapes, ml_R = calibrator.shape_measure(q_imgs, batch_size=ml_batch_size)
+    if timing_records is not None and timing_device.type == 'cuda':
+        torch.cuda.synchronize(timing_device)
     t_shape = time.perf_counter() - t_shape_start
+    if timing_records is not None:
+        timing_records.append(dict(n_detections=n_stamps, eR_seconds=t_shape))
 
     if verbose:
         print(f"  [ml_shape_measure timing]  n_stamps={n_stamps}")

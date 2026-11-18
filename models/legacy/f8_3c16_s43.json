@@ -1,0 +1,177 @@
+{
+  "schema_version": 1,
+  "description": "Production-selected constrained F8_noTanh, not the later pure-SSL ablation.",
+  "artifact": {
+    "path": "models/legacy/f8_3c16_s43.pth",
+    "sha256": "c47be245b62f157595988e930cff1745af8de08977ecbb16fc1d3473036e6dea",
+    "original_path": "/projects/bdsp/wenyinli/codes/single_galaxies/models/d4_f8/f8c_parab10_d3c16_truth_null1e4_v2w1_s43_seed43_final.pth",
+    "architecture": "F8_noTanh",
+    "recipe": {
+      "depth": 3,
+      "target": "truth",
+      "ssl": false,
+      "parent": null,
+      "forward8": true,
+      "pool_parabola": [
+        10.0,
+        0.5
+      ],
+      "input_size": 39,
+      "norm_window": [
+        "gaussian",
+        6.0
+      ],
+      "norm_share_orbit": true,
+      "act": "gelu",
+      "channels": 16
+    },
+    "weights": "ema",
+    "selected_epoch": 1,
+    "trained_epochs": 2,
+    "training_steps": 1313,
+    "selection_file": "/projects/bdsp/wenyinli/codes/single_galaxies/output/Codex_freestyle/d4_f8_integrated/position_null_d3c16/selection.json"
+  },
+  "train_kwargs": {
+    "kind": "f8c_parab10_d3c16_truth",
+    "seed": 43,
+    "max_epochs": 2,
+    "seconds": 1500,
+    "device": "cuda",
+    "threads": 2,
+    "model_dir": "models/d4_f8",
+    "output_dir": "output/Codex_freestyle/d4_f8_integrated/position_null_d3c16/reproduce",
+    "learning_rate": 0.0001,
+    "warmup_fraction": 0.05,
+    "weight_ema": 0.995,
+    "tf32_data": true,
+    "highorder_every": 4,
+    "highorder_weight": 0.01,
+    "supervised_only": false,
+    "ssl_only": false,
+    "isotropy_weight": 1.0,
+    "noise_only_selection": false,
+    "tag": "legacy_repro_s43",
+    "rotation_weight": 10.0,
+    "bank_large": true,
+    "position_weight": 1.0,
+    "position_every": 1,
+    "position_null_weight": 0.0001,
+    "rotation_count": 16,
+    "highorder_count": 32,
+    "position_count": 16,
+    "position_null_per_bin": 8,
+    "score_ema_decay": 0.9,
+    "cuda_graph": false,
+    "diagnostic_every": 0,
+    "diagnostic_validation_every": 200
+  },
+  "response_mode": "jvp",
+  "fixed_training_constants": {
+    "objective_version": "logscore_v3",
+    "score_max": 0.01,
+    "supervision_schedule": "0.5*(1+cos(pi*step/total_steps)); score=score_max*(1-supervision)",
+    "batch_size": 512,
+    "microbatch_size": 16,
+    "optimizer": "AdamW",
+    "weight_decay": 1.3e-06,
+    "gradient_clip_norm": 1.0,
+    "score_ema_decay": 0.9,
+    "group_link_pixels": 32.0,
+    "highorder_internal_scale": 10000.0,
+    "highorder_gate": 0.001,
+    "weight_ema_warm_start": "min(0.995,(1+steps)/(10+steps))",
+    "lr_schedule": "66-step linear warmup; cosine decay to 0.01*learning_rate",
+    "objective_scale": 0.15013931691646576,
+    "auxiliary_config": {
+      "position_weight": 1,
+      "position_every": 1,
+      "position_null_weight": 0.0001,
+      "position_null_version": "signed_position_null_v1",
+      "position_null_source": "isolated_partner_noiseless_true_offset",
+      "position_null_size_edges_px": [
+        2.46,
+        2.5,
+        2.6,
+        2.71,
+        2.95
+      ],
+      "position_null_per_bin": 8,
+      "position_null_scale": 1000000.0,
+      "position_loss_version": "gelu_commutator_cross_v2",
+      "position_source": "isolated_partner_two_noise_draws",
+      "position_noise": 0.594,
+      "position_window": "pool_reach",
+      "position_count": 16,
+      "position_layers": "uniform_one_layer_channel_mean"
+    }
+  },
+  "data": {
+    "sample_ids": "models/blended_rdsm_runs/renoised_q_n0594_330k_3m/attnw/train_sample_ids.npy",
+    "sample_ids_array_sha256": "3e4c65203e301c4bff922a0a7d0add4a9291e76e9f52e0db97ea3ae976082590",
+    "sample_count": 330000,
+    "training_fields": [
+      0,
+      190
+    ],
+    "validation_fields": [
+      935,
+      939
+    ],
+    "ranges": "inclusive",
+    "blended_stamps": "/work/hdd/bfcn/wenyinli/blended_training_stamp",
+    "isolated_partners": "/work/hdd/bfcn/wenyinli/blended_training_isoIMG",
+    "truth_catalog": "/projects/bdsp/wenyinli/codes/opt_e/datasets/isolated_truth_weighted_m002/truth_catalog.npz",
+    "rdsm_catalog_for_source_bank": "/projects/bdsp/wenyinli/codes/opt_e/datasets/isolated_rdsm_best_m002/rdsm_catalog.npz",
+    "source_catalog": "/projects/bdsp/wenyinli/codes/data/training_extend/OneDegSq.fits",
+    "weight_response_catalogs": "/work/hdd/bfmo/wenyinli/measurement/blended_sims/g1_2/blended_det_fpfs_training_s4",
+    "psf": "/projects/bdsp/wenyinli/codes/single_galaxies/logs/blended_test_psf.npy",
+    "preprocessing": "src.train_d4.training_q: reconstruct q and shear tangents from blended_stamps using AnaCal, not the q cache",
+    "renoise_sigma": 0.594,
+    "renoise_seed": "numpy SeedSequence([20020620, sample_id])"
+  },
+  "selection": {
+    "within_run": "EMA checkpoint: prioritize highorder gate pass, then minimize worst-axis validation sigma2; selected epoch1 of2",
+    "across_seeds": "Minimum mean of two blending shape-noise variances among three accepted primary replicas, each trained for two epochs with original validation checkpoint selection.",
+    "reference_blending_shape_noise": [
+      0.43013888736892836,
+      0.45851715220080724
+    ]
+  },
+  "reproduce": {
+    "working_directory": "/projects/bdsp/wenyinli/codes/single_galaxies",
+    "python": "/u/wenyinli/.conda/envs/anacal_clone/bin/python",
+    "command": "cd /projects/bdsp/wenyinli/codes/single_galaxies && env -u PYTHONPATH PYTHONDONTWRITEBYTECODE=1 OMP_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 MKL_NUM_THREADS=1 /u/wenyinli/.conda/envs/anacal_clone/bin/python -u -c 'import json; from src import train_d4 as t; c=json.load(open('\"'\"'models/legacy/f8_3c16_s43.json'\"'\"')); assert t.SCORE_MAX==c['\"'\"'fixed_training_constants'\"'\"']['\"'\"'score_max'\"'\"']; t.set_response_mode(c['\"'\"'response_mode'\"'\"']); t.train(**c['\"'\"'train_kwargs'\"'\"'])'",
+    "resume": "Run in an allocated GPU task. Each call is bounded by seconds=1500; repeat the same command if a resume checkpoint remains until results.json contains the *_complete record. Do not rerun after completion unless intentionally retraining.",
+    "expected_final_model": "models/d4_f8/f8c_parab10_d3c16_truth_legacy_repro_s43_seed43_final.pth",
+    "scope": "Reproduces the recorded training recipe using the current refactored trainer. Original source has changed; identical binary weights/metrics are not guaranteed. The archived pth itself is an exact byte copy.",
+    "environment": {
+      "python": "3.12.11",
+      "packages": {
+        "torch": "2.6.0+cu126",
+        "numpy": "2.3.1",
+        "scipy": "1.16.1",
+        "galsim": "2.7.2",
+        "anacal": "0.8.2",
+        "fitsio": "1.2.8"
+      },
+      "cuda": "12.6",
+      "cudnn": 90501
+    },
+    "current_source_sha256": {
+      "src/train_d4.py": "2f50a178b058e19d209e83e3cd743c8aab7a05d5f09ef826097dec7b0e76527f",
+      "src/loss/__init__.py": "ea8ea9b2e6d8418f084520921f40fabd56006aba9dc6e719ea11b765d8fbc37a",
+      "src/loss/base.py": "2a47515256f283baf6da557fbfc16afef07088e29963627c6b48543bf4c0a5b9",
+      "src/loss/common.py": "ccb43d1e3516433d724634c5b349e02648777e3371554ff14b26985c0833f91b",
+      "src/loss/nolinear_loss.py": "fef4fba28d8824a03fcfda3fe51f83a5ee1563fdafa6bea5b8408ea8797038e0",
+      "src/loss/position_loss.py": "5f69781ac7eedfd38a17dee9cd9b428c460e6ec988a6cea2ae522e6edca74609",
+      "src/loss/rot_loss.py": "9df34a2e0b4a1e67ab2f20690168a38b64e8544c26b0a33b9dfcf9aade07ce79",
+      "src/loss/score_SSL.py": "190175cecaff4300fa19b0d38a8bfc6f34fe0836373f92e2e71d33eda07a97e1",
+      "src/loss/supervised_loss.py": "59eff565cbc152ff7ceea5fe6d39ce716fa8bf203bf8a42bc4935e087b636ad6",
+      "src/architecture/forward8_CNN.py": "ea6af76dad1bd84694bc37237bfdd1f2fd617e48be640a7e3455ff88876a3e6f",
+      "src/architecture/d4inv_CNN.py": "3d42f19f5cc784e8016f30198ab97c2eecfe3561e446c57ddee19798a04a226e",
+      "src/architecture/CNN_toolkit.py": "1ed1c5b0f41ebd0052f196557c3f2a51b48306a8f594c6222d0bbdc955297e55",
+      "src/anacal/pixel_response.py": "91ab12a6d7508e17b1a19244fac50a792f2cf7da28b540e758af810ee820486a"
+    },
+    "original_trainer_sha256": "7a864c02031bb13715952fad4af4c7216c98da79095d1445fe826bf3cca9813d"
+  }
+}

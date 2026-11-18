@@ -140,7 +140,8 @@ def fpfs_measure(
 
     # Detection is required by the new anacal API (no internal FPFS
     # detection): pass a single fixed-center catalogue.
-    dtype = np.dtype([("y", np.int32), ("x", np.int32)])
+    # AnaCal Position uses doubles; preserve a requested centre such as 31.5.
+    dtype = np.dtype([("y", np.float64), ("x", np.float64)])
     detection = np.empty(1, dtype=dtype)
     detection["y"] = center[0]
     detection["x"] = center[1]

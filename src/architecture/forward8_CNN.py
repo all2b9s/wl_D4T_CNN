@@ -3,7 +3,10 @@ from torch import nn
 import torch.nn.functional as F
 import torchvision.transforms as T
 
-from src.architecture.CNN_toolkit import gaussian_weight_2d
+from src.architecture.CNN_toolkit import (
+    gaussian_weight_2d, rotate_quarter_turns, reflect_y,
+    d4_orbit_stack, d4_inverse_stack,
+)
 from src.architecture.CNN_module import ConvGELU, BiasFreeMLP, BiasFreeMLP_2l, ConvGELU_Res, ConvGELU_layernorm
 
 # ----------------------------
@@ -29,60 +32,11 @@ class Forward8_base(nn.Module):
         #self.register_buffer("signs_e1_5d", self.signs_e1.view(8, 1, 1, 1, 1))
         #self.register_buffer("signs_e2_5d", self.signs_e2.view(8, 1, 1, 1, 1))
 
-    # ----- D4 transforms (vectorized) -----
-
-    @staticmethod
-    def _rot90_k(x: torch.Tensor, k: int) -> torch.Tensor:
-        # NOTE: rot90+flip can create negative strides; we’ll call .contiguous() later once, globally.
-        return torch.rot90(x, k % 4, dims=(-2, -1))
-
-    @staticmethod
-    def _reflect_x(x: torch.Tensor) -> torch.Tensor:
-        return torch.flip(x, dims=[-2])
-
-    def _d4_orbit_stack(self, x: torch.Tensor) -> torch.Tensor:
-        """
-        Returns stacked orbit as [8, B, C, H, W].
-        We call .contiguous() once after stacking to avoid hidden copies in convs.
-        """
-        x0 = x
-        x1 = self._rot90_k(x, 1)
-        x2 = self._rot90_k(x, 2)
-        x3 = self._rot90_k(x, 3)
-
-        # reflections
-        xr0 = self._reflect_x(x0)
-        xr1 = self._reflect_x(x1)
-        xr2 = self._reflect_x(x2)
-        xr3 = self._reflect_x(x3)
-
-        xs = torch.stack([x0, x1, x2, x3, xr0, xr1, xr2, xr3], dim=0)  # [8,B,C,H,W]
-        return xs.contiguous()  # ensure positive strides for downstream convs
-
-    def _d4_inverse_stack(self, f8: torch.Tensor) -> torch.Tensor:
-        """
-        Bulk inverse on stacked features.
-        Input:  f8 [8, B, C, H, W] in transform order above
-        Output: inv_f8 [8, B, C, H, W], each map restored to canonical frame.
-        """
-        assert f8.dim() == 5 and f8.size(0) == 8
-        # Inverses: for r^k -> r^{-k}; for r^k*sx -> r^{-k}*sx
-        g0, g1, g2, g3, g4, g5, g6, g7 = f8.unbind(dim=0)
-
-        # rotate back
-        g0i = self._rot90_k(g0, 0)
-        g1i = self._rot90_k(g1, -1)
-        g2i = self._rot90_k(g2, -2)
-        g3i = self._rot90_k(g3, -3)
-
-        # reflect then rotate back
-        g4i = self._rot90_k(self._reflect_x(g4), 0)
-        g5i = self._rot90_k(self._reflect_x(g5), -1)
-        g6i = self._rot90_k(self._reflect_x(g6), -2)
-        g7i = self._rot90_k(self._reflect_x(g7), -3)
-
-        inv = torch.stack([g0i, g1i, g2i, g3i, g4i, g5i, g6i, g7i], dim=0).contiguous()
-        return inv
+    # Shared exact pixel operations; historical method names stay compatible.
+    _rot90_k = staticmethod(rotate_quarter_turns)
+    _reflect_x = staticmethod(reflect_y)
+    _d4_orbit_stack = staticmethod(d4_orbit_stack)
+    _d4_inverse_stack = staticmethod(d4_inverse_stack)
 
     # ----- Trunk feature extraction (works on [N,C,H,W]) -----
 
@@ -124,6 +78,7 @@ class Forward8_fixW_CNN(Forward8_base):
         gw_sigma=16,
         shared_head=False,
         suppress=True,
+        input_size=None,
     ):
         super().__init__()
         assert out_dim == 2, "This D4-equivariant head assumes two shape components."
@@ -146,6 +101,68 @@ class Forward8_fixW_CNN(Forward8_base):
         self.nl_sigma = nl_sigma
         self.gw_sigma = gw_sigma
         self.suppress = bool(suppress)
+        self._set_input_size(input_size)
+
+    # ============================================================
+    # Optional central crop with unpadded (valid) convolutions
+    # ============================================================
+
+    def _set_input_size(self, input_size):
+        """input_size (odd) crops input_size pixels centred on pixel h//2 at the
+        start of forward, so normalization, features and pooling see only that region;
+        the 3x3 convolutions then run unpadded, giving an odd feature grid of
+        input_size - 2*num_layers centred on the same pixel. D4 stays exact.
+        None keeps the original zero-padded behaviour."""
+        if input_size is not None:
+            if (isinstance(input_size, bool) or not isinstance(input_size, int)
+                    or input_size % 2 == 0 or input_size - 2 * len(self.blocks) < 1):
+                raise ValueError('input_size must be an odd integer larger than 2*num_layers')
+            if any(b.conv.kernel_size != (3, 3) for b in self.blocks):
+                raise ValueError('valid convolution assumes 3x3 kernels')
+        self.input_size = input_size
+
+    def _crop_input(self, x):
+        n = getattr(self, 'input_size', None)
+        if n is None:
+            return x
+        # Centre on pixel h//2: the integer detection pixel of a 64 cutout
+        # (32) and the centre of InputCrop63's 63 grid (31, i.e. the same pixel).
+        h = x.shape[-1]
+        start = h // 2 - n // 2
+        if x.ndim != 4 or x.shape[-2] != h or start < 0 or start + n > h:
+            raise ValueError(f'cropped F8 needs a square input of at least {n} pixels')
+        return x[..., start:start + n, start:start + n]
+
+    @staticmethod
+    def _pre_lowpass(z):
+        """Fixed separable binomial [1,4,6,4,1]/16 on pre-activations.
+
+        GELU(x) = x/2 + x^2/sqrt(2 pi) - O(x^4) has no cubic term, so keeping
+        pre-activations below half Nyquist (|k| < pi/2) keeps the dominant
+        quadratic sum frequencies below Nyquist: sub-pixel shifts then do not
+        alias through the pointwise nonlinearity. Replicate padding on the
+        square grid with a symmetric kernel commutes with D4 exactly.
+        Implemented as shifted adds (faster than depthwise conv or banded matmul).
+        """
+        y = F.pad(z, (2, 2, 2, 2), mode='replicate')
+        y = (y[..., :, :-4] + y[..., :, 4:]) + 4 * (y[..., :, 1:-3] + y[..., :, 3:-1]) + 6 * y[..., :, 2:-2]
+        y = (y[..., :-4, :] + y[..., 4:, :]) + 4 * (y[..., 1:-3, :] + y[..., 3:-1, :]) + 6 * y[..., 2:-2, :]
+        return y / 256
+
+    def _valid_trunk(self, x):
+        assert x.shape[-1] == x.shape[-2] == self.input_size
+        lowpass = getattr(self, 'pre_lowpass', False)
+        for block in self.blocks:
+            residual = block.skip(x) if block.skip is not None else x
+            z = block.norm(F.conv2d(x, block.conv.weight, block.conv.bias))
+            y = block.act(self._pre_lowpass(z) if lowpass else z)
+            x = y + block.residual_scale * residual[..., 1:-1, 1:-1]
+        return x.contiguous()
+
+    def _trunk_feature(self, x):
+        if getattr(self, 'input_size', None) is not None:
+            return self._valid_trunk(x)
+        return super()._trunk_feature(x)
 
     # ============================================================
     # Weighted Global Average Pool
@@ -181,6 +198,7 @@ class Forward8_fixW_CNN(Forward8_base):
     # ============================================================
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = self._crop_input(x)
         # --- Normalization ---
         w = self._get_cached_weight(x.shape[-2:], sigma=self.nl_sigma, device=x.device, dtype=x.dtype)
         m = (x*w).sum(dim=(1, 2, 3), keepdim=True)*100 # mean brightness
@@ -214,15 +232,17 @@ class Forward8_fixW_CNN(Forward8_base):
         # --- Weighted pooling ---
         v1, v2 = self._pool_components(w_f)
 
-        # --- Heads ---
+        return self._readout(v1, v2)
+
+    def _readout(self, v1, v2):
+        """Map pooled spin-2 features [B,C] x2 to [B,2]; subclasses may override."""
         if self.shared_head:
             e1 = self.head_shared(v1)
             e2 = self.head_shared(v2)
         else:
             e1 = self.head_e1(v1)
             e2 = self.head_e2(v2)
-        e = torch.cat([e1, e2], dim=-1)  # [B,2]
-        return e
+        return torch.cat([e1, e2], dim=-1)  # [B,2]
     
 class Forward8_poolmix_CNN(Forward8_fixW_CNN):
     """D4 CNN with a learned convex mixture of spatial pooling windows.
@@ -870,6 +890,8 @@ class _Forward8_AdaptiveW_CNN(Forward8_fixW_CNN):
         return self._w_cache[key]
 
     def _trunk_feature(self, x):
+        if getattr(self, 'input_size', None) is not None:
+            return self._valid_trunk(x)
         # Preserve odd as well as even sizes, as in Forward8_poolmix_CNN.
         for block in self.blocks:
             x = block(x)
@@ -1032,3 +1054,398 @@ class Forward8_AttnW_CNN(_Forward8_AdaptiveW_CNN):
         logits = F.conv2d(F.pad(logits, (2, 2, 2, 2), mode='replicate'),
                           self.kernel_blur.to(logits))
         return self._normalize_logits(logits)
+
+
+class F8_noTanh(Forward8_AttnW_CNN):
+    """Forward8_AttnW_CNN trunk/pooling with the D4inv_noTanh scalar-conditioned readout.
+
+    Shapes (default): pooled scalar [B,C], pooled spin features [B,C,2],
+    channel coefficients [B,C], output [B,2]. The scalar is the orbit mean of
+    the canonical-frame features (D4 invariant), pooled with the same
+    attention kernel as the spin-2 sign-weighted means.
+    Readout = mean_channels(MLP(scalar / scalar_scale) * spin).
+
+    The MLP is Linear-GELU-Linear with no output activation; its signed
+    coefficients are shared by e1 and e2, so the output stays spin-2 under D4.
+    scalar_scale is a fixed per-channel training-set RMS buffer (default ones);
+    set it once before optimization from training descriptors only.
+
+    fixed_pool_sigma (feature pixels): replace the attention kernel by an exact
+    normalized Gaussian centred on the feature grid; attention modules are
+    removed. input_size (odd; implemented in Forward8_fixW_CNN): crop the
+    central input_size pixels first, so
+    the brightness normalization and everything after it see only that
+    region; the 3x3 convolutions run unpadded (valid), so every feature pixel
+    is computed from real data and the feature grid, input_size -
+    2*num_layers, stays odd and centred on the detection pixel. The output
+    depends on no pixel outside the crop. D4 stays exact.
+    """
+
+    def __init__(self, in_dim=1, base_channels=32, readout_hidden=64,
+                 scalar_scale=None, fixed_pool_sigma=None, input_size=None,
+                 pool_parabola=None, pool_quartic=None, **kwargs):
+        if (isinstance(readout_hidden, bool)
+                or not isinstance(readout_hidden, int) or readout_hidden < 1):
+            raise ValueError('readout_hidden must be a positive integer')
+        super().__init__(in_dim=in_dim, base_channels=base_channels, **kwargs)
+        if fixed_pool_sigma is not None and not 0 < float(fixed_pool_sigma) < float('inf'):
+            raise ValueError('fixed_pool_sigma must be finite and positive')
+        if sum(v is not None for v in (fixed_pool_sigma, pool_parabola, pool_quartic)) > 1:
+            raise ValueError('choose at most one of fixed_pool_sigma, pool_parabola, pool_quartic')
+        self.fixed_pool_sigma = None if fixed_pool_sigma is None else float(fixed_pool_sigma)
+        self.pool_parabola = None
+        if pool_parabola is not None:
+            r0, blur = (float(v) for v in pool_parabola)
+            if not (0 < r0 < float('inf') and 0 <= blur < r0):
+                raise ValueError('pool_parabola must be (r0 > 0, 0 <= blur < r0)')
+            self.pool_parabola = (r0, blur)
+        self.pool_quartic = None
+        if pool_quartic is not None:
+            if not 0 < float(pool_quartic) < float('inf'):
+                raise ValueError('pool_quartic must be finite and positive')
+            self.pool_quartic = float(pool_quartic)
+        if (self.fixed_pool_sigma is not None or self.pool_parabola is not None
+                or self.pool_quartic is not None):
+            for name in ('token_projection', 'attn_norm', 'qkv', 'attn_output',
+                         'ffn_norm', 'ffn', 'kernel_head', 'kernel_blur'):
+                delattr(self, name)
+        self._set_input_size(input_size)
+        # The scalar MLP replaces the per-component BiasFreeMLP heads.
+        for name in ('head_shared', 'head_e1', 'head_e2'):
+            if hasattr(self, name):
+                delattr(self, name)
+        self.scalar_readout = nn.Sequential(
+            nn.Linear(base_channels, readout_hidden),
+            nn.GELU(),
+            nn.Linear(readout_hidden, base_channels),
+        )
+        nn.init.normal_(self.scalar_readout[-1].weight, std=1e-3)
+        nn.init.ones_(self.scalar_readout[-1].bias)
+        self.register_buffer('scalar_scale', torch.ones(base_channels))
+        if scalar_scale is not None:
+            self.set_scalar_scale(scalar_scale)
+
+    @torch.no_grad()
+    def set_scalar_scale(self, scale):
+        """Install fixed training-set channel RMS; no per-object normalization."""
+        scale = torch.as_tensor(scale, device=self.scalar_scale.device,
+                                dtype=self.scalar_scale.dtype)
+        if (scale.shape != self.scalar_scale.shape
+                or not torch.isfinite(scale).all() or not (scale > 0).all()):
+            raise ValueError('scalar_scale must be a finite positive [channels] vector')
+        self.scalar_scale.copy_(scale)
+
+    @staticmethod
+    def smooth_parabola_kernel(hw, r0, blur, oversample=8):
+        """Normalized (1 - r^2/r0^2)_+ convolved with a Gaussian of width blur (pixels).
+
+        Pooling term from sub-pixel translation is driven by the spin-2 Hessian
+        of the kernel, (K'' - K'/r) cos 2theta for radial K, which vanishes
+        exactly for K = a - b r^2. Gaussian blurring keeps a quadratic quadratic,
+        so the kernel is translation-neutral for r < r0 - ~3 blur and only the
+        smoothed rim contributes. Built once in float64 on a D4-symmetric
+        oversampled grid, then symmetrized exactly over D4.
+        """
+        h, w = hw
+        y = torch.arange(h, dtype=torch.float64) - (h - 1) / 2
+        x = torch.arange(w, dtype=torch.float64) - (w - 1) / 2
+        yy, xx = torch.meshgrid(y, x, indexing='ij')
+        if blur == 0:
+            kernel = (1 - (xx.square() + yy.square()) / r0**2).clamp(min=0)
+        else:
+            extent = r0
+            n = int(2 * extent * oversample)
+            fine = (torch.arange(n, dtype=torch.float64) + 0.5) / oversample - extent
+            fy, fx = torch.meshgrid(fine, fine, indexing='ij')
+            hard = (1 - (fx.square() + fy.square()) / r0**2).clamp(min=0).flatten()
+            keep = hard > 0
+            fx, fy, hard = fx.flatten()[keep], fy.flatten()[keep], hard[keep]
+            d2 = (xx.flatten()[:, None] - fx[None]).square() + (yy.flatten()[:, None] - fy[None]).square()
+            kernel = (torch.exp(-0.5 * d2 / blur**2) @ hard).reshape(h, w)
+        kernel = kernel + kernel.flip(0) + kernel.flip(1) + kernel.flip(0).flip(1)
+        kernel = kernel + kernel.transpose(0, 1)
+        return kernel / kernel.sum()
+
+    @staticmethod
+    def quartic_kernel(hw, a):
+        """Normalized flat-top window exp(-(r/a)^4) sampled at feature-pixel centres.
+
+        Smooth everywhere (no rim discontinuity). Effective area
+        sum(K)/K(0) = pi^1.5 a^2 / 2, so a = 4.5 matches the r0 = 6 paraboloid.
+        Built in float64; the centred grid makes it exactly D4-symmetric.
+        """
+        h, w = hw
+        y = torch.arange(h, dtype=torch.float64) - (h - 1) / 2
+        x = torch.arange(w, dtype=torch.float64) - (w - 1) / 2
+        yy, xx = torch.meshgrid(y, x, indexing='ij')
+        kernel = torch.exp(-((xx.square() + yy.square()) / a**2).square())
+        return kernel / kernel.sum()
+
+    def _make_pool_kernel(self, scalar_field):
+        if getattr(self, 'pool_quartic', None) is not None:
+            key = ('quartic', tuple(scalar_field.shape[-2:]), scalar_field.device, scalar_field.dtype)
+            if key not in self._w_cache:
+                self._w_cache[key] = self.quartic_kernel(
+                    scalar_field.shape[-2:], self.pool_quartic).to(
+                    device=scalar_field.device, dtype=scalar_field.dtype)[None, None]
+            return self._w_cache[key].expand(scalar_field.shape[0], -1, -1, -1)
+        if getattr(self, 'pool_parabola', None) is not None:
+            key = ('parabola', tuple(scalar_field.shape[-2:]), scalar_field.device, scalar_field.dtype)
+            if key not in self._w_cache:
+                self._w_cache[key] = self.smooth_parabola_kernel(
+                    scalar_field.shape[-2:], *self.pool_parabola).to(
+                    device=scalar_field.device, dtype=scalar_field.dtype)[None, None]
+            return self._w_cache[key].expand(scalar_field.shape[0], -1, -1, -1)
+        if self.fixed_pool_sigma is None:
+            return super()._make_pool_kernel(scalar_field)
+        # Exact normalized Gaussian in feature pixels; no additional taper.
+        xx, yy = self._coordinates(scalar_field.shape[-2:], scalar_field.device, scalar_field.dtype)
+        logits = -0.5 * (xx.square() + yy.square()) / self.fixed_pool_sigma**2
+        kernel = logits.flatten().softmax(0).reshape(1, 1, *logits.shape)
+        return kernel.expand(scalar_field.shape[0], -1, -1, -1)
+
+    def _has_fixed_kernel(self):
+        return not (self.pool_quartic is None and self.pool_parabola is None
+                    and self.fixed_pool_sigma is None)
+
+    def _fixed_kernel(self, hw, device, dtype):
+        """[H,W] D4-symmetric pooling kernel, or None for attention pooling."""
+        if not self._has_fixed_kernel():
+            return None
+        key = ('fixed', tuple(hw), device, dtype)
+        if key not in self._w_cache:
+            if self.pool_quartic is not None:
+                kernel = self.quartic_kernel(hw, self.pool_quartic)
+            elif self.pool_parabola is not None:
+                kernel = self.smooth_parabola_kernel(hw, *self.pool_parabola)
+            else:
+                xx, yy = self._coordinates(hw, 'cpu', torch.float64)
+                kernel = (-0.5 * (xx.square() + yy.square()) / self.fixed_pool_sigma**2).flatten().softmax(0).view(hw)
+            self._w_cache[key] = kernel.to(device=device, dtype=dtype)
+        return self._w_cache[key]
+
+    def forward(self, x):
+        """With a fixed kernel K, pool each D4 view in its own frame.
+
+        K(g u) = K(u), so sum_u K(u) (g^-1 f_g)(u) = sum_u K(u) f_g(u): the
+        inverse stack and the [8,B,C,H,W] orbit means are skipped. Same output
+        up to summation order. Set inframe_pool = False to restore the
+        full-field path (feats, f_mean_e1/e2), e.g. for primal traces.
+        """
+        if x.ndim != 4 or x.shape[-2] != x.shape[-1] or x.shape[-1] < 1:
+            raise ValueError('Expected nonempty square images [B,C,H,H]')
+        if not getattr(self, 'inframe_pool', True) or not self._has_fixed_kernel():
+            return super().forward(x)
+        x = self._crop_input(x)
+        w = self._get_cached_weight(x.shape[-2:], sigma=self.nl_sigma, device=x.device, dtype=x.dtype)
+        m = (x * w).sum(dim=(1, 2, 3), keepdim=True) * 100
+        x = x / (1 + F.softplus(m - 1, beta=10.0, threshold=20))
+        b = x.size(0)
+        f8 = self._trunk_feature(self._d4_orbit_stack(x).flatten(0, 1))  # [8B,C,h,w]
+        kernel = self._fixed_kernel(f8.shape[-2:], f8.device, f8.dtype)
+        # Elementwise product-sum (not matmul): unaffected by TF32 matmul settings.
+        pooled = (f8 * kernel).sum(dim=(-2, -1)).view(8, b, -1)          # [8,B,C]
+        v1 = (self.signs_e1.to(pooled).view(8, 1, 1) * pooled).mean(0)
+        v2 = (self.signs_e2.to(pooled).view(8, 1, 1) * pooled).mean(0)
+        self.f8 = self.feats = self.f_mean_e1 = self.f_mean_e2 = None
+        self._pool_kernel = kernel[None, None].expand(b, -1, -1, -1)
+        self.scalar_pooled = pooled.mean(0)
+        self.spin_pooled = torch.stack((v1, v2), dim=-1)
+        self.channel_weights = self.scalar_readout(self.scalar_pooled / self.scalar_scale)
+        return (self.spin_pooled * self.channel_weights[..., None]).mean(dim=1)
+
+    def _readout(self, v1, v2):
+        # pool_kernel already sums to one over pixels.
+        scalar = self.feats.mean(dim=0)
+        self.scalar_pooled = (scalar * self.pool_kernel).sum(dim=(-2, -1)).to(scalar.dtype)
+        self.spin_pooled = torch.stack((v1, v2), dim=-1)
+        self.channel_weights = self.scalar_readout(self.scalar_pooled / self.scalar_scale)
+        return (self.spin_pooled * self.channel_weights[..., None]).mean(dim=1)
+
+
+class WindowedChannelNorm2d(nn.Module):
+    """Channel norm with one window-weighted scale per image, replacing ChannelLayerNorm2d.
+
+    ChannelLayerNorm2d divides every pixel by its own channel std, so pixels at
+    1e-3 of the source peak come out O(1) and the spin density no longer
+    follows the light (it peaks on the pooling-window rim, which produces the
+    translation term). Here each pixel is still centred over channels (a linear
+    map), but all pixels share one scale:
+
+        s^2 = sum_u W(u) var_c(u) / sum_u W(u),   y = (x - mean_c x) / sqrt(s^2 + eps)
+
+    W is fixed, centred on the odd feature grid (the detection pixel) and
+    D4-symmetric, so D4 stays exact. Spatial amplitude ratios survive the norm.
+    window: ('parabola', r0, blur) uses F8_noTanh.smooth_parabola_kernel, which
+    is exactly zero beyond r0 + ~3 blur, so far neighbours do not enter s;
+    ('gaussian', sigma); ('global',) is a uniform W (GroupNorm-like scale).
+    Parameter names and shapes match ChannelLayerNorm2d.
+    """
+
+    def __init__(self, num_channels, window, eps=1e-5, share_orbit=False):
+        super().__init__()
+        kind = window[0]
+        if kind not in ('parabola', 'gaussian', 'global'):
+            raise ValueError(f'unknown norm window {window!r}')
+        self.window = tuple(window)
+        self.eps = eps
+        # share_orbit: one scale per object, averaged over the 8 orbit-major D4
+        # views ([8B] batch). Per-view scales differ for a non-equivariant
+        # trunk and act as a hidden orientation/position-dependent channel.
+        self.share_orbit = bool(share_orbit)
+        self.weight = nn.Parameter(torch.ones(1, num_channels, 1, 1))
+        self.bias = nn.Parameter(torch.zeros(1, num_channels, 1, 1))
+        self._cache = {}
+
+    def _window(self, hw, device, dtype):
+        key = (tuple(hw), device, dtype)
+        if key not in self._cache:
+            kind = self.window[0]
+            if kind == 'parabola':
+                w = F8_noTanh.smooth_parabola_kernel(hw, *self.window[1:])
+            elif kind == 'gaussian':
+                h, wd = hw
+                y = torch.arange(h, dtype=torch.float64) - (h - 1) / 2
+                x = torch.arange(wd, dtype=torch.float64) - (wd - 1) / 2
+                yy, xx = torch.meshgrid(y, x, indexing='ij')
+                w = torch.exp(-0.5 * (xx.square() + yy.square()) / self.window[1] ** 2)
+            else:
+                w = torch.ones(*hw, dtype=torch.float64)
+            self._cache[key] = (w / w.sum()).to(device=device, dtype=dtype)
+        return self._cache[key]
+
+    def forward(self, x):
+        centred = x - x.mean(dim=1, keepdim=True)
+        variance = centred.square().mean(dim=1)                       # [N,H,W]
+        scale = (variance * self._window(x.shape[-2:], x.device, x.dtype)).sum((-2, -1))
+        if self.share_orbit:
+            if scale.shape[0] % 8:
+                raise ValueError('share_orbit expects an orbit-major [8B] batch')
+            scale = scale.view(8, -1).mean(0).repeat(8)
+        return centred * torch.rsqrt(scale + self.eps)[:, None, None, None] * self.weight + self.bias
+
+
+class QuadAct(nn.Module):
+    """Per-channel quadratic initialized to the GELU Taylor coefficient."""
+    def __init__(self, channels, coefficient=0.4):
+        super().__init__()
+        self.c = nn.Parameter(torch.full((1, channels, 1, 1), float(coefficient)))
+
+    def forward(self, z):
+        return z / 2 + self.c * z.square()
+
+
+# Fixed-Gaussian, cropped F8_noTanh: 5 unpadded layers on the central 43x43
+# (feature grid 33x33 = +-4 sigma), centred on the integer detection pixel.
+F8_RECIPES = {
+    'f8c_sigma4_rdsm': dict(depth=5, target='rdsm', ssl=False, parent=None, forward8=True,
+                            fixed_pool_sigma=4., input_size=43),
+    'f8c_sigma4_truth': dict(depth=5, target='truth', ssl=False, parent=None, forward8=True,
+                             fixed_pool_sigma=4., input_size=43),
+    # Same as f8c_sigma4_* except pooling: smoothed paraboloid, r0=6, blur 0.5
+    # feature pixels (translation-neutral core r < ~4.5).
+    'f8c_parab6_rdsm': dict(depth=5, target='rdsm', ssl=False, parent=None, forward8=True,
+                            pool_parabola=(6., .5), input_size=43),
+    'f8c_parab6_truth': dict(depth=5, target='truth', ssl=False, parent=None, forward8=True,
+                             pool_parabola=(6., .5), input_size=43),
+    # Same as f8c_sigma4_* except pooling: exp(-(r/4.5)^4), same effective
+    # area as parab6 (~56 feature pixels^2).
+    'f8c_quart45_rdsm': dict(depth=5, target='rdsm', ssl=False, parent=None, forward8=True,
+                             pool_quartic=4.5, input_size=43),
+    'f8c_quart45_truth': dict(depth=5, target='truth', ssl=False, parent=None, forward8=True,
+                              pool_quartic=4.5, input_size=43),
+}
+# Same as f8c_parab6_* except the trunk norm: WindowedChannelNorm2d instead of
+# the per-pixel ChannelLayerNorm2d. wnp4: smoothed paraboloid r0=4, blur .5
+# (target core only; few noise pixels). wng6: Gaussian sigma=6 (wide, many
+# pixels, sees more of the neighbours). Widths in feature pixels.
+for _name, _window in (('wnp4', ('parabola', 4., .5)), ('wng6', ('gaussian', 6.))):
+    for _target in ('truth', 'rdsm'):
+        F8_RECIPES[f'f8c_parab6_{_name}_{_target}'] = dict(
+            depth=5, target=_target, ssl=False, parent=None, forward8=True,
+            pool_parabola=(6., .5), input_size=43, norm_window=_window)
+del _name, _window, _target
+# Same as f8c_parab6_wng6_* plus a fixed binomial low-pass on every
+# pre-activation (anti-aliasing at ~3% cost). wng6lp keeps per-view norm
+# scales; wng6lps also shares the norm scale over the 8 D4 views.
+for _name, _share in (('wng6lp', False), ('wng6lps', True)):
+    for _target in ('truth', 'rdsm'):
+        F8_RECIPES[f'f8c_parab6_{_name}_{_target}'] = dict(
+            depth=5, target=_target, ssl=False, parent=None, forward8=True,
+            pool_parabola=(6., .5), input_size=43, norm_window=('gaussian', 6.),
+            norm_share_orbit=_share, pre_lowpass=True)
+del _name, _share, _target
+
+
+# Shared D4 norm, no low-pass; readout retains GELU.
+for _depth in (2, 3, 5):
+    _prefix = 'f8c' if _depth == 5 else f'f8c{_depth}'
+    F8_RECIPES[f'{_prefix}_parab6_wng6s_truth'] = dict(
+        depth=_depth, target='truth', ssl=False, parent=None, forward8=True,
+        pool_parabola=(6., .5), input_size=43, norm_window=('gaussian', 6.),
+        norm_share_orbit=True, act='gelu')
+for _act in ('softplus', 'tanh', 'quad'):
+    F8_RECIPES[f'f8c_parab6_wng6s_truth_{_act}'] = dict(
+        F8_RECIPES['f8c_parab6_wng6s_truth'], act=_act)
+del _depth, _prefix, _act
+
+
+# Pool-radius ablation: identical trunk, normalization and training target.
+F8_RECIPES['f8c_parab10_wng6s_truth'] = dict(
+    F8_RECIPES['f8c_parab6_wng6s_truth'], pool_parabola=(10., .5))
+
+
+# Depth/width controls: all other parab10 settings and the 64-unit readout stay fixed.
+for _depth in (1, 2, 3, 4, 5):
+    for _channels in (8, 16, 24, 32):
+        F8_RECIPES[f'f8c_parab10_d{_depth}c{_channels}_truth'] = dict(
+            F8_RECIPES['f8c_parab10_wng6s_truth'], depth=_depth, channels=_channels,
+            input_size=33 + 2 * _depth)
+del _depth, _channels
+
+
+def build_f8_model(kind, seed=42, state=None):
+    """Random-init (or state-restored) F8 recipe with the common input wrappers:
+    InputCrop63 (odd grid on the detection pixel), linear trainable gain, and
+    ObservableCenter disabled."""
+    from src.architecture.CNN_toolkit import (
+        use_explicit_layernorm, InputCrop63, ObservableCenter, TrainableRadial)
+    recipe = F8_RECIPES[kind]
+    torch.manual_seed(seed)
+    base = F8_noTanh(
+        num_layers=recipe['depth'], base_channels=recipe.get('channels', 32), res_factor=0.25, head_hidden=128,
+        nl_sigma=16.0, suppress=True, r_cut=24.0, suppress_order=8, head_num_hidden_layers=1,
+        attn_grid_size=16, attn_dim=32, attn_heads=4,
+        fixed_pool_sigma=recipe.get('fixed_pool_sigma'), input_size=recipe.get('input_size'),
+        pool_parabola=recipe.get('pool_parabola'), pool_quartic=recipe.get('pool_quartic'))
+    use_explicit_layernorm(base)
+    if recipe.get('norm_window') is not None:
+        for block in base.blocks:
+            block.norm = WindowedChannelNorm2d(block.norm.weight.shape[1], recipe['norm_window'],
+                                               eps=block.norm.eps,
+                                               share_orbit=recipe.get('norm_share_orbit', False))
+    activation = recipe.get('act', 'gelu')
+    if activation not in ('gelu', 'softplus', 'tanh', 'quad'):
+        raise ValueError(f'unknown trunk activation {activation!r}')
+    for block in base.blocks:
+        if activation == 'softplus':
+            block.act = nn.Softplus(beta=1)
+        elif activation == 'tanh':
+            block.act = nn.Tanh()
+        elif activation == 'quad':
+            block.act = QuadAct(block.norm.weight.shape[1])
+    base.pre_lowpass = bool(recipe.get('pre_lowpass', False))
+    model = ObservableCenter(InputCrop63(TrainableRadial(base)), sigma=2.0, enabled=False).float()
+    if state is not None:
+        model.load_state_dict(state, strict=True)
+    return model
+
+
+def load_f8_checkpoint(path, *, device='cpu', dtype=torch.float64):
+    """Strictly restore a checkpoint written by src.train_d4 for an F8_RECIPES kind."""
+    saved = torch.load(path, map_location='cpu', weights_only=False)
+    if saved.get('kind') not in F8_RECIPES:
+        raise ValueError(f"not an F8_RECIPES checkpoint: {saved.get('kind')}")
+    model = build_f8_model(saved['kind'], saved['seed'], saved['state_dict'])
+    model.model.model.radial_alpha = 0.0
+    return model.to(device=device, dtype=dtype).eval()

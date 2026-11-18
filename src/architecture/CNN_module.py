@@ -4,6 +4,29 @@ import torch.nn.functional as F
 from typing import Literal
 
 
+def frozen_weight_cache(module, name, build):
+    """Reuse a weight-only tensor while ``module`` is frozen for inference.
+
+    Active only in eval mode with every parameter at requires_grad=False
+    (as Calibrator sets); then the tensor carries no autograd path to the
+    weights and recomputing it each batch only adds kernel launches. The key
+    tracks storage, version, dtype and device of every parameter, so
+    load_state_dict, in-place edits and .to() invalidate it. Otherwise the
+    tensor is rebuilt every call exactly as before.
+    """
+    params = list(module.parameters())
+    if module.training or any(p.requires_grad for p in params):
+        module.__dict__.pop('_frozen_weight_cache', None)
+        return build()
+    key = tuple((p.data_ptr(), p._version, p.dtype, p.device) for p in params)
+    cache = module.__dict__.setdefault('_frozen_weight_cache', {})
+    hit = cache.get(name)
+    if hit is None or hit[0] != key:
+        with torch.no_grad():
+            hit = cache[name] = (key, build())
+    return hit[1]
+
+
 class ChannelLayerNorm2d(nn.Module):
     def __init__(self, num_channels, eps=1e-5, affine=True):
         super().__init__()
@@ -83,7 +106,7 @@ class D4Inv_Conv2d(nn.Module):
         return torch.stack(Ws, dim=0).mean(dim=0)
 
     def forward(self, x):
-        self.W_D4 = self._D4_avg(self.P)
+        self.W_D4 = frozen_weight_cache(self, 'W_D4', lambda: self._D4_avg(self.P))
         x = F.conv2d(x, self.W_D4, self.bias, stride=self.s, padding=self.p)
 
         # LayerNorm normalizes over the channel dimension only
