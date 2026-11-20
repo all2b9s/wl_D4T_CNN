@@ -97,7 +97,7 @@ void bind_anacal(py::module_&);
 #endif
 PYBIND11_MODULE(_native,m){
  m.doc()="D4CNN forward-mode CPU inference; no libtorch dependency";
- m.attr("api_version")=3;
+ m.attr("api_version")=4;
 #ifdef D4CNN_PROFILE
  m.def("profile_reset",&prof::reset);
  m.def("profile_stats",[](){py::dict out;for(int k=0;k<prof::count;++k)out[prof::names[k]]=prof::sums[k].load();return out;});

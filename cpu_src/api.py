@@ -28,7 +28,7 @@ class Measurement:
 class Model:
     def __init__(self, metadata, weights, precision="float32", isa="auto"):
         from . import _native
-        if getattr(_native, "api_version", 0) != 3:
+        if getattr(_native, "api_version", 0) != 4:
             raise RuntimeError("CPU native extension is out of date; rebuild cpu_src with build_local.sh using this Python interpreter")
         validate(metadata, weights)
         if precision not in ("float32", "float64"):
@@ -69,7 +69,9 @@ class Model:
                            values[:, 3:5].transpose(0, 2, 1).copy() if n_tangent == 4 else None,
                            self._metadata(n_tangent))
 
-    def prepare_qstamps(self, image, psf, positions_xy, noise=None, nthreads=1):
+    def prepare_qstamps(self, image, psf, positions_xy, noise=None, nthreads=1, noise2=None, renoise=None):
+        """renoise: object with mode/c/delta (e.g. src RenoiseConfig); None = spectral c=0.1,
+        delta=0.01, which needs noise2 (second independent canvas) whenever noise is given."""
         from . import _native
         if not _native.has_anacal:
             raise RuntimeError("Rebuild with -DANACAL_SOURCE_DIR=/path/to/AnaCal for source measurement")
@@ -86,11 +88,13 @@ class Model:
             noise = np.ascontiguousarray(noise, dtype=np.float32)
             if noise.shape != image.shape or not np.isfinite(noise).all():
                 raise ValueError("noise must be finite and have image shape")
+        noise2, rkw = _renoise_args(image, noise, noise2, renoise)
         p = self.metadata["preprocessing"]
         return _native.prepare_qstamps(image, psf, pos, noise, self.metadata["stamp_size"],
-                                      p["pixel_scale"], p["sigma_arcsec"], p["klim"], nthreads)
+                                      p["pixel_scale"], p["sigma_arcsec"], p["klim"], nthreads, noise2, **rkw)
 
-    def measure_sources(self, image, psf, positions_xy, noise=None, n_tangent=2, nthreads=1, batch_size=None):
+    def measure_sources(self, image, psf, positions_xy, noise=None, n_tangent=2, nthreads=1, batch_size=None,
+                        noise2=None, renoise=None):
         if type(nthreads) is not int or nthreads < 1:
             raise ValueError("nthreads must be a positive integer")
         if batch_size is None:
@@ -114,14 +118,15 @@ class Model:
             noise = np.ascontiguousarray(noise,dtype=np.float32)
             if noise.shape != image.shape or not np.isfinite(noise).all():
                 raise ValueError("noise must be finite and have image shape")
+        noise2, rkw = _renoise_args(image, noise, noise2, renoise)
         pre=self.metadata["preprocessing"]
         results = []
         for start in range(0, len(pos), batch_size):
             q = _native.prepare_qstamps(image,psf,pos[start:start+batch_size],noise,self.metadata["stamp_size"],
-                                       pre["pixel_scale"],pre["sigma_arcsec"],pre["klim"],nthreads)
+                                       pre["pixel_scale"],pre["sigma_arcsec"],pre["klim"],nthreads,noise2,**rkw)
             results.append(self.measure_qstamps(q, n_tangent, nthreads))
         if not results:
-            q = self.prepare_qstamps(image, psf, pos, noise, nthreads)
+            q = self.prepare_qstamps(image, psf, pos, noise, nthreads, noise2, renoise)
             return replace(self.measure_qstamps(q, n_tangent, nthreads), centers_xy=np.empty((0, 2), dtype=np.int64))
         return Measurement(np.concatenate([r.e for r in results]), np.concatenate([r.R for r in results]),
                            np.concatenate([r.dE_dx for r in results]) if n_tangent == 4 else None,
@@ -132,3 +137,22 @@ class Model:
         if not np.isfinite(q).all():
             raise ValueError("q contains non-finite values")
         return dict(self._model.trace(q, n_tangent))
+
+
+def _renoise_args(image, noise, noise2, renoise):
+    """Native renoise keywords; None = spectral (c=0.1, delta=0.01), the default."""
+    mode = "spectral" if renoise is None else renoise.mode
+    c = 0.1 if renoise is None else float(renoise.c)
+    delta = 0.01 if renoise is None else float(renoise.delta)
+    if mode not in ("spectral", "rotate"):
+        raise ValueError("renoise mode must be 'spectral' or 'rotate'")
+    if mode == "spectral" and noise is not None:
+        if noise2 is None:
+            raise ValueError("spectral renoising (the default) needs noise2, a second independent noise "
+                             "canvas; pass renoise with mode='rotate' for the legacy path")
+        noise2 = np.ascontiguousarray(noise2, dtype=np.float32)
+        if noise2.shape != image.shape or not np.isfinite(noise2).all():
+            raise ValueError("noise2 must be finite and have image shape")
+    else:
+        noise2 = None
+    return noise2, dict(renoise_mode=mode, renoise_c=c, renoise_delta=delta)

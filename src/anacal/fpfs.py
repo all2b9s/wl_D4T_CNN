@@ -6,6 +6,7 @@ os.environ["MKL_NUM_THREADS"] = "1"
 os.environ["NUMEXPR_NUM_THREADS"] = "1"
 import numpy as np
 from src.anacal.cal_toolkit import build_dataset, format_number
+from src.anacal.pixel_response import RenoiseConfig
 import anacal
 import multiprocessing as mp
 
@@ -25,6 +26,8 @@ _FPFS_GLOBALS = {
     "cutouts": None,
     "psfs": None,
     "noises": None,
+    "noises2": None,
+    "renoise_kw": None,
     "fpfs_config": None,
     "mag_zero": None,
     "pixel_scale": None,
@@ -34,7 +37,7 @@ _FPFS_GLOBALS = {
 
 def _init_fpfs_worker(cutouts, psfs, noises,
                       fpfs_config, mag_zero, pixel_scale,
-                      noise_variance, detection):
+                      noise_variance, detection, noises2=None, renoise_kw=None):
     """Initializer: store large arrays & constants in worker-local globals."""
     _FPFS_GLOBALS["cutouts"]        = cutouts
     _FPFS_GLOBALS["psfs"]           = psfs
@@ -43,7 +46,9 @@ def _init_fpfs_worker(cutouts, psfs, noises,
     _FPFS_GLOBALS["fpfs_config"]    = fpfs_config
     _FPFS_GLOBALS["mag_zero"]       = mag_zero
     _FPFS_GLOBALS["pixel_scale"]    = pixel_scale
-    _FPFS_GLOBALS["noise_variance"] = noise_variance
+    _FPFS_GLOBALS["noise_variance"] = noise_variance  # (n_gal,) per-galaxy variance
+    _FPFS_GLOBALS["noises2"]        = noises2
+    _FPFS_GLOBALS["renoise_kw"]     = renoise_kw or {}
 
 
 def _fpfs_worker(idx):
@@ -54,6 +59,9 @@ def _fpfs_worker(idx):
         cutout = g["cutouts"][idx].astype(np.float64, copy=False)
         psf    = g["psfs"][idx].astype(np.float64, copy=False)
         noise  = g["noises"][idx].astype(np.float64, copy=False)
+        extra = dict(g["renoise_kw"])
+        if g["noises2"] is not None:
+            extra["noise2_array"] = g["noises2"][idx].astype(np.float32)
 
         # Detection is now required (new anacal API); fpfs_measure always
         # passes a fixed-center catalogue, no internal FPFS detection weight.
@@ -63,9 +71,10 @@ def _fpfs_worker(idx):
             gal_array=cutout,
             psf_array=psf,
             pixel_scale=g["pixel_scale"],
-            noise_variance=g["noise_variance"],
+            noise_variance=float(g["noise_variance"][idx]),
             noise_array=noise,
             detection=g["detection"],
+            **extra,
         )
 
         # ---- Key: guard against empty results ----
@@ -112,6 +121,7 @@ def fpfs_measure(
     fname = 'fpfs',
     if_return = False,
     save_dir = None,        # output directory (override the hard-coded default below)
+    renoise = None,         # RenoiseConfig; None = RenoiseConfig() (spectral)
 ):
     """
     Batch FPFS shape & flux measurement (the baseline estimator compared in the paper).
@@ -146,17 +156,17 @@ def fpfs_measure(
     detection["y"] = center[0]
     detection["x"] = center[1]
 
-    # Determine noise variance for FPFS config
-    if noise_level > 0:
-        noise_variance = noise_level**2.0
-    else:
-        noise_variance = 1e-4
-    
-
-    if noise_level == 'adaptive':
+    # 'adaptive' draws a per-galaxy sigma in load_img (noise_mode='adaptive',
+    # uncapped); the FPFS variance then follows each galaxy's sigma.
+    adaptive = noise_level == 'adaptive'
+    if adaptive:
         folder_name = 'nada'
+        load_kw = dict(noise_level=np.inf, noise_mode='adaptive')
     else:
         folder_name = format_number(noise_level)
+        load_kw = dict(noise_level=noise_level)
+    if renoise is None:
+        renoise = RenoiseConfig()
 
     if save_dir is None:
         save_dir = '/work/hdd/bfmo/wenyinli/measurement/xlens_sims/'
@@ -176,13 +186,19 @@ def fpfs_measure(
 
         all_cutouts, all_psfs, all_cats, noise_levels = build_dataset(
             shear_comp=shear_comp, shear_mode=shear_mode, abs_shear_value=0.02,
-            noise_level=noise_level, index_range=range_idx,
+            index_range=range_idx, **load_kw,
             directory=dir, workers=n_workers, use_threads=False
         )
 
         # noise per-galaxy
         np.random.seed(20020620 + start)
         noises = np.random.normal(0, 1, all_cutouts.shape) * noise_levels.reshape(-1, 1, 1)
+        noises2 = None
+        if renoise.spectral:
+            noises2 = (np.random.default_rng([20020620, start, 2]).normal(0, 1, all_cutouts.shape)
+                       * noise_levels.reshape(-1, 1, 1))
+        # Per-galaxy variance; 1e-4 floor for noiseless galaxies (legacy value).
+        noise_variance = np.where(noise_levels > 0, noise_levels.astype(np.float64) ** 2, 1e-4)
 
         n_gal = all_cutouts.shape[0]   # should be 10000 here
 
@@ -199,6 +215,8 @@ def fpfs_measure(
                 pixel_scale,
                 noise_variance,
                 detection,
+                noises2,
+                renoise.fpfs_kwargs(),
             ),
         ) as pool:
             # map over indices 0..n_gal-1

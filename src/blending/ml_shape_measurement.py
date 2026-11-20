@@ -24,6 +24,8 @@ def prepare_chunk_q_images(
     n_workers: int = 32,
     flim: float = 10.0,
     dtype: str = "float32",
+    noise2_arrays: Optional[np.ndarray] = None,
+    renoise=None,
 ) -> np.ndarray:
     """Q-images for pre-generated noise stamps, as computed in ``ml_shape_measure``.
 
@@ -32,12 +34,14 @@ def prepare_chunk_q_images(
     """
     from src.anacal.batch_calibration import prepare_q_images
 
-    noises = noise_arrays.astype(np.float64 if dtype == "float64" else np.float32)
+    ndt = np.float64 if dtype == "float64" else np.float32
+    noises = noise_arrays.astype(ndt)
+    noises2 = None if noise2_arrays is None else noise2_arrays.astype(ndt)
     psfs = np.tile(psf_image, (stamps.shape[0], 1, 1))
     q_imgs = prepare_q_images(
         images=stamps, psfs=psfs, noises=noises, cat=None,
         pixel_scale=pixel_scale, sigma_arcsec=psf_fwhm / 2.355,
-        flim=flim, workers=n_workers,
+        flim=flim, workers=n_workers, noises2=noises2, renoise=renoise,
     )
     return q_imgs.astype(np.float64 if dtype == "float64" else np.float32)
 
@@ -59,6 +63,8 @@ def ml_shape_measure(
     verbose: bool = True,
     timing_records=None,
     q_imgs: Optional[np.ndarray] = None,  # precomputed (N, 5, H, W); skips steps 1-2
+    noise2_arrays: Optional[np.ndarray] = None,  # second noise stamps (spectral filler)
+    renoise=None,  # RenoiseConfig; None = RenoiseConfig() (spectral)
 ) -> Tuple[np.ndarray, np.ndarray]:
     """
     Run ML shape measurement on a set of postage stamps.
@@ -90,6 +96,12 @@ def ml_shape_measure(
         Q-image calibration — the same noise array should be passed to the
         detection step for consistent noise-bias handling.  Overrides
         ``noise_std`` and ``noise_levels``.
+    noise2_arrays : Optional[np.ndarray]
+        Second independent noise stamps for spectral renoising (the default).
+        Required with ``noise_arrays``; drawn from the same ``seed`` stream
+        after the first realization when the noise is generated here.
+    renoise : RenoiseConfig or None
+        None = RenoiseConfig() (spectral); RenoiseConfig(mode='rotate') = legacy.
     n_workers : int
         Number of parallel workers for Q-image preparation.
     flim : float
@@ -129,17 +141,27 @@ def ml_shape_measure(
     # it is used internally by anacal to compute noise bias corrections.
     # Supports both scalar noise_std, per-stamp noise_levels array, and
     # pre-generated noise_arrays (for consistent noise between detection & measurement).
+    from src.anacal.pixel_response import RenoiseConfig
+    if renoise is None:
+        renoise = RenoiseConfig()
     t_noise_start = time.perf_counter()
+    noises2 = None
     if noise_arrays is not None:
         # Use the pre-generated noise directly — must match the noise passed to detection
         noises = noise_arrays.astype(np.float64 if dtype == "float64" else np.float32)
+        if noise2_arrays is not None:
+            noises2 = noise2_arrays.astype(noises.dtype)
     elif noise_levels is not None and np.any(noise_levels > 0):
         # Per-stamp noise levels: shape (N,)  →  broadcast to (N, H, W)
         rng = np.random.default_rng(seed)
         noises = rng.normal(0, 1, stamps.shape) * noise_levels.reshape(-1, 1, 1)
+        if renoise.spectral:
+            noises2 = rng.normal(0, 1, stamps.shape) * noise_levels.reshape(-1, 1, 1)
     elif isinstance(noise_std, (int, float)) and noise_std > 0:
         rng = np.random.default_rng(seed)
         noises = rng.normal(0, noise_std, stamps.shape)
+        if renoise.spectral:
+            noises2 = rng.normal(0, noise_std, stamps.shape)
     else:
         noises = None
     t_noise = time.perf_counter() - t_noise_start
@@ -155,6 +177,8 @@ def ml_shape_measure(
         sigma_arcsec=sigma_arcsec,
         flim=flim,
         workers=n_workers,
+        noises2=noises2,
+        renoise=renoise if noises is not None else None,
     )
     t_prepare = time.perf_counter() - t_prepare_start
 

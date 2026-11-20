@@ -20,6 +20,7 @@ import numpy as np
 from cpu_src import Model
 from src.anacal.batch_calibration import prepare_q_images
 from src.anacal.cal_toolkit import build_dataset, format_number
+from src.anacal.pixel_response import RenoiseConfig, RENOISE_MODES
 
 def parse_shear_tasks(task_list):
     parsed = []
@@ -38,8 +39,13 @@ def prepare_batch(shear_comp, shear_mode, start, args):
     # Same MT19937 stream as src/shape_measurement.py
     rs = np.random.RandomState(20020620 + start)
     noises = rs.normal(0, 1, cutouts.shape) * noise_levels.reshape(-1, 1, 1)
+    renoise = RenoiseConfig(mode=args.renoise_mode, c=args.renoise_c, delta=args.renoise_delta)
+    noises2 = None
+    if renoise.spectral:  # same second stream as src/shape_measurement.py
+        noises2 = (np.random.default_rng([20020620, start, 2]).normal(0, 1, cutouts.shape)
+                   * noise_levels.reshape(-1, 1, 1))
     q = prepare_q_images(cutouts, psfs, noises, cats, sigma_arcsec=args.psf_fwhm / 2.355,
-                         workers=args.io_workers, flim=10)
+                         workers=args.io_workers, flim=10, noises2=noises2, renoise=renoise)
     return q.astype(np.float32), time.perf_counter() - t0
 
 
@@ -59,6 +65,10 @@ def main():
     p.add_argument("--nthreads", type=int, default=int(os.environ.get("SLURM_CPUS_PER_TASK", 32)))
     p.add_argument("--io_workers", type=int, default=16, help="processes for loading / q-image prep")
     p.add_argument("--precision", choices=["float32", "float64"], default="float32")
+    p.add_argument("--renoise-mode", choices=list(RENOISE_MODES), default="spectral",
+                   help="'spectral' (default; AnaCal 0.8.4) or 'rotate' (legacy)")
+    p.add_argument("--renoise-c", type=float, default=0.1)
+    p.add_argument("--renoise-delta", type=float, default=0.01)
     args = p.parse_args()
 
     t_start = time.time()

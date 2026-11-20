@@ -32,10 +32,18 @@ class PipelineConfig:
     calibration_workers: int = 1
     backend: str = "cpp"
     reference_device: str = "cpu"
+    # Noise-bias correction for detection, forced FPFS and q-stamps (as src/blended_run.py).
+    renoise_mode: str = "spectral"
+    renoise_c: float = 0.1
+    renoise_delta: float = 0.01
 
     def validate(self):
         if self.precision not in ("float32","float64") or self.backend not in ("cpp","torch"):
             raise ValueError("Invalid precision or backend")
+        if self.renoise_mode not in ("spectral","rotate"):
+            raise ValueError("renoise_mode must be 'spectral' or 'rotate'")
+        if not math.isfinite(self.renoise_c) or self.renoise_c<=0 or not math.isfinite(self.renoise_delta) or self.renoise_delta<0:
+            raise ValueError("renoise_c must be positive and renoise_delta nonnegative")
         if self.n_tangent not in (2,4):
             raise ValueError("n_tangent must be 2 or 4")
         for key in ("nthreads","bs_times","calibration_workers"):

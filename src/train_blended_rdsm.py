@@ -54,7 +54,7 @@ def parse_args():
     parser.add_argument('--weight-decay', type=float, default=1e-4)
     parser.add_argument('--device', default='auto', help='auto, cpu, cuda, or cuda:N')
     parser.add_argument('--blended-dir', type=Path,
-                        default=Path('/work/hdd/bfcn/wenyinli/blended_training_q_n0594'))
+                        default=Path('/work/hdd/bfcn/wenyinli/blended_training_q_n0594_spectral_c01'))
     parser.add_argument('--label-path', type=Path,
                         default=PROJECT_ROOT / 'codes/opt_e/datasets/isolated_rdsm_best_m002/rdsm_catalog.npz')
     parser.add_argument('--e1-column', default='rdsm_e1',

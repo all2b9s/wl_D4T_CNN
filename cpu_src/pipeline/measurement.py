@@ -5,16 +5,17 @@ class MeasurementBackend:
     def __init__(self, model, config):
         self.model, self.config = model, config
 
-    def measure(self, image, psf, positions, noise):
+    def measure(self, image, psf, positions, noise, noise2=None, renoise=None):
         c=self.config
         if c.backend=="cpp":
-            return self.model.measure_sources(image,psf,positions,noise,c.n_tangent,c.nthreads,c.batch_size)
+            return self.model.measure_sources(image,psf,positions,noise,c.n_tangent,c.nthreads,c.batch_size,
+                                              noise2=noise2,renoise=renoise)
         # Same native q-stamps and detections for a paired backend comparison.
         from cpu_src.reference import measure
         from cpu_src.api import Measurement
         chunks=[]
         for start in range(0,len(positions),c.batch_size):
-            q=self.model.prepare_qstamps(image,psf,positions[start:start+c.batch_size],noise,c.nthreads)
+            q=self.model.prepare_qstamps(image,psf,positions[start:start+c.batch_size],noise,c.nthreads,noise2,renoise)
             chunks.append(measure(c.model,q,c.precision,c.n_tangent,c.reference_device,c.batch_size))
         if not chunks:
             return self.model.measure_qstamps(np.empty((0,5,self.model.metadata["stamp_size"],self.model.metadata["stamp_size"])),c.n_tangent,c.nthreads)

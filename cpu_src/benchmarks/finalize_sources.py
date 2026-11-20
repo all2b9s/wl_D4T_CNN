@@ -18,24 +18,25 @@ def main():
     rng=np.random.default_rng(20261019)
     image=rng.normal(0,.02,(384,384)).astype(np.float32)
     noise=rng.normal(0,.02,image.shape).astype(np.float32)
+    noise2=rng.normal(0,.02,image.shape).astype(np.float32)  # spectral filler (default renoising)
     y,x=np.mgrid[:64,:64];psf=np.exp(-((x-32)**2+(y-32)**2)/(2*1.8**2));psf/=psf.sum()
     positions=rng.uniform(40,344,(512,2))
     report={"dataset":"synthetic 384x384 canvas, 512 non-edge positions; not a science sample",
             "threads":threads,"models":{}}
     for name in ("s4","attnw"):
         model=Model.load(args.data/f"{name}.npz")
-        q=model.prepare_qstamps(image,psf,positions,noise,threads)
+        q=model.prepare_qstamps(image,psf,positions,noise,threads,noise2)
         expected=model.measure_qstamps(q,4,threads)
-        result=model.measure_sources(image,psf,positions,noise,4,threads)
+        result=model.measure_sources(image,psf,positions,noise,4,threads,noise2=noise2)
         for key in ("e","R","dE_dx"):
             np.testing.assert_array_equal(getattr(result,key),getattr(expected,key))
         rows=[]
         for batch in (64,None):
             durations=[]
-            model.measure_sources(image,psf,positions,noise,2,threads,batch)
+            model.measure_sources(image,psf,positions,noise,2,threads,batch,noise2=noise2)
             for _ in range(3):
                 start=time.perf_counter()
-                model.measure_sources(image,psf,positions,noise,2,threads,batch)
+                model.measure_sources(image,psf,positions,noise,2,threads,batch,noise2=noise2)
                 durations.append(time.perf_counter()-start)
             rows.append({"batch_size":batch,"effective_batch_size":batch or max(64,8*threads),
                          "seconds":durations,"gal_per_sec":512/float(np.median(durations))})

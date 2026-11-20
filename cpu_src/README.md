@@ -34,8 +34,12 @@ On filesystems where CMake probe creation is very slow, add
 `D4CNN_DIRECT_BUILD=1` to the same command. This uses the same compiler flags,
 parallel compilation and cached object files, without CMake probes. Both build
 paths install the extension atomically.
-The Python API checks native API version 3 at model construction and reports a
-rebuild instruction if an old extension is present. Always restart interpreters
+The Python API checks native API version 4 at model construction and reports a
+rebuild instruction if an old extension is present. Version 4 adds AnaCal 0.8.4
+spectral renoising, the default for `prepare_qstamps`/`measure_sources` (it needs
+`noise2`, a second independent noise canvas; pass `renoise` with `mode="rotate"`
+for the legacy path), so `ANACAL_SOURCE_DIR` must be an AnaCal checkout at
+v0.8.4 or later. Always restart interpreters
 that loaded an older extension after rebuilding it.
 
 Without `ANACAL_SOURCE_DIR`, the q-stamp model API still builds; native image

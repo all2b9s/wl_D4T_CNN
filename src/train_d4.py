@@ -113,9 +113,17 @@ def record_result(key, value, output_dir=STUDY_OUT):
         stream.truncate()
 
 
-def training_q(field, rows=None):
-    """Reconstruct original allowed Q and responses with the original renoise."""
-    from src.anacal.pixel_response import anacal_pix_r
+def training_q(field, rows=None, renoise=None):
+    """Reconstruct the training Q and responses from the raw stamps.
+
+    renoise: RenoiseConfig; None = RenoiseConfig() (spectral, c=0.1), which
+    matches blended_training_q_n0594_spectral_c01 (filler noise seeded
+    SeedSequence(20020620, sample_id, 1)).  RenoiseConfig(mode='rotate')
+    reproduces the original rotate renoise of blended_training_q_n0594.
+    """
+    from src.anacal.pixel_response import anacal_pix_r, RenoiseConfig
+    if renoise is None:
+        renoise = RenoiseConfig()
     with np.load(f'/work/hdd/bfcn/wenyinli/blended_training_stamp/blended_{field:05d}.npz') as source:
         raw, ids = (source['blended_stamps'], source['sample_id'])
     if rows is not None:
@@ -127,6 +135,10 @@ def training_q(field, rows=None):
         .astype(np.float32)
         for sample_id in ids
     ])
+    noise2 = [None] * len(ids)
+    if renoise.spectral:
+        noise2 = [np.random.default_rng(np.random.SeedSequence([20020620, int(sample_id), 1]))
+                  .normal(0, 0.594, (64, 64)).astype(np.float32) for sample_id in ids]
     # The old workers=1 API still forked a process. Calling it from training's
     # threaded prefetch after CUDA initialization can deadlock. Use the same
     # source operation and identical explicit centers without creating a pool.
@@ -138,8 +150,10 @@ def training_q(field, rows=None):
         scale_arcsec_per_pix=0.2,
         sigma_arcsec=0.85 / 2.355,
         freq_lim=10.0,
-        noise_map=n
-    ) for image, n in zip(raw, noise)])
+        noise_map=n,
+        noise2_map=n2,
+        renoise=renoise,
+    ) for image, n, n2 in zip(raw, noise, noise2)])
     return (ids, q)
 
 

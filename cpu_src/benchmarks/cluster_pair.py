@@ -15,6 +15,7 @@ import shutil
 import subprocess
 import time
 from concurrent.futures import ThreadPoolExecutor
+import types
 import numpy as np
 
 _WORKER_MODEL = None
@@ -167,7 +168,10 @@ def prepare_data(repo, work, output, model_path, metadata, count, seed):
     def one(index):
         generator = np.random.default_rng(np.random.SeedSequence([noise_seed, int(sample_ids[index])]))
         noise = generator.normal(0, noise_std, images[index].shape).astype(np.float32)
-        return model.prepare_qstamps(images[index], psf, center, noise, nthreads=1)[0].astype(np.float32)
+        # The source q cache and both models use the legacy rotate renoise.
+        rotate = types.SimpleNamespace(mode="rotate", c=0.1, delta=0.01)
+        return model.prepare_qstamps(images[index], psf, center, noise, nthreads=1,
+                                     renoise=rotate)[0].astype(np.float32)
     started = time.perf_counter()
     with ThreadPoolExecutor(max_workers=16) as executor:
         q = np.stack(list(executor.map(one, range(count))))

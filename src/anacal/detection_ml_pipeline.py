@@ -251,7 +251,6 @@ def _build_task_from_fpfs_config(
     num_epochs: int = 0,
     force_center: bool = True,
     prior: Optional[Any] = None,
-    prior_sigma_a: float = 0.05,
     prior_sigma_x: float = 0.05,
 ):
     """Build an ``anacal.task.Task`` for source detection + measurement.
@@ -297,9 +296,9 @@ def _build_task_from_fpfs_config(
         Default True (example).
     prior : anacal.ngmix.modelPrior or None
         Prior for the C++ ngmix fit.  If None, a default ``modelPrior`` with
-        sigma_a = sigma_x = 0.05 is built (same as example).
-    prior_sigma_a, prior_sigma_x : float
-        Prior widths used when ``prior`` is None.
+        only sigma_x = 0.05 is built (AnaCal 0.8.4 removed ``set_sigma_a``).
+    prior_sigma_x : float
+        Centroid prior width used when ``prior`` is None.
 
     Returns
     -------
@@ -317,9 +316,9 @@ def _build_task_from_fpfs_config(
     if omega_v is None:
         omega_v = 0.011   # example_fpfs_blended (effective ~0.0030 at mag_zero=30)
     if prior is None:
-        # Same prior as example_fpfs_blended.ipynb.
+        # AnaCal 0.8.4 removed modelPrior.set_sigma_a; only the centroid
+        # prior is set.  With num_epochs=0 (default) the fit does not iterate.
         prior = anacal.ngmix.modelPrior()
-        prior.set_sigma_a(anacal.math.qnumber(prior_sigma_a))
         prior.set_sigma_x(anacal.math.qnumber(prior_sigma_x))
 
     task = anacal.task.Task(
@@ -390,6 +389,8 @@ def run_detection_and_fpfs(
     pixel_scale: float = 0.2,
     noise_variance: float = 1e-4,
     noise_array: Optional[np.ndarray] = None,
+    noise2_array: Optional[np.ndarray] = None,
+    renoise: Any = None,  # src.anacal.pixel_response.RenoiseConfig
     task: Any = None,  # cached anacal.task.Task (detection)
     cells: Any = None,  # cached cell list
     sigma_arcsec: float = 0.40,
@@ -445,6 +446,15 @@ def run_detection_and_fpfs(
         deconvolved data and doubles the input ``noise_variance`` so the
         renoised covariance is consistent.  Pass ``None`` only for
         noise-free images.
+    noise2_array : ndarray or None
+        Second pure-noise canvas, independent of the science noise and of
+        ``noise_array`` (spectral renoising only; the spin-2 filler).
+    renoise : RenoiseConfig or None
+        None = RenoiseConfig() (spectral, the default) whenever noise_array
+        is given.  'spectral' passes a ``renoise.Setup`` on the detection
+        cell grid to the Task and ``renoise_mode='spectral'`` +
+        ``noise2_array`` to forced FPFS.  RenoiseConfig(mode='rotate') keeps
+        the legacy calls.
     task : anacal.task.Task or None
         Cached detection Task. If None, a new one is built.
     cells : list of anacal.geometry.Cell or None
@@ -464,7 +474,7 @@ def run_detection_and_fpfs(
     force_center : bool
         Force the measured center to the detection position (default True).
     prior : anacal.ngmix.modelPrior or None
-        Prior for the C++ ngmix fit (default: sigma_a = sigma_x = 0.05).
+        Prior for the C++ ngmix fit (default: sigma_x = 0.05 only).
 
     Returns
     -------
@@ -502,6 +512,24 @@ def run_detection_and_fpfs(
             pixel_scale=pixel_scale,
         )
 
+    renoise_kw = {}
+    fpfs_renoise_kw = {}
+    if renoise is None and noise_array is not None:
+        from src.anacal.pixel_response import RenoiseConfig
+        renoise = RenoiseConfig()
+    if renoise is not None and renoise.spectral:
+        if noise_array is None or noise2_array is None:
+            raise ValueError("spectral renoising (the default) needs noise_array and noise2_array; "
+                             "pass renoise=RenoiseConfig(mode='rotate') for the legacy path")
+        noise2_array = np.asarray(noise2_array, dtype=np.float32)
+        # The Setup spectrum lives on the detection cell grid (square cells).
+        cell_n = cells[0].xmax - cells[0].xmin
+        renoise_kw = dict(
+            noise2_array=noise2_array,
+            renoise=renoise.task_setup(cell_n, pixel_scale, noise_variance),
+        )
+        fpfs_renoise_kw = dict(noise2_array=noise2_array, **renoise.fpfs_kwargs())
+
     det_cat_raw = task.process_image(
         np.asarray(gal_array, dtype=np.float32),
         psf_array,
@@ -516,6 +544,7 @@ def run_detection_and_fpfs(
         noise_array=noise_array,
         cell_list=cells,
         do_measure=True,
+        **renoise_kw,
     )
 
     n_det = len(det_cat_raw) if det_cat_raw is not None else 0
@@ -554,6 +583,7 @@ def run_detection_and_fpfs(
         noise_variance=noise_variance,
         noise_array=noise_array,
         detection=detection,
+        **fpfs_renoise_kw,
     )
 
     # ---- Merge detector weight + FPFS shapes ----

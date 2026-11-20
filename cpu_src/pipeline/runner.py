@@ -16,7 +16,9 @@ def run_measurement(config):
     from .exposure import load_blended_exposure
     from .detection import _build_truth_detection_catalog, _recenter_on_truth
     from src.anacal.detection_ml_pipeline import run_detection_and_fpfs, _build_cell_list, _build_task_from_fpfs_config
+    from src.anacal.pixel_response import RenoiseConfig
     config.validate()
+    renoise=RenoiseConfig(mode=config.renoise_mode,c=config.renoise_c,delta=config.renoise_delta)
     model=Model.load(config.model,config.precision,config.isa)
     h=model.metadata["stamp_size"]
     if h%2:
@@ -51,6 +53,9 @@ def run_measurement(config):
             row["load_seconds"]=time.perf_counter()-tick
             tick=time.perf_counter()
             noise=np.random.default_rng(19491001+index).normal(0,sigma,image.shape).astype(np.float32)
+            # Spectral filler canvas: same seed as src/blended_run.py (shared by the sim_mode0/40 pair).
+            noise2=(np.random.default_rng([index,19491001,2]).normal(0,sigma,image.shape).astype(np.float32)
+                    if renoise.spectral else None)
             if config.skip_detection:
                 det=_build_truth_detection_catalog(truth,config.mag_cut)
             else:
@@ -58,7 +63,8 @@ def run_measurement(config):
                 cells=_build_cell_list(*image.shape,pixel_scale=pre["pixel_scale"])
                 fpfs=anacal.fpfs.FpfsConfig(sigma_shapelets1=.45,sigma_shapelets2=.55)
                 det=run_detection_and_fpfs(image,psf,fpfs,config.mag_zero,pre["pixel_scale"],
-                                           sigma**2 if sigma>0 else 1e-4,noise,task,cells)
+                                           sigma**2 if sigma>0 else 1e-4,noise_array=noise,noise2_array=noise2,
+                                           renoise=renoise,task=task,cells=cells)
                 det=det[det["fpfs_w"]>=config.weight_threshold]
                 if config.center_on_truth:
                     det=_recenter_on_truth(det,truth_positions,config.match_threshold)
@@ -72,7 +78,7 @@ def run_measurement(config):
             row["detection_seconds"]=time.perf_counter()-tick
             positions=np.column_stack((det["x"],det["y"]))
             tick=time.perf_counter()
-            result=backend.measure(image,psf,positions,noise)
+            result=backend.measure(image,psf,positions,noise,noise2,renoise)
             row["measurement_seconds"]=time.perf_counter()-tick
             tick=time.perf_counter()
             save_catalog(det,result,truth_positions,truth,root/f"{comp}_{mode}"/config.fname,index,config)

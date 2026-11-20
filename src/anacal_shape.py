@@ -3,6 +3,7 @@ import argparse
 import anacal
 import multiprocessing as mp
 from src.anacal.fpfs import fpfs_measure
+from src.anacal.pixel_response import RenoiseConfig, RENOISE_MODES
 
 
 def parse_shear_tasks(task_list):
@@ -38,7 +39,12 @@ def main():
     parser.add_argument("--index-range", type=int, nargs=2, default=[0, 4000],
                          metavar=("START", "STOP"),
                          help="[start, stop) batch index range to process.")
+    parser.add_argument("--renoise-mode", type=str, default="spectral", choices=list(RENOISE_MODES),
+                        help="'spectral' (default; AnaCal 0.8.4, second noise map) or 'rotate' (legacy).")
+    parser.add_argument("--renoise-c", type=float, default=0.1)
+    parser.add_argument("--renoise-delta", type=float, default=0.01)
     args = parser.parse_args()
+    renoise = RenoiseConfig(mode=args.renoise_mode, c=args.renoise_c, delta=args.renoise_delta)
 
     shear_tasks = parse_shear_tasks(args.shear_tasks)
 
@@ -53,6 +59,7 @@ def main():
             shear_task=shear_task,
             fname=args.fname,
             save_dir=args.save_dir,
+            renoise=renoise,
         )
 
 

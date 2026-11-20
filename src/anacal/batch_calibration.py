@@ -139,6 +139,8 @@ def _process_image(
     pixel_scale: float,
     sigma_arcsec: float,
     flim: float,
+    noises2: np.ndarray = None,
+    renoise=None,
 ):
     # your existing per-index logic:
     return anacal_pix_r(
@@ -149,6 +151,8 @@ def _process_image(
         sigma_arcsec=sigma_arcsec,
         freq_lim=flim,
         noise_map=(noises[i] if noises is not None else None),
+        noise2_map=(noises2[i] if noises2 is not None else None),
+        renoise=renoise,
     )
 
 
@@ -342,9 +346,10 @@ def get_biases(
 
 # --- globals inside workers ---
 _G = {}
-def _init_worker(images, psfs, centers, noises, pixel_scale, sigma_arcsec, flim):
+def _init_worker(images, psfs, centers, noises, pixel_scale, sigma_arcsec, flim,
+                 noises2=None, renoise=None):
     # mark read-only to avoid copy-on-write if using fork
-    for arr in (images, psfs, centers, noises):
+    for arr in (images, psfs, centers, noises, noises2):
         try:
             arr.setflags(write=False)
         except Exception:
@@ -356,6 +361,8 @@ def _init_worker(images, psfs, centers, noises, pixel_scale, sigma_arcsec, flim)
     _G['pixel_scale'] = pixel_scale
     _G['sigma_arcsec'] = sigma_arcsec
     _G['flim'] = flim
+    _G['noises2'] = noises2
+    _G['renoise'] = renoise
 
 def _process_idx(i):
     # call your existing function with globals
@@ -368,11 +375,17 @@ def _process_idx(i):
         pixel_scale=_G['pixel_scale'],
         sigma_arcsec=_G['sigma_arcsec'],
         flim=_G['flim'],
+        noises2=_G['noises2'],
+        renoise=_G['renoise'],
     )
 
 def prepare_q_images(images, psfs, noises,
                      cat=None, pixel_scale=0.2,
-                     sigma_arcsec=0.85/2.355, flim=10.0, workers=32):
+                     sigma_arcsec=0.85/2.355, flim=10.0, workers=32,
+                     noises2=None, renoise=None):
+    """Q-images (N, 5, H, W).  renoise: RenoiseConfig; None = RenoiseConfig()
+    (spectral, the default) whenever noises is given, which also needs noises2,
+    a second independent noise realization.  RenoiseConfig(mode='rotate') = legacy."""
 
     N = images.shape[0]
     centers = np.ones((N, 2), dtype=np.float64) * (images.shape[1] // 2)
@@ -386,7 +399,8 @@ def prepare_q_images(images, psfs, noises,
     with ProcessPoolExecutor(
         max_workers=workers,
         initializer=_init_worker,
-        initargs=(images, psfs, centers, noises, pixel_scale, sigma_arcsec, flim),
+        initargs=(images, psfs, centers, noises, pixel_scale, sigma_arcsec, flim,
+                  noises2, renoise),
     ) as ex:
         # key changes: use ex.map on indices ONLY + chunksize + tqdm
         q_imgs = list(

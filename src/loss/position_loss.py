@@ -83,8 +83,9 @@ def _reach_windows(base, device, dtype):
 def isolated_noise_pair(images, rng, noise=POSITION_NOISE):
     """Two independent noisy q0 realizations [2, N, 1, H, W] of noiseless isolated partners.
 
-    Each realization draws fresh image noise and a fresh AnaCal renoise map
-    (both sigma=noise, as in training_q), so the two share only the source.
+    Each realization draws fresh image noise and fresh AnaCal renoise maps
+    (all sigma=noise, as in training_q; spectral renoising by default, so a
+    second map for the filler), so the two share only the source.
     Training stamps are already noisy; renoising them twice would share the
     field noise and leave half of the jitter floor.
     """
@@ -98,7 +99,8 @@ def isolated_noise_pair(images, rng, noise=POSITION_NOISE):
             out[realization, i, 0] = anacal_pix_r(
                 image + rng.normal(0, noise, image.shape), psf, center=center,
                 scale_arcsec_per_pix=0.2, sigma_arcsec=0.85 / 2.355, freq_lim=10.0,
-                noise_map=rng.normal(0, noise, image.shape).astype(np.float32))[0]
+                noise_map=rng.normal(0, noise, image.shape).astype(np.float32),
+                noise2_map=rng.normal(0, noise, image.shape).astype(np.float32))[0]
     return out
 
 

@@ -7,7 +7,9 @@ cores are neither idle between stages nor oversubscribed.
 
 Results are bit-identical to ``isolated_measure.py``: the per-batch measurement
 noise is still drawn in the parent from the same ``RandomState(20020620 + batch)``
-stream (shared with the workers through shared memory).  Output files and the
+stream, and for spectral renoising (the default) the filler noise from
+``default_rng([20020620, batch, 2])`` (both shared with the workers through
+shared memory).  Output files and the
 skip-if-done behaviour are unchanged, so a timed-out job can simply be resubmitted.
 
 Run from ``single_galaxies/``:
@@ -33,6 +35,7 @@ from cpu_src import Model
 from cpu_src.isolated_measure import parse_shear_tasks
 from src.anacal.batch_calibration import _process_image
 from src.anacal.cal_toolkit import format_number, load_img
+from src.anacal.pixel_response import RenoiseConfig, RENOISE_MODES
 
 STAMP = 64            # cutout size
 GAL_PER_DIR = 100     # galaxies per img_ dir (checked at run time)
@@ -72,13 +75,17 @@ def _task(args):
         shear_comp=comp, shear_mode=mode, abs_shear_value=c["shear_value"],
         index=start * c["img_bs"] + d, noise_level=c["noise"], directory=c["dir"])
     n = len(cut)
-    noises = _attach(shm_name, (nrows, STAMP, STAMP))[d * n:(d + 1) * n]
+    renoise = RenoiseConfig(mode=c["renoise_mode"], c=c["renoise_c"], delta=c["renoise_delta"])
+    buf = _attach(shm_name, (2 if renoise.spectral else 1, nrows, STAMP, STAMP))
+    noises = buf[0, d * n:(d + 1) * n]
+    noises2 = buf[1, d * n:(d + 1) * n] if renoise.spectral else None
     centers = np.ones((n, 2), dtype=np.float64) * (cut.shape[1] // 2)
     centers[:, 0] += (cat["image_x"] - (cat["image_x"] + 0.5) // 1).to_numpy(np.float64)
     centers[:, 1] += (cat["image_y"] - (cat["image_y"] + 0.5) // 1).to_numpy(np.float64)
     t1 = time.perf_counter()
     q = np.array([_process_image(i, images=cut, psfs=psf, centers=centers, noises=noises,
-                                 pixel_scale=0.2, sigma_arcsec=c["psf_fwhm"] / 2.355, flim=10)
+                                 pixel_scale=0.2, sigma_arcsec=c["psf_fwhm"] / 2.355, flim=10,
+                                 noises2=noises2, renoise=renoise)
                   for i in range(n)]).astype(np.float32)
     t2 = time.perf_counter()
     res = _state["model"].measure_qstamps(q, n_tangent=2, nthreads=1)
@@ -110,8 +117,12 @@ def main():
     p.add_argument("--parent_cores", type=int, default=2,
                    help="cores kept for the parent (noise draw, collection, saving)")
     p.add_argument("--max_batches_inflight", type=int, default=4,
-                   help="batches whose noise is held in shared memory (328 MB each)")
+                   help="batches whose noise is held in shared memory (328 MB each; 656 MB with spectral)")
     p.add_argument("--precision", choices=["float32", "float64"], default="float32")
+    p.add_argument("--renoise-mode", choices=list(RENOISE_MODES), default="spectral",
+                   help="'spectral' (default; AnaCal 0.8.4, doubles the shared noise memory) or 'rotate' (legacy)")
+    p.add_argument("--renoise-c", type=float, default=0.1)
+    p.add_argument("--renoise-delta", type=float, default=0.01)
     # Accepted so callers of isolated_measure.py keep working; unused here.
     p.add_argument("--nthreads", type=int, default=None)
     p.add_argument("--io_workers", type=int, default=None)
@@ -140,7 +151,9 @@ def main():
         return 0
 
     cfg = dict(model=args.model, precision=args.precision, shear_value=args.shear_value,
-               noise=args.noise, dir=args.dir, img_bs=args.img_bs, psf_fwhm=args.psf_fwhm)
+               noise=args.noise, dir=args.dir, img_bs=args.img_bs, psf_fwhm=args.psf_fwhm,
+               renoise_mode=args.renoise_mode, renoise_c=args.renoise_c, renoise_delta=args.renoise_delta)
+    spectral = args.renoise_mode == "spectral"
     shapes = {}                       # job index -> noise shared memory + collected results
     lock = threading.Lock()
     inflight = threading.Semaphore(args.max_batches_inflight)
@@ -194,9 +207,13 @@ def main():
             nrows = args.img_bs * GAL_PER_DIR
             nl = np.full(nrows, args.noise, dtype=np.float32).reshape(-1, 1, 1)
             noise = rs.normal(0, 1, (nrows, STAMP, STAMP)) * nl
-            shm = shared_memory.SharedMemory(create=True, size=noise.nbytes)
-            np.ndarray(noise.shape, dtype=np.float64, buffer=shm.buf)[:] = noise
-            del noise
+            nbuf = 2 if spectral else 1
+            shm = shared_memory.SharedMemory(create=True, size=nbuf * noise.nbytes)
+            buf = np.ndarray((nbuf,) + noise.shape, dtype=np.float64, buffer=shm.buf)
+            buf[0] = noise
+            if spectral:  # same second stream as isolated_measure.py / src/shape_measurement.py
+                buf[1] = np.random.default_rng([20020620, s, 2]).normal(0, 1, noise.shape) * nl
+            del noise, buf
             with lock:
                 shapes[ji] = {"shm": shm, "res": {}}
             for d in range(args.img_bs):

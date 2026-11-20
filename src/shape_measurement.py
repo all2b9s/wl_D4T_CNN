@@ -6,6 +6,7 @@ import torch
 from tqdm import tqdm
 from src.anacal.cal_toolkit import load_img, build_dataset
 from src.anacal.batch_calibration import prepare_q_images, Calibrator, get_biases
+from src.anacal.pixel_response import RenoiseConfig, RENOISE_MODES
 from src.architecture.single_gal_CNN import R180Inv_CNN_GeLU, D4T_CNN_GeLU,SmoothCNN_GeLU
 from src.architecture.forward8_CNN import Forward8_fixW_CNN, SmoothCNN_GeLU_mocked,Forward8_fixW_nores_CNN, Forward8_simp_CNN
 import argparse, os, random,re
@@ -51,7 +52,8 @@ def format_number(x: float) -> str:
     s = s.replace('.', '')                  # remove the decimal point
     return f"n{s}"
 
-def _prepare_cpu_batch(shear_comp, shear_mode, start, imgBs, noise_level, dtype, psf_fwhm, shear_value=0.02):
+def _prepare_cpu_batch(shear_comp, shear_mode, start, imgBs, noise_level, dtype, psf_fwhm, shear_value=0.02,
+                       renoise=None):
     """CPU part of one iteration: load cutouts, draw noise, build q-images."""
     t0 = time.perf_counter()
     range_idx = [start*imgBs, (start+1)*imgBs]
@@ -64,10 +66,18 @@ def _prepare_cpu_batch(shear_comp, shear_mode, start, imgBs, noise_level, dtype,
     # without touching global state (this runs in a prefetch thread).
     rs = np.random.RandomState(20020620+start)
     noises = rs.normal(0, 1, all_cutouts.shape)*noise_levels.reshape(-1,1,1)
+    if renoise is None:
+        renoise = RenoiseConfig()
+    noises2 = None
+    if renoise.spectral:
+        # Second realization (spin-2 filler): independent of the science noise
+        # (SeedSequence([1115, index])) and of `noises`; same for +/- shear.
+        noises2 = (np.random.default_rng([20020620, start, 2]).normal(0, 1, all_cutouts.shape)
+                   * noise_levels.reshape(-1, 1, 1))
     q_imgs = prepare_q_images(
             all_cutouts, all_psfs, noises, all_cats,
             sigma_arcsec=psf_fwhm/2.355,
-            workers=32, flim=10
+            workers=32, flim=10, noises2=noises2, renoise=renoise,
         )
     #q_imgs = q_imgs[:,:,1:,1:]
 
@@ -94,6 +104,7 @@ def loop_shape_measurement(
     psf_fwhm = 0.85,
     shear_value = 0.02,
     batch_size = 800,       # GPU batch size for calibrator.shape_measure
+    renoise = None,         # RenoiseConfig; None = RenoiseConfig() (spectral)
     ):
     if noise_level == 'adaptive':
         folder_name = 'nada'
@@ -111,7 +122,8 @@ def loop_shape_measurement(
     # Prefetch the next iteration's CPU work while the GPU measures the current one.
     with ThreadPoolExecutor(max_workers=1) as prefetch:
         submit = lambda job: prefetch.submit(
-            _prepare_cpu_batch, job[1], job[0], job[2], imgBs, noise_level, dtype, psf_fwhm, shear_value)
+            _prepare_cpu_batch, job[1], job[0], job[2], imgBs, noise_level, dtype, psf_fwhm, shear_value,
+            renoise)
         future = submit(jobs[0]) if jobs else None
         for k, (shear_mode, shear_comp, start) in enumerate(jobs):
             print(f'Processing {shear_comp}_{shear_mode}, batch {start}')
@@ -170,6 +182,10 @@ if __name__ == "__main__":
                    help="Output root; results go to <save_base>/<noise_tag>/<comp>_<mode>/")
     p.add_argument("--batch_size", type=int, default=800, help="GPU batch size for shape_measure")
     p.add_argument("--shear_value", type=float, default=0.02, help="Absolute simulated shear amplitude")
+    p.add_argument("--renoise_mode", type=str, default="spectral", choices=list(RENOISE_MODES),
+                   help="'spectral' (default; AnaCal 0.8.4, draws a second noise map) or 'rotate' (legacy)")
+    p.add_argument("--renoise_c", type=float, default=0.1, help="Spectral renoising c")
+    p.add_argument("--renoise_delta", type=float, default=0.01, help="Spectral renoising delta")
     args = p.parse_args()
     dir, save_base = args.dir, args.save_base
 
@@ -180,6 +196,8 @@ if __name__ == "__main__":
 
     print(f"Path of the model dict: {args.model_path}")
     print(f"Batch range: {args.range}")
+    renoise = RenoiseConfig(mode=args.renoise_mode, c=args.renoise_c, delta=args.renoise_delta)
+    print(f"Renoise: {renoise.mode}")
     cal_CNN = Calibrator(load_model(args.model_path), device, dtype=dtype)
     # --- Run main processes ---
     loop_shape_measurement(
@@ -193,6 +211,7 @@ if __name__ == "__main__":
         dtype=dtype,
         batch_size=args.batch_size,
         shear_value=args.shear_value,
+        renoise=renoise,
     )
 
     end_time = time.time()

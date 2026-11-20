@@ -51,6 +51,7 @@ from src.anacal.detection_ml_pipeline import (
     _build_cell_list,
 )
 from src.blending.ml_shape_measurement import ml_shape_measure
+from src.anacal.pixel_response import RenoiseConfig, RENOISE_MODES
 from src.architecture.forward8_CNN import Forward8_fixW_CNN
 
 # ---------------------------------------------------------------------------
@@ -162,9 +163,14 @@ def run_detection_ml_pipeline(
     save_csv: bool = True,
     match_threshold: float = 3.0,
     dtype: str = "float32",
+    renoise: RenoiseConfig = None,  # None = RenoiseConfig() (spectral)
 ):
     if shear_tasks is None:
         shear_tasks = DEFAULT_SHEAR_TASKS
+    if renoise is None:
+        renoise = RenoiseConfig()
+    print(f"[pipeline] Renoise: mode={renoise.mode}"
+          + (f"  c={renoise.c}  delta={renoise.delta}" if renoise.spectral else ""))
 
     # ---- Device & Model ----
     device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -275,6 +281,14 @@ def run_detection_ml_pipeline(
             ).astype(np.float32)
         else:
             _all_noise_canvases = None
+        # Spectral renoising: second canvas (spin-2 filler), independent of
+        # the science noise and of the first renoise canvas above.
+        if _all_noise_canvases is not None and renoise.spectral:
+            _all_noise2_canvases = np.random.default_rng([20020620 + _outer_start, 2]).normal(
+                0, noise_level, (_chunk_nB, canvas_size, canvas_size),
+            ).astype(np.float32)
+        else:
+            _all_noise2_canvases = None
 
         # ------------------------------------------------------
         # Step B: Per-directory detect + cut stamps (parallel)
@@ -298,6 +312,7 @@ def run_detection_ml_pipeline(
                 noise_canvas_i = _all_noise_canvases[i_dir]
             else:
                 noise_canvas_i = None
+            noise2_canvas_i = None if _all_noise2_canvases is None else _all_noise2_canvases[i_dir]
             t2 = time.perf_counter()
 
             task_i = _build_task_from_fpfs_config(
@@ -320,6 +335,8 @@ def run_detection_ml_pipeline(
                 pixel_scale=pixel_scale,
                 noise_variance=noise_variance,
                 noise_array=noise_canvas_i,
+                noise2_array=noise2_canvas_i,
+                renoise=renoise,
                 task=task_i,
                 cells=cells_i,
             )
@@ -352,6 +369,9 @@ def run_detection_ml_pipeline(
                 )
             else:
                 noise_stamps_i = np.zeros_like(stamps_i)
+            noise2_stamps_i = None
+            if noise2_canvas_i is not None:
+                noise2_stamps_i, _ = cut_stamps_from_large(noise2_canvas_i, det_i, stamp_size=stamp_size)
             t5 = time.perf_counter()
 
             timings = {
@@ -359,13 +379,14 @@ def run_detection_ml_pipeline(
                 "build_task": t3 - t2, "detect": t4 - t3,
                 "cut": t5 - t4, "n_det": len(det_i),
             }
-            return i_dir, det_i, positions_template, cat_i, stamps_i, noise_stamps_i, timings
+            return i_dir, det_i, positions_template, cat_i, stamps_i, noise_stamps_i, timings, noise2_stamps_i
 
         _all_det_cats = [None] * _chunk_nB
         _all_positions_list = [None] * _chunk_nB
         _all_cats_chunks = [None] * _chunk_nB
         _all_stamps_list = [None] * _chunk_nB
         _all_noise_stamps_list = [None] * _chunk_nB
+        _all_noise2_stamps_list = [None] * _chunk_nB
         _all_timings = [None] * _chunk_nB
 
         with ThreadPoolExecutor(max_workers=min(_chunk_nB, 32)) as ex:
@@ -379,6 +400,7 @@ def run_detection_ml_pipeline(
                 _all_cats_chunks[i_dir] = cat_i
                 _all_stamps_list[i_dir] = stamps_i
                 _all_noise_stamps_list[i_dir] = noise_stamps_i
+                _all_noise2_stamps_list[i_dir] = result[7]
                 _all_timings[i_dir] = timings_i
 
         _total_stamps = sum(len(s) for s in _all_stamps_list if s is not None)
@@ -412,6 +434,7 @@ def run_detection_ml_pipeline(
             "total_stamps": _total_stamps,
             "all_stamps_list": _all_stamps_list,
             "all_noise_stamps_list": _all_noise_stamps_list,
+            "all_noise2_stamps_list": _all_noise2_stamps_list,
             "all_det_cats": _all_det_cats,
             "all_positions_list": _all_positions_list,
             "all_cats_chunks": _all_cats_chunks,
@@ -526,6 +549,8 @@ def run_detection_ml_pipeline(
                     noise_stamps_all = np.concatenate(
                         [n for n in all_noise_stamps_list if len(n) > 0], axis=0
                     )
+                    _n2 = [n for n in cpu_data["all_noise2_stamps_list"] if n is not None and len(n) > 0]
+                    noise2_stamps_all = np.concatenate(_n2, axis=0) if _n2 else None
 
                     # GPU utilization monitor (background polling)
                     gpu_mon = {"util_samples": [], "mem_util_samples": [],
@@ -544,6 +569,8 @@ def run_detection_ml_pipeline(
                         pixel_scale=pixel_scale,
                         psf_fwhm=psf_fwhm,
                         noise_arrays=noise_stamps_all,
+                        noise2_arrays=noise2_stamps_all,
+                        renoise=renoise,
                         n_workers=n_workers,
                         dtype=dtype,
                         ml_batch_size=ml_batch_size,
@@ -684,6 +711,10 @@ if __name__ == "__main__":
                    help="Canvas margin (pixels). 40 makes 864 canvas, more FFT-friendly.")
     p.add_argument("--no_csv", action="store_true")
     p.add_argument("--no_npz", action="store_true")
+    p.add_argument("--renoise_mode", type=str, default="spectral", choices=list(RENOISE_MODES),
+                   help="'spectral' (default; AnaCal 0.8.4, second noise canvas) or 'rotate' (legacy)")
+    p.add_argument("--renoise_c", type=float, default=0.1)
+    p.add_argument("--renoise_delta", type=float, default=0.01)
 
     args = p.parse_args()
 
@@ -702,6 +733,7 @@ if __name__ == "__main__":
         grid_margin=args.grid_margin,
         save_npz=not args.no_npz,
         save_csv=not args.no_csv,
+        renoise=RenoiseConfig(mode=args.renoise_mode, c=args.renoise_c, delta=args.renoise_delta),
     )
 
     print(f"[main] Total time: {time.time() - start_time:.1f}s "

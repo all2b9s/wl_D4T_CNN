@@ -8,6 +8,7 @@ import tempfile
 import unittest
 from concurrent.futures import ThreadPoolExecutor
 from unittest.mock import patch
+import types
 import numpy as np
 
 class ModelTests(unittest.TestCase):
@@ -168,21 +169,30 @@ class ModelTests(unittest.TestCase):
         noise=rng.normal(0,.01,image.shape).astype(np.float32)
         psf=np.zeros((8,8),dtype=np.float64)
         psf[4,4]=1
+        noise2=rng.normal(0,.01,image.shape).astype(np.float32)
         positions=np.array([[12.1,11.8],[10.2,13.4]])
         centers=np.floor(positions+.5).astype(int)
-        for n in (None,noise):
-            q=model.prepare_qstamps(image,psf,positions,n,nthreads=2)
+        rotate=types.SimpleNamespace(mode="rotate",c=.1,delta=.01)
+        kernels=anacal.renoise.make_renoise_kernels(anacal.renoise.make_noise_spectrum(8,.2,1.),psf,50.,.1,.01,
+                                                    True,False,"spectral")
+        with self.assertRaisesRegex(ValueError,"noise2"):
+            model.prepare_qstamps(image,psf,positions,noise,nthreads=2)
+        for n,n2,renoise in ((None,None,None),(noise,None,rotate),(noise,noise2,None)):
+            q=model.prepare_qstamps(image,psf,positions,n,nthreads=2,noise2=n2,renoise=renoise)
             expected=[]
             for cx,cy in centers:
                 stamp=image[cy-4:cy+4,cx-4:cx+4].copy()
                 iq=anacal.image.ImageQ(8,8,.2,.85/2.355,50.,True)
                 if n is None:
                     expected.append(iq.prepare_qnumber_image(stamp,psf,4,4))
-                else:
+                elif n2 is None:
                     expected.append(iq.prepare_qnumber_image(stamp,psf,4,4,n[cy-4:cy+4,cx-4:cx+4].copy()))
+                else:
+                    expected.append(iq.prepare_qnumber_image(stamp,psf,4,4,n[cy-4:cy+4,cx-4:cx+4].copy(),
+                                                             n2[cy-4:cy+4,cx-4:cx+4].copy(),kernels))
             np.testing.assert_allclose(q,expected,atol=1e-13,rtol=1e-13)
             direct=model.measure_qstamps(q,4)
-            sources=model.measure_sources(image,psf,positions,n,4,2,1)
+            sources=model.measure_sources(image,psf,positions,n,4,2,1,noise2=n2,renoise=renoise)
             np.testing.assert_array_equal(sources.e,direct.e)
             np.testing.assert_array_equal(sources.R,direct.R)
             np.testing.assert_array_equal(sources.dE_dx,direct.dE_dx)

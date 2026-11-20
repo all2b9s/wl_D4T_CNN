@@ -4,7 +4,7 @@ FPFS Detection + ML Shape Measurement — Blended Image Pipeline
 
 End-to-end batch processing for DC1 blended simulation FITS exposures:
   1. Load FITS exposure + truth catalog, extract noise sigma
-  2. Generate single renoise canvas (shared by detection & ML)
+  2. Generate renoise canvas(es) shared by detection & ML (two for --renoise_mode spectral)
   3. FPFS detect → filter by weight (fpfs_w >= 1e-6)
   4. Cut stamps + noise stamps
   5. Batch ML inference on GPU (all stamps in chunk)
@@ -61,6 +61,7 @@ from src.anacal.detection_ml_pipeline import (
     match_detections_to_truth,
 )
 from src.blending.ml_shape_measurement import ml_shape_measure, prepare_chunk_q_images
+from src.anacal.pixel_response import RenoiseConfig, RENOISE_MODES
 from src.architecture.forward8_CNN import Forward8_fixW_CNN, Forward8_AttnW_CNN, load_f8_checkpoint
 from src.architecture.quad_Gauss import QuadGauss
 from src.datasets.dataset_toolkit import get_weighted_e
@@ -331,6 +332,8 @@ class _CpuPreparationConfig:
     q_workers: int = 32
     psf_fwhm: float = 0.85
     dtype: str = "float32"
+    # Noise-bias correction shared by detection, forced FPFS and CNN Q-images.
+    renoise: RenoiseConfig = RenoiseConfig()
 
 
 def _empty_stamps(stamp_size: int) -> tuple[np.ndarray, np.ndarray]:
@@ -400,6 +403,15 @@ def _cut_signal_and_noise_stamps(
     return stamps, noise_stamps
 
 
+def _cut_noise2_stamps(noise2_canvas, det_cat: np.ndarray, stamp_size: int):
+    """Second renoise stamps at the same centres (spectral only; else None)."""
+    if noise2_canvas is None:
+        return None
+    if len(det_cat) == 0:
+        return _empty_stamps(stamp_size)[1]
+    return cut_stamps_from_large(noise2_canvas, det_cat, stamp_size=stamp_size)[0]
+
+
 def _process_one_exposure(
     i_local: int,
     exp_start: int,
@@ -427,6 +439,14 @@ def _process_one_exposure(
     noise_canvas = np.random.default_rng(19491001 + exp_idx).normal(
         0, noise_sigma, large_img.shape,
     ).astype(np.float32)
+    # Spectral renoising: a second canvas (the spin-2 filler), independent of
+    # the science noise and of noise_canvas, seeded by exp_idx only so the
+    # sim_mode0/sim_mode40 pair shares it.  Never drawn in rotate mode.
+    noise2_canvas = None
+    if config.renoise.spectral:
+        noise2_canvas = np.random.default_rng([exp_idx, 19491001, 2]).normal(
+            0, noise_sigma, large_img.shape,
+        ).astype(np.float32)
     noise_variance = noise_sigma ** 2 if noise_sigma > 0 else 1e-4
     t3 = time.perf_counter()
 
@@ -435,6 +455,7 @@ def _process_one_exposure(
         stamps, noise_stamps = _cut_signal_and_noise_stamps(
             large_img, noise_canvas, det_cat, config.stamp_size,
         )
+        noise2_stamps = _cut_noise2_stamps(noise2_canvas, det_cat, config.stamp_size)
         t4 = time.perf_counter()
         timings = {
             "load": t2 - t1, "noise_gen": t3 - t2, "build_task": 0.0,
@@ -453,6 +474,7 @@ def _process_one_exposure(
             large_image=large_img, psf_image=config.psf_image, fpfs_config=FPFS_CONFIG,
             mag_zero=config.mag_zero, pixel_scale=config.pixel_scale,
             noise_variance=noise_variance, noise_array=noise_canvas, task=task, cells=cells,
+            noise2_array=noise2_canvas, renoise=config.renoise,
             snr_peak_min=config.snr_cut,
         )
         t5 = time.perf_counter()
@@ -473,6 +495,7 @@ def _process_one_exposure(
         stamps, noise_stamps = _cut_signal_and_noise_stamps(
             large_img, noise_canvas, det_cat, config.stamp_size,
         )
+        noise2_stamps = _cut_noise2_stamps(noise2_canvas, det_cat, config.stamp_size)
         t7 = time.perf_counter()
         timings = {
             "load": t2 - t1, "noise_gen": t3 - t2, "build_task": t4 - t3,
@@ -481,7 +504,8 @@ def _process_one_exposure(
             "noise_sigma": noise_sigma, "test_mode": False,
         }
 
-    return i_local, exp_idx, large_img, noise_sigma, truth_df, positions, det_cat, stamps, noise_stamps, timings
+    return (i_local, exp_idx, large_img, noise_sigma, truth_df, positions, det_cat,
+            stamps, noise_stamps, timings, noise2_stamps)
 
 
 def _prepare_cpu_chunk(
@@ -497,7 +521,7 @@ def _prepare_cpu_chunk(
         for future in as_completed(futures):
             result = future.result()
             results[result[0]] = result
-            _, exp_idx, _, noise_sigma, _, _, _, _, _, timings = result
+            _, exp_idx, _, noise_sigma, _, _, _, _, _, timings, _ = result
             if timings["test_mode"]:
                 mag_info = f"  mag_cut<{config.mag_cut}" if config.mag_cut is not None else "  (no mag cut)"
                 print(f"    [{sim_mode}] exp-{exp_idx:05d}: noise_sigma={noise_sigma:.4f}  "
@@ -519,12 +543,16 @@ def _prepare_cpu_chunk(
         t_q_start = time.time()
         stamps_all = np.concatenate([s for s in fields[7] if len(s) > 0], axis=0)
         noise_stamps_all = np.concatenate([n for n in fields[8] if len(n) > 0], axis=0)
+        noise2_stamps_all = None
+        if config.renoise.spectral:
+            noise2_stamps_all = np.concatenate([n for n in fields[10] if len(n) > 0], axis=0)
         q_imgs = prepare_chunk_q_images(
             stamps_all, noise_stamps_all, config.psf_image,
             pixel_scale=config.pixel_scale, psf_fwhm=config.psf_fwhm,
             n_workers=config.q_workers, dtype=config.dtype,
+            noise2_arrays=noise2_stamps_all, renoise=config.renoise,
         )
-        del stamps_all, noise_stamps_all
+        del stamps_all, noise_stamps_all, noise2_stamps_all
         t_q = time.time() - t_q_start
 
     elapsed = time.time() - started
@@ -574,6 +602,9 @@ def run_detection_ml_pipeline(
     snr_cut: float = 5.0,
     center_on_truth: bool = False,
     add_image_noise: bool = False,
+    renoise_mode: str = "spectral",
+    renoise_c: float = 0.1,
+    renoise_delta: float = 0.01,
 ):
     if sim_modes is None:
         sim_modes = list(SIM_MODE_MAP.keys())
@@ -646,6 +677,9 @@ def run_detection_ml_pipeline(
     print(f"[pipeline] Noise mode: {noise_mode}"
           + (f"  sigma={noise_level}" if noise_level is not None else "  (from variance_map)"))
     print(f"[pipeline] Add image noise (same sigma, independent of renoise): {add_image_noise}")
+    renoise = RenoiseConfig(mode=renoise_mode, c=renoise_c, delta=renoise_delta)
+    print(f"[pipeline] Renoise: mode={renoise.mode}"
+          + (f"  c={renoise.c}  delta={renoise.delta}" if renoise.spectral else ""))
     print(f"[pipeline] I/O chunk: {io_chunk_size} exposures, ML batch: {ml_batch_size}")
     print(f"[pipeline] sim_modes: {sim_modes}, exposure range: {exp_range}")
     print(f"[pipeline] Save npz={save_npz}, csv={save_csv}")
@@ -682,6 +716,7 @@ def run_detection_ml_pipeline(
         q_workers=n_workers,
         psf_fwhm=psf_fwhm,
         dtype=dtype,
+        renoise=renoise,
     )
 
     # ==================================================================
@@ -938,6 +973,15 @@ if __name__ == "__main__":
                         "same sigma as --noise (or variance_map), independent of the "
                         "renoise realization.")
 
+    p.add_argument("--renoise_mode", type=str, default="spectral", choices=list(RENOISE_MODES),
+                   help="Noise-bias correction for detection, forced FPFS and CNN Q-images: "
+                        "'spectral' (default; AnaCal 0.8.4 minimal-variance renoising, draws a "
+                        "second independent canvas) or 'rotate' (90-deg noise copy, legacy).")
+    p.add_argument("--renoise_c", type=float, default=0.1,
+                   help="Spectral renoising added-noise fraction c")
+    p.add_argument("--renoise_delta", type=float, default=0.01,
+                   help="Spectral renoising smooth-maximum delta")
+
     args = p.parse_args()
 
     run_detection_ml_pipeline(
@@ -963,6 +1007,9 @@ if __name__ == "__main__":
         snr_cut=args.snr_cut,
         center_on_truth=args.center_on_truth,
         add_image_noise=args.add_image_noise,
+        renoise_mode=args.renoise_mode,
+        renoise_c=args.renoise_c,
+        renoise_delta=args.renoise_delta,
     )
 
     print(f"[main] Total time: {time.time() - start_time:.1f}s "
